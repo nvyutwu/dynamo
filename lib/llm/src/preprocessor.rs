@@ -1135,6 +1135,10 @@ impl OpenAIPreprocessor {
                                 ),
                             ) = choice.delta.content.as_ref()
                             {
+                                tracing::debug!(
+                                    raw_content = %text,
+                                    "Reasoning parser input (before parsing)"
+                                );
                                 let parser_result =
                                     parser.parse_reasoning_streaming_incremental(text, &[]);
 
