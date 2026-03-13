@@ -36,6 +36,7 @@ from dynamo.llm import (
     make_engine,
     run_input,
 )
+from dynamo.common.utils.otel_instrumentation import init_dynamo_otel_metrics
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 
@@ -294,6 +295,10 @@ async def async_main():
 
     e = EntrypointArgs(EngineType.Dynamic, **kwargs)
     engine = await make_engine(runtime, e)
+
+    # Initialize OTEL metrics bridge (scrapes /metrics and exports via OTLP)
+    # Only active if OTEL_EXPORTER_OTLP_METRICS_ENDPOINT is set
+    init_dynamo_otel_metrics(http_port=config.http_port)
 
     try:
         if config.interactive:

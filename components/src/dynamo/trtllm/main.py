@@ -3,10 +3,12 @@
 
 import asyncio
 import logging
+import os
 
 import uvloop
 
 from dynamo.common.utils.graceful_shutdown import install_signal_handlers
+from dynamo.common.utils.otel_instrumentation import init_dynamo_otel_metrics
 from dynamo.common.utils.runtime import create_runtime
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.trtllm.args import parse_args
@@ -28,6 +30,12 @@ async def worker():
     )
 
     install_signal_handlers(loop, runtime, shutdown_endpoints, shutdown_event)
+
+    # Initialize OTEL metrics bridge for worker metrics (scrapes DYN_SYSTEM_PORT /metrics)
+    # Only active if both OTEL_EXPORTER_OTLP_METRICS_ENDPOINT and DYN_SYSTEM_PORT are set
+    _system_port = os.getenv("DYN_SYSTEM_PORT", "-1")
+    if _system_port not in ("-1", "0", ""):
+        init_dynamo_otel_metrics(http_port=int(_system_port))
 
     logging.info(f"Initializing the worker with config: {config}")
     await init_worker(runtime, config, shutdown_event, shutdown_endpoints)
