@@ -666,11 +666,19 @@ impl OpenAIPreprocessor {
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
         // Try to parse reasoning content only if parser is configured
-        let should_parse_reasoning = self.runtime_config.reasoning_parser.is_some()
-            && !Self::is_reasoning_disabled_by_request(
-                self.runtime_config.reasoning_parser.as_deref(),
-                request.chat_template_args.as_ref(),
-            );
+        let is_disabled = Self::is_reasoning_disabled_by_request(
+            self.runtime_config.reasoning_parser.as_deref(),
+            request.chat_template_args.as_ref(),
+        );
+        let should_parse_reasoning = self.runtime_config.reasoning_parser.is_some() && !is_disabled;
+
+        tracing::debug!(
+            reasoning_parser = ?self.runtime_config.reasoning_parser,
+            chat_template_args = ?request.chat_template_args,
+            is_disabled_by_request = is_disabled,
+            should_parse_reasoning = should_parse_reasoning,
+            "Reasoning parser decision for postprocessing"
+        );
 
         // Reasoning Content Parsing Transformation Step
         // Current Solution:
@@ -1089,7 +1097,7 @@ impl OpenAIPreprocessor {
                 }
                 false
             }
-            Some("nemotron_nano") => {
+            Some("nemotron_nano") | Some("deepseek_r1") | Some("glm45") => {
                 if let Some(args) = chat_template_args
                     && let Some(enable_thinking) = args.get("enable_thinking")
                 {
@@ -1142,11 +1150,21 @@ impl OpenAIPreprocessor {
                                 let parser_result =
                                     parser.parse_reasoning_streaming_incremental(text, &[]);
 
+                                let parsed_content = parser_result.get_some_normal_text();
+                                let parsed_reasoning = parser_result.get_some_reasoning();
+                                tracing::debug!(
+                                    has_content = parsed_content.is_some(),
+                                    content_preview = ?parsed_content.as_deref().map(|s| &s[..s.len().min(100)]),
+                                    has_reasoning = parsed_reasoning.is_some(),
+                                    reasoning_preview = ?parsed_reasoning.as_deref().map(|s| &s[..s.len().min(100)]),
+                                    "Reasoning parser output (after parsing)"
+                                );
+
                                 // Update this specific choice with parsed content
-                                choice.delta.content = parser_result.get_some_normal_text().map(
+                                choice.delta.content = parsed_content.map(
                                     dynamo_async_openai::types::ChatCompletionMessageContent::Text,
                                 );
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                choice.delta.reasoning_content = parsed_reasoning;
                             }
                             // For multimodal content, pass through unchanged
                         }
@@ -1498,11 +1516,61 @@ mod tests {
                 false,
                 "kimi_k25 + empty args → enabled",
             ),
+            // deepseek_r1 uses "enable_thinking" key
+            (
+                Some("deepseek_r1"),
+                Some(&enable_thinking_false),
+                true,
+                "deepseek_r1 + enable_thinking=false → disabled",
+            ),
+            (
+                Some("deepseek_r1"),
+                Some(&enable_thinking_true),
+                false,
+                "deepseek_r1 + enable_thinking=true → enabled",
+            ),
+            (
+                Some("deepseek_r1"),
+                None,
+                false,
+                "deepseek_r1 + no args → enabled",
+            ),
+            (
+                Some("deepseek_r1"),
+                Some(&empty_args),
+                false,
+                "deepseek_r1 + empty args → enabled",
+            ),
             (
                 Some("deepseek_r1"),
                 Some(&thinking_false),
                 false,
-                "deepseek_r1 → never disabled",
+                "deepseek_r1 + thinking=false (wrong key) → enabled",
+            ),
+            // glm45 uses "enable_thinking" key
+            (
+                Some("glm45"),
+                Some(&enable_thinking_false),
+                true,
+                "glm45 + enable_thinking=false → disabled",
+            ),
+            (
+                Some("glm45"),
+                Some(&enable_thinking_true),
+                false,
+                "glm45 + enable_thinking=true → enabled",
+            ),
+            (
+                Some("glm45"),
+                None,
+                false,
+                "glm45 + no args → enabled",
+            ),
+            (
+                Some("glm45"),
+                Some(&empty_args),
+                false,
+                "glm45 + empty args → enabled",
             ),
             (
                 Some("basic"),
