@@ -24,6 +24,29 @@ pub fn compute_block_hash(data: &[u8]) -> LocalBlockHash {
     LocalBlockHash(compute_hash(data))
 }
 
+#[inline]
+fn hash_block_no_mm(chunk: &[u32], seed: u64, scratch_bytes: &mut Vec<u8>) -> LocalBlockHash {
+    #[cfg(target_endian = "little")]
+    {
+        let _ = scratch_bytes;
+        // SAFETY: `u32` is plain-old-data, and on little-endian targets its in-memory
+        // representation matches the `to_le_bytes()` sequence used for hashing.
+        let chunk_bytes = unsafe {
+            std::slice::from_raw_parts(chunk.as_ptr().cast::<u8>(), std::mem::size_of_val(chunk))
+        };
+        LocalBlockHash(xxh3::xxh3_64_with_seed(chunk_bytes, seed))
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        scratch_bytes.clear();
+        for &token in chunk {
+            scratch_bytes.extend_from_slice(&token.to_le_bytes());
+        }
+        return LocalBlockHash(xxh3::xxh3_64_with_seed(scratch_bytes, seed));
+    }
+}
+
 /// Compute the hash for a sequence of tokens, optionally including multimodal metadata
 /// and LoRA adapter identity.
 ///
@@ -46,30 +69,35 @@ pub fn compute_block_hash_for_seq(
         Some(name) => XXH3_SEED.wrapping_add(xxh3::xxh3_64(name.as_bytes())),
         None => XXH3_SEED,
     };
-    tokens
-        .chunks_exact(kv_block_size as usize)
-        .enumerate()
-        .map(|(block_idx, chunk)| {
-            let mut bytes: Vec<u8> = chunk.iter().flat_map(|&num| num.to_le_bytes()).collect();
+    let block_size = kv_block_size as usize;
+    let mut hashes = Vec::with_capacity(tokens.len() / block_size);
+    let mut bytes = Vec::with_capacity(block_size * std::mem::size_of::<u32>());
+    let mut mm_hashes = Vec::new();
 
-            if let Some(mm_infos) = block_mm_infos
-                && let Some(Some(block_mm_info)) = mm_infos.get(block_idx)
-            {
-                let mut mm_hashes: Vec<u64> = block_mm_info
-                    .mm_objects
-                    .iter()
-                    .map(|obj| obj.mm_hash)
-                    .collect();
-                mm_hashes.sort_unstable();
-
-                for mm_hash in mm_hashes {
-                    bytes.extend_from_slice(&mm_hash.to_le_bytes());
-                }
+    for (block_idx, chunk) in tokens.chunks_exact(block_size).enumerate() {
+        if let Some(mm_infos) = block_mm_infos
+            && let Some(Some(block_mm_info)) = mm_infos.get(block_idx)
+        {
+            bytes.clear();
+            for &token in chunk {
+                bytes.extend_from_slice(&token.to_le_bytes());
             }
 
-            LocalBlockHash(xxh3::xxh3_64_with_seed(&bytes, seed))
-        })
-        .collect()
+            mm_hashes.clear();
+            mm_hashes.extend(block_mm_info.mm_objects.iter().map(|obj| obj.mm_hash));
+            mm_hashes.sort_unstable();
+
+            for &mm_hash in &mm_hashes {
+                bytes.extend_from_slice(&mm_hash.to_le_bytes());
+            }
+
+            hashes.push(LocalBlockHash(xxh3::xxh3_64_with_seed(&bytes, seed)));
+        } else {
+            hashes.push(hash_block_no_mm(chunk, seed, &mut bytes));
+        }
+    }
+
+    hashes
 }
 
 /// Compute rolling sequence hashes for a vector of block hashes.
@@ -89,8 +117,25 @@ pub fn compute_seq_hash_for_block(block_hashes: &[LocalBlockHash]) -> Vec<Sequen
         let current_block_hash = block_hashes[i].0;
 
         let combined = [parent_seq_hash, current_block_hash];
-        let bytes: Vec<u8> = combined.iter().flat_map(|&num| num.to_le_bytes()).collect();
-        let seq_hash = compute_hash(&bytes);
+        #[cfg(target_endian = "little")]
+        let seq_hash = {
+            // SAFETY: `u64` is plain-old-data, and on little-endian targets its in-memory
+            // representation matches the `to_le_bytes()` sequence used by the previous code.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    combined.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&combined),
+                )
+            };
+            compute_hash(bytes)
+        };
+        #[cfg(not(target_endian = "little"))]
+        let seq_hash = {
+            let mut bytes = [0_u8; std::mem::size_of::<u64>() * 2];
+            bytes[..8].copy_from_slice(&parent_seq_hash.to_le_bytes());
+            bytes[8..].copy_from_slice(&current_block_hash.to_le_bytes());
+            compute_hash(&bytes)
+        };
         sequence_hashes.push(seq_hash);
     }
 

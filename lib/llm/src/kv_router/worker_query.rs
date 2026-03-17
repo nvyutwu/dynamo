@@ -551,8 +551,8 @@ impl WorkerQueryClient {
                     events.len(),
                     last_event_id
                 );
-                for event in &events {
-                    self.indexer.apply_event(event.clone()).await;
+                for event in events {
+                    self.indexer.apply_event(event).await;
                 }
                 new_cursor = RankCursor::Live(last_event_id);
                 successful_response = true;
