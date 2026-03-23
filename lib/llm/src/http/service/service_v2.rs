@@ -506,14 +506,38 @@ impl HttpServiceConfigBuilder {
 
         let mut all_docs = Vec::new();
 
-        // Shared on_response callback for both system and inference routes
+        // Shared on_request / on_response callbacks for both system and inference routes.
+        // INFO-level "request received" / "request completed" lines correlate via the
+        // surrounding span (which carries the request_id). Server errors are logged at
+        // error!, client errors at warn!, success at info!.
+        let on_request = |request: &axum::http::Request<Body>, _span: &tracing::Span| {
+            tracing::info!(
+                method = %request.method(),
+                uri = %request.uri(),
+                "request received"
+            );
+        };
         let on_response = |response: &Response<Body>, latency: Duration, _span: &tracing::Span| {
             let status = response.status();
             let latency_ms = latency.as_millis();
-            if status.is_server_error() || status.is_client_error() {
-                tracing::error!(status = %status.as_u16(), latency_ms = %latency_ms, "http response sent");
+            if status.is_server_error() {
+                tracing::error!(
+                    status = %status.as_u16(),
+                    latency_ms = %latency_ms,
+                    "request completed with server error"
+                );
+            } else if status.is_client_error() {
+                tracing::warn!(
+                    status = %status.as_u16(),
+                    latency_ms = %latency_ms,
+                    "request completed with client request error"
+                );
             } else {
-                tracing::info!(status = %status.as_u16(), latency_ms = %latency_ms, "http response sent");
+                tracing::info!(
+                    status = %status.as_u16(),
+                    latency_ms = %latency_ms,
+                    "request completed"
+                );
             }
         };
 
@@ -552,6 +576,7 @@ impl HttpServiceConfigBuilder {
         inference_router = inference_router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_inference_request_span)
+                .on_request(on_request)
                 .on_response(on_response),
         );
 
@@ -564,6 +589,7 @@ impl HttpServiceConfigBuilder {
         system_router = system_router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_system_request_span)
+                .on_request(on_request)
                 .on_response(on_response),
         );
 
