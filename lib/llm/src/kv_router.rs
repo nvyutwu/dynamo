@@ -420,6 +420,7 @@ where
                 lora_name.as_deref(),
             )
         });
+        let hash_elapsed = start.elapsed();
         // Compute seq_hashes only if scheduler needs it for active blocks tracking
         let maybe_seq_hashes = tracing::info_span!("kv_router.compute_seq_hashes").in_scope(|| {
             self.kv_router_config.compute_seq_hashes_for_tracking(
@@ -430,7 +431,7 @@ where
                 Some(&block_hashes),
             )
         });
-        let hash_elapsed = start.elapsed();
+        let seq_hash_elapsed = start.elapsed();
 
         let overlap_scores = self
             .indexer
@@ -438,8 +439,6 @@ where
             .instrument(tracing::info_span!("kv_router.find_matches"))
             .await?;
         let find_matches_elapsed = start.elapsed();
-
-        let seq_hash_elapsed = start.elapsed();
 
         let response = self
             .scheduler
@@ -462,8 +461,8 @@ where
         if let Some(m) = metrics::RoutingOverheadMetrics::get() {
             m.observe(
                 hash_elapsed,
-                find_matches_elapsed,
                 seq_hash_elapsed,
+                find_matches_elapsed,
                 total_elapsed,
             );
         }
@@ -472,9 +471,9 @@ where
         tracing::info!(
             isl_tokens,
             hash_us = hash_elapsed.as_micros() as u64,
-            find_matches_us = (find_matches_elapsed - hash_elapsed).as_micros() as u64,
-            seq_hash_us = (seq_hash_elapsed - find_matches_elapsed).as_micros() as u64,
-            schedule_us = (total_elapsed - seq_hash_elapsed).as_micros() as u64,
+            seq_hash_us = (seq_hash_elapsed - hash_elapsed).as_micros() as u64,
+            find_matches_us = (find_matches_elapsed - seq_hash_elapsed).as_micros() as u64,
+            schedule_us = (total_elapsed - find_matches_elapsed).as_micros() as u64,
             total_us = total_elapsed.as_micros() as u64,
             "find_best_match completed"
         );
