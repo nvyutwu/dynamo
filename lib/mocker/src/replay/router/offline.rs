@@ -235,6 +235,7 @@ impl OfflineReplayRouter {
             self.block_size,
             None,
             None,
+            None
         );
 
         Ok(PendingRequest {

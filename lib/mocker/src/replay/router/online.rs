@@ -188,6 +188,7 @@ impl KvReplayRouter {
             self.block_size,
             None,
             None,
+            None,
         );
         let response = self
             .scheduler
