@@ -15,6 +15,7 @@ use axum::http::Response;
 use super::Metrics;
 use super::RouteDoc;
 use super::metrics;
+use super::payload_logger::PayloadLogger;
 use super::metrics::register_worker_timing_metrics;
 use crate::discovery::ModelManager;
 use crate::endpoint_type::EndpointType;
@@ -47,6 +48,8 @@ pub struct State {
     discovery_client: Arc<dyn Discovery>,
     flags: StateFlags,
     cancel_token: CancellationToken,
+    /// Optional payload logger. Active when `DYN_LOG_PAYLOADS=1`.
+    pub(super) payload_logger: Arc<PayloadLogger>,
 }
 
 #[derive(Default, Debug)]
@@ -128,6 +131,7 @@ impl State {
                 anthropic_endpoints_enabled: AtomicBool::new(false),
             },
             cancel_token,
+            payload_logger: PayloadLogger::new(),
         }
     }
 
@@ -156,6 +160,11 @@ impl State {
     /// Get the cancellation token
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// Returns the payload logger shared reference.
+    pub fn payload_logger(&self) -> &Arc<PayloadLogger> {
+        &self.payload_logger
     }
 
     // TODO

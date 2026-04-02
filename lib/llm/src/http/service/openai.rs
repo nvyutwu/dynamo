@@ -40,6 +40,8 @@ use super::{
         process_response_and_observe_metrics,
         process_response_using_event_converter_and_observe_metrics,
     },
+    payload_logger::headers_to_json,
+    payload_logging_stream::{ChatPayloadLoggingStream, CompletionPayloadLoggingStream},
     service_v2,
 };
 use crate::engines::ValidateRequest;
@@ -345,6 +347,19 @@ async fn handler_completions(
     // create the context for the request
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
     let streaming = request.inner.stream.unwrap_or(false);
+
+    // Log the incoming request payload.
+    if state.payload_logger().is_enabled() {
+        let payload = serde_json::to_string(&request.inner).unwrap_or_default();
+        let headers_json = headers_to_json(&headers);
+        state.payload_logger().log_request(
+            &request_id,
+            "OpenAIServingCompletions",
+            &payload,
+            &headers_json,
+        );
+    }
+
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
         endpoint: Endpoint::Completions.to_string(),
@@ -479,6 +494,14 @@ async fn completions_single(
     let stream = stream::iter(annotations).chain(stream);
 
     if streaming {
+        // Wrap with payload logging accumulation before SSE conversion.
+        // CompletionPayloadLoggingStream is a pass-through no-op when DYN_LOG_PAYLOADS is not set.
+        let stream = CompletionPayloadLoggingStream::new(
+            stream,
+            state.payload_logger().clone(),
+            request_id.clone(),
+        );
+
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream
@@ -537,6 +560,13 @@ async fn completions_single(
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
+        }
+        // Log the assembled non-streaming response.
+        if state.payload_logger().is_enabled() {
+            let payload = serde_json::to_string(&response).unwrap_or_default();
+            state
+                .payload_logger()
+                .log_response(&request_id, "OpenAIServingCompletions", &payload);
         }
         Ok(Json(response).into_response())
     }
@@ -710,6 +740,12 @@ async fn completions_batch(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
+        if state.payload_logger().is_enabled() {
+            let payload = serde_json::to_string(&response).unwrap_or_default();
+            state
+                .payload_logger()
+                .log_response(&request_id, "OpenAIServingCompletions", &payload);
+        }
         Ok(Json(response).into_response())
     }
 }
@@ -803,6 +839,16 @@ async fn handler_chat_completions(
     // create the context for the request
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
     let streaming = request.inner.stream.unwrap_or(false);
+
+    // Log the incoming request payload before spawning the generation task.
+    if state.payload_logger().is_enabled() {
+        let payload = serde_json::to_string(&request.inner).unwrap_or_default();
+        let headers_json = headers_to_json(&headers);
+        state
+            .payload_logger()
+            .log_request(&request_id, "OpenAIServingChat", &payload, &headers_json);
+    }
+
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
         endpoint: Endpoint::ChatCompletions.to_string(),
@@ -1193,6 +1239,16 @@ async fn chat_completions(
         // EventConverter and monitor_for_disconnects). This is standard SSE behavior.
         stream_handle.arm(); // allows the system to detect client disconnects and cancel the LLM generation
 
+        // Wrap the stream with payload logging accumulation before SSE conversion.
+        // ChatPayloadLoggingStream emits openai.response once the stream is exhausted or dropped.
+        // It is a pass-through no-op when DYN_LOG_PAYLOADS is not set.
+        let stream = ChatPayloadLoggingStream::new(
+            stream,
+            state.payload_logger().clone(),
+            request_id.clone(),
+            "OpenAIServingChat",
+        );
+
         let mut http_queue_guard = Some(http_queue_guard);
         let tool_dispatch_enabled = state.streaming_tool_dispatch_enabled();
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
@@ -1287,6 +1343,13 @@ async fn chat_completions(
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
+        }
+        // Log the assembled non-streaming response.
+        if state.payload_logger().is_enabled() {
+            let payload = serde_json::to_string(&response).unwrap_or_default();
+            state
+                .payload_logger()
+                .log_response(&request_id, "OpenAIServingChat", &payload);
         }
         Ok(Json(response).into_response())
     }
@@ -1412,6 +1475,19 @@ async fn handler_responses(
     // create the context for the request
     let request_id = get_or_create_request_id(None, &headers);
     let streaming = request.inner.stream.unwrap_or(false);
+
+    // Log the incoming request payload.
+    if state.payload_logger().is_enabled() {
+        let payload = serde_json::to_string(&request.inner).unwrap_or_default();
+        let headers_json = headers_to_json(&headers);
+        state.payload_logger().log_request(
+            &request_id,
+            "OpenAIServingResponses",
+            &payload,
+            &headers_json,
+        );
+    }
+
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone().unwrap_or_default(),
         endpoint: Endpoint::Responses.to_string(),
@@ -1571,6 +1647,16 @@ async fn responses(
     let ctx = engine_stream.context();
 
     if streaming {
+        // For streaming responses: wrap engine_stream with payload logging accumulation.
+        // ChatPayloadLoggingStream accumulates content/reasoning/tool_calls and emits
+        // openai.response once the stream is exhausted or dropped (client disconnect).
+        // It is a pass-through no-op when DYN_LOG_PAYLOADS is not set.
+        let engine_stream = ChatPayloadLoggingStream::new(
+            engine_stream,
+            state.payload_logger().clone(),
+            request_id.clone(),
+            "OpenAIServingResponses",
+        );
         // For streaming responses, we return HTTP 200 immediately without checking for errors.
         // Once HTTP 200 OK is sent, we cannot change the status code, so any backend errors
         // must be delivered as SSE events in the stream. This is standard SSE behavior.
@@ -1712,6 +1798,13 @@ async fn responses(
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
+        }
+        // Log the assembled non-streaming Responses API response.
+        if state.payload_logger().is_enabled() {
+            let payload = serde_json::to_string(&response).unwrap_or_default();
+            state
+                .payload_logger()
+                .log_response(&request_id, "OpenAIServingResponses", &payload);
         }
 
         Ok(Json(response).into_response())
