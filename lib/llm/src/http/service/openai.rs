@@ -476,17 +476,18 @@ async fn completions_single(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     let model = request.inner.model.clone();
+    let metrics_model = state.manager().resolve_canonical_name(&model);
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &model,
+        &metrics_model,
         Endpoint::Completions,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
 
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
@@ -498,7 +499,7 @@ async fn completions_single(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -617,17 +618,18 @@ async fn completions_batch(
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
     let model = request.inner.model.clone();
+    let metrics_model = state.manager().resolve_canonical_name(&model);
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &model,
+        &metrics_model,
         Endpoint::Completions,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
 
     let (engine, parsing_options) = state
         .manager()
@@ -638,7 +640,7 @@ async fn completions_batch(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -800,17 +802,18 @@ async fn embeddings(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     let model = &request.inner.model;
+    let metrics_model = state.manager().resolve_canonical_name(model);
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight = state.metrics_clone().create_inflight_guard(
-        model,
+        &metrics_model,
         Endpoint::Embeddings,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
 
     // todo - error handling should be more robust
     let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
@@ -819,8 +822,8 @@ async fn embeddings(
         err_response
     })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(model);
-    let model_name = model.to_string();
+    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let model_name = metrics_model.clone();
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1177,12 +1180,13 @@ async fn chat_completions(
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
     let model = request.inner.model.clone();
+    let metrics_model = state.manager().resolve_canonical_name(&model);
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
     // Create inflight_guard early to ensure all errors (including validation) are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &model,
+        &metrics_model,
         Endpoint::ChatCompletions,
         streaming,
         &request_id,
@@ -1229,7 +1233,7 @@ async fn chat_completions(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
 
     let annotations = request.annotations();
 
@@ -1559,12 +1563,13 @@ async fn responses(
     tracing::trace!("Received responses request: {:?}", request.inner);
 
     let model = request.inner.model.clone().unwrap_or_default();
+    let metrics_model = state.manager().resolve_canonical_name(&model);
     let streaming = request.inner.stream.unwrap_or(false);
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &model,
+        &metrics_model,
         Endpoint::Responses,
         streaming,
         request.id(),
@@ -1641,7 +1646,7 @@ async fn responses(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
 
     tracing::trace!("Issuing generate call for responses");
 
