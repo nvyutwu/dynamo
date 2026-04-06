@@ -723,7 +723,7 @@ async fn completions_single(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     let model = request.inner.model.clone();
-    let metric_model = state.manager().metric_model_for(&model).to_string();
+    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -874,7 +874,7 @@ async fn completions_batch(
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
     let model = request.inner.model.clone();
-    let metric_model = state.manager().metric_model_for(&model).to_string();
+    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -1092,7 +1092,7 @@ async fn embeddings(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     let model = &request.inner.model;
-    let metric_model = state.manager().metric_model_for(model).to_string();
+    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(model)).to_string();
 
     // Start the embedding-specific latency timer. Distinct from
     // `request_duration` (which has 1..512s LLM-gen buckets); pooling-model
@@ -1637,7 +1637,7 @@ async fn chat_completions(
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
     let model = request.inner.model.clone();
-    let metric_model = state.manager().metric_model_for(&model).to_string();
+    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
@@ -2078,7 +2078,7 @@ async fn responses(
 
     let model = request.inner.model.clone().unwrap_or_default();
     let streaming = request.inner.stream.unwrap_or(false);
-    let metric_model = state.manager().metric_model_for(&model).to_string();
+    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);

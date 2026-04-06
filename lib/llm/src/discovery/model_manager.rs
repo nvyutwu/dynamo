@@ -117,6 +117,9 @@ pub struct ModelManager {
     /// per component and can restart it if the previous one exited (avoids double counting on
     /// rebuilds while keeping the feed durable).
     lora_load_feeds: DashMap<String, tokio::task::JoinHandle<()>>,
+
+    /// Alias → primary model name mapping. Used to normalize metrics labels.
+    alias_to_primary: DashMap<String, String>,
 }
 
 impl Default for ModelManager {
@@ -145,6 +148,7 @@ impl ModelManager {
             lora_filter,
             lora_enabled: crate::lora::lora_serving_enabled(),
             lora_load_feeds: DashMap::new(),
+            alias_to_primary: DashMap::new(),
         }
     }
 
@@ -193,6 +197,26 @@ impl ModelManager {
     ) {
         let model = self.get_or_create_model(model_name);
         model.add_worker_set(namespace.to_string(), worker_set);
+    }
+
+    /// Record that `alias` is an alternate name for `primary`. Used to normalize metrics labels.
+    pub fn register_alias(&self, alias: &str, primary: &str) {
+        self.alias_to_primary
+            .insert(alias.to_string(), primary.to_string());
+    }
+
+    /// Remove a previously registered alias mapping.
+    pub fn unregister_alias(&self, alias: &str) {
+        self.alias_to_primary.remove(alias);
+    }
+
+    /// Return the primary (canonical) model name for `model`, resolving aliases.
+    /// Returns `model` unchanged if it is not an alias.
+    pub fn resolve_canonical_name<'a>(&self, model: &'a str) -> String {
+        self.alias_to_primary
+            .get(model)
+            .map(|v| v.value().clone())
+            .unwrap_or_else(|| model.to_string())
     }
 
     /// Remove a WorkerSet from a Model. Removes the Model if it becomes empty.
