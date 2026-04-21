@@ -162,13 +162,18 @@ pub fn validate_temperature(temperature: Option<f32>) -> Result<(), anyhow::Erro
     Ok(())
 }
 
-/// Validates the top_p parameter
+/// Validates the top_p parameter.
+///
+/// OpenAI spec defines `top_p` in the interval `(0, 1]` — the lower bound is
+/// exclusive. Backends enforce this strictly (e.g. TRT-LLM's
+/// `SamplingConfig::checkTopP` asserts `topP > 0.0f`), so a `top_p = 0` that
+/// reaches the engine crashes the worker. Reject it at the frontend instead.
 pub fn validate_top_p(top_p: Option<f32>) -> Result<(), anyhow::Error> {
     if let Some(p) = top_p
-        && !(MIN_TOP_P..=MAX_TOP_P).contains(&p)
+        && (p <= MIN_TOP_P || p > MAX_TOP_P)
     {
         anyhow::bail!(
-            "Top_p must be between {} and {}, got {}",
+            "top_p must be greater than {} and less than or equal to {}, got {}",
             MIN_TOP_P,
             MAX_TOP_P,
             p

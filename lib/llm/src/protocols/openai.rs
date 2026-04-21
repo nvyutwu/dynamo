@@ -25,7 +25,7 @@ pub mod videos;
 
 use validate::{
     BEST_OF_RANGE, FREQUENCY_PENALTY_RANGE, MIN_P_RANGE, N_RANGE, PRESENCE_PENALTY_RANGE,
-    TEMPERATURE_RANGE, TOP_P_RANGE, validate_range,
+    TEMPERATURE_RANGE, validate_range, validate_top_p,
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,8 +100,9 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
 
         let mut temperature = validate_range(self.get_temperature(), &TEMPERATURE_RANGE)
             .map_err(|e| anyhow::anyhow!("Error validating temperature: {}", e))?;
-        let mut top_p = validate_range(self.get_top_p(), &TOP_P_RANGE)
-            .map_err(|e| anyhow::anyhow!("Error validating top_p: {}", e))?;
+        let raw_top_p = self.get_top_p();
+        validate_top_p(raw_top_p).map_err(|e| anyhow::anyhow!("Error validating top_p: {}", e))?;
+        let mut top_p = raw_top_p;
         let frequency_penalty =
             validate_range(self.get_frequency_penalty(), &FREQUENCY_PENALTY_RANGE)
                 .map_err(|e| anyhow::anyhow!("Error validating frequency_penalty: {}", e))?;
