@@ -1119,7 +1119,6 @@ impl ModelWatcher {
                             );
                             self.manager
                                 .add_worker_set_arc(alias, &ws_key, ws_arc.clone());
-                            self.manager.register_alias(alias, card.name());
                         }
                     }
                 }
