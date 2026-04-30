@@ -644,11 +644,20 @@ def test_acquire_reasoning_tokenizer_warns_when_no_path(caplog):
 # ─── concurrent CV propagation ───────────────────────────────────────────────
 
 
-def test_cv_propagates_across_concurrent_tasks():
-    """Two concurrent asyncio tasks must each see their own CV value when
-    the wrapper executes, even when they share a single tokenizer_manager.
-    Regression guard: if the wrapper ever moved CV-read out of the synchronous
-    call into a thread pool or to a non-task-bound coroutine, this would fail.
+def test_cv_isolation_two_tasks_same_engine():
+    """Two concurrent asyncio tasks sharing one engine each see their own
+    ``require_reasoning`` value when the wrapper executes — the contextvar
+    is per-task, not module-global.
+
+    Regression guard: if the wrapper ever cached the CV value at install
+    time, read it from a module global, or used a thread-local, the two
+    interleaved tasks below would both observe the same value (the
+    install-time default ``False`` in the cached case, or the last-writer
+    value in the global case).
+
+    The wrapper is installed once on the bare TM — no recorder layer in
+    between, so the only thing that can mutate ``obj.require_reasoning`` is
+    the proxy itself.
     """
     import asyncio
 
@@ -658,42 +667,30 @@ def test_cv_propagates_across_concurrent_tasks():
     )
 
     tm = _RecorderTokenizerManager()
-    seen_flags: list[tuple[str, bool]] = []
-
-    original = tm.generate_request
-
-    def _record_call(obj, request):
-        result = original(obj, request)
-        seen_flags.append((request, obj.require_reasoning))
-        return result
-
-    tm.generate_request = _record_call
     engine = _EngineWithTM(tm)
     _install_require_reasoning_proxy(engine)
 
-    async def one_request(label: str, expect: bool):
+    async def run_task(expect: bool) -> bool:
         token = _DYN_REQUIRE_REASONING_CV.set(expect)
         try:
-            await asyncio.sleep(0)  # yield so tasks interleave
-            obj = _GenerateReqInputStub()
-            tm.generate_request(obj, label)
+            # Yield so the other task gets a chance to set its own CV and
+            # call the wrapper before we do — exercises true interleave,
+            # not sequential execution.
             await asyncio.sleep(0)
-            assert obj.require_reasoning is expect
+            obj = _GenerateReqInputStub()
+            tm.generate_request(obj, None)
+            await asyncio.sleep(0)
+            return obj.require_reasoning
         finally:
             _DYN_REQUIRE_REASONING_CV.reset(token)
 
     async def main():
-        await asyncio.gather(
-            one_request("task-true", True),
-            one_request("task-false", False),
-        )
+        return await asyncio.gather(run_task(True), run_task(False))
 
-    asyncio.run(main())
-
-    # Each task saw its own CV value — no cross-contamination.
-    by_label = dict(seen_flags)
-    assert by_label["task-true"] is True
-    assert by_label["task-false"] is False
+    results = asyncio.run(main())
+    # Each task's wrapper invocation observed its own task-bound CV value,
+    # not the other task's, the default, nor the install-time snapshot.
+    assert results == [True, False]
 
 
 def test_cv_resets_on_cancellation_between_set_and_await():
@@ -787,23 +784,117 @@ def test_end_to_end_engine_async_generate_routes_through_wrapper():
 # ─── prefill handler call site is wrapped ────────────────────────────────────
 
 
-def test_prefill_handler_imports_cv_and_wraps_async_generate():
-    """Source-level guard that the prefill handler also drives the CV.
-    Without this wrap, disagg requests enter SGLang prefill with
-    require_reasoning=False even when the prompt is mid-thinking, which
-    can defeat the gate when grammar state is shared with decode.
-    """
-    import inspect
+@pytest.mark.asyncio
+async def test_prefill_handler_drives_cv_through_async_generate():
+    """Behavior guard: PrefillWorkerHandler.generate must enter
+    engine.async_generate with the contextvar set to
+    _resolve_require_reasoning's answer for the request, and reset it on
+    the way out.
 
+    Replaces an earlier source-grep test that broke the moment anyone
+    refactored the CV access into a helper. This drives the actual
+    handler against a fake engine and observes the wrapper's mutation.
+
+    Without the prefill-side wrap, disagg requests enter SGLang prefill
+    with require_reasoning=False even when the prompt is mid-thinking,
+    which defeats the gate when grammar state is shared with decode.
+    """
+    import asyncio
+
+    from dynamo.sglang.request_handlers.handler_base import (
+        _DYN_REQUIRE_REASONING_CV,
+        _install_require_reasoning_proxy,
+    )
+    from dynamo.sglang.request_handlers.llm.prefill_handler import (
+        PrefillWorkerHandler,
+    )
+
+    cv_observed_during_call: list[bool] = []
+    last_obj_holder: dict = {}
+
+    class _RecordingEngine:
+        def __init__(self, tm):
+            self.tokenizer_manager = tm
+
+        async def async_generate(self, **kwargs):
+            # Mirror SGLang's Engine.async_generate: build a GenerateReqInput
+            # and call tokenizer_manager.generate_request synchronously
+            # before returning the async generator.
+            cv_observed_during_call.append(_DYN_REQUIRE_REASONING_CV.get())
+            obj = _GenerateReqInputStub()
+            self.tokenizer_manager.generate_request(obj, None)
+            last_obj_holder["obj"] = obj
+
+            async def _empty():
+                if False:  # pragma: no cover
+                    yield {}
+
+            return _empty()
+
+    class _PrefillContext:
+        def id(self):
+            return "test-request-id"
+
+        @property
+        def trace_id(self):
+            return "test-trace-id"
+
+        def is_stopped(self):
+            return False
+
+    tm = _RecorderTokenizerManager()
+    engine = _RecordingEngine(tm)
+    _install_require_reasoning_proxy(engine)
+
+    h = PrefillWorkerHandler.__new__(PrefillWorkerHandler)
+    h.engine = engine
+    h.bootstrap_host = "localhost"
+    h.bootstrap_port = 0
+    h.config = _FakeConfig(sglang_parser="glm45")
+    h._reasoning_tokenizer = _FakeTokenizer()
+    h.enable_trace = False
+    h._consume_tasks = set()
+    # Prompt's last token is `<think>` (id 99 in the fake tokenizer) — so
+    # _resolve_require_reasoning should return True.
+    h._get_input_param = lambda req: {"input_ids": [1, 2, 99]}
+    h._resolve_lora = lambda req: None
+    h._priority_kwargs = lambda priority: {}
+    h._session_kwargs = lambda req: {}
+    h._generate_bootstrap_room = lambda: 12345
+
+    request = {
+        "request": {"input_ids": [1, 2, 99], "routing": {}},
+        "sampling_params": {},
+    }
+
+    # Drive the generator just past the CV try/finally — the first yield
+    # at line ~191 is the bootstrap_info dict, after async_generate has
+    # been awaited and the CV has been reset.
+    gen = h.generate(request, _PrefillContext())
+    bootstrap = await gen.__anext__()
+    # Cancel the trailing _consume_results task so the test exits cleanly.
+    await gen.aclose()
+
+    # 1. The wrapper saw require_reasoning=True at call time.
+    assert cv_observed_during_call == [True], (
+        "engine.async_generate did not run with the require-reasoning CV set"
+    )
+    # 2. The wrapper mutated the GenerateReqInput before async_generate returned.
+    assert last_obj_holder["obj"].require_reasoning is True
+    # 3. After the CV try/finally, the contextvar is back to its default.
+    assert _DYN_REQUIRE_REASONING_CV.get() is False
+    # 4. Bootstrap info still threaded through correctly.
+    assert bootstrap["disaggregated_params"]["bootstrap_room"] == 12345
+
+
+def test_prefill_handler_imports_cv_symbols():
+    """Lightweight import guard: prefill_handler must continue to import
+    the CV and the resolver. If a refactor moves these into helpers, the
+    behavior test above is the real regression net — this just catches a
+    naming-only break early.
+    """
     from dynamo.sglang.request_handlers.llm import prefill_handler
 
-    src = inspect.getsource(prefill_handler)
-    assert "_DYN_REQUIRE_REASONING_CV" in src, (
+    assert hasattr(prefill_handler, "_DYN_REQUIRE_REASONING_CV"), (
         "prefill_handler must import _DYN_REQUIRE_REASONING_CV"
-    )
-    assert "_DYN_REQUIRE_REASONING_CV.set(" in src and (
-        "_DYN_REQUIRE_REASONING_CV.reset(" in src
-    ), "prefill handler must wrap engine.async_generate with CV try/finally"
-    assert "self._resolve_require_reasoning(" in src, (
-        "prefill handler must derive the CV value via _resolve_require_reasoning"
     )

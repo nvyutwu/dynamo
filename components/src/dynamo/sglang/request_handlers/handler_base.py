@@ -1166,9 +1166,15 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
           1. ``engine.tokenizer_manager.tokenizer`` — present when SGLang runs
              with ``skip_tokenizer_init=False`` (e.g. integration tests using
              ``use_sglang_tokenizer=True``).
-          2. Fallback: ``AutoTokenizer.from_pretrained(server_args.model_path)``
-             — required for the production path where Dynamo tokenizes at the
-             frontend and SGLang runs with ``skip_tokenizer_init=True``.
+          2. Fallback: ``AutoTokenizer.from_pretrained(server_args.model_path,
+             local_files_only=True)`` — required for the production path
+             where Dynamo tokenizes at the frontend and SGLang runs with
+             ``skip_tokenizer_init=True``. ``local_files_only=True`` because
+             SGLang has already populated the HF cache for this model_path
+             during engine init; this avoids surprise network calls and
+             respects ``HF_HUB_OFFLINE``. If the cache lookup fails (e.g.
+             a tokenizer-only path not yet cached), retries once with
+             network access enabled before giving up.
 
         Logs a single warning if neither succeeds; emits no warning on the
         non-reasoning path (cheap default).
@@ -1197,9 +1203,27 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             )
             return None
 
-        try:
-            from transformers import AutoTokenizer
+        from transformers import AutoTokenizer
 
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True, local_files_only=True
+            )
+            logger.info(
+                "Loaded fallback tokenizer for reasoning detection from %s "
+                "(local cache)",
+                model_path,
+            )
+            return tokenizer
+        except Exception as cache_exc:
+            logger.debug(
+                "Local-only AutoTokenizer load failed for %s: %s. Retrying "
+                "with network access.",
+                model_path,
+                cache_exc,
+            )
+
+        try:
             tokenizer = AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=True
             )
@@ -1211,9 +1235,12 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         except Exception as exc:
             logger.warning(
                 "Failed to load fallback tokenizer from %s for reasoning "
-                "detection: %s. Token-input requests will not activate "
-                "ReasonerGrammarBackend; thinking-on guided decoding may "
-                "misbehave.",
+                "detection: %s. Token-input requests will NOT activate "
+                "ReasonerGrammarBackend; thinking-on guided decoding will "
+                "silently fall back to non-reasoner masking and may emit the "
+                "schema-constrained output before </think>. Set "
+                "--skip-tokenizer-init=False or pre-cache the tokenizer to "
+                "fix.",
                 model_path,
                 exc,
             )
@@ -1296,10 +1323,14 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
 
         Maps Dynamo's `GuidedDecodingOptions` (snake_case fields from the Rust
         protocol struct) onto SGLang `SamplingParams` fields. Only one
-        constraint is honored per request — priority order matches SGLang's
-        own `verify()` logic (`json_schema` → `regex` → `ebnf`) plus
-        `structural_tag` and `choice`. Fields without an SGLang equivalent on
-        this code path (`backend`, `whitespace_pattern`) are ignored.
+        constraint is honored per request — Dynamo applies the priority
+        ``json`` → ``structural_tag`` → ``regex`` → ``grammar`` → ``choice``
+        and returns on the first match, so the resulting params dict only
+        ever sets one of SGLang's grammar fields. SGLang's `verify()` enforces
+        mutual exclusivity between ``json_schema`` / ``regex`` / ``ebnf`` (it
+        does not impose its own priority); the early return keeps us inside
+        that exclusivity guard. Fields without an SGLang equivalent on this
+        code path (``backend``, ``whitespace_pattern``) are ignored.
         """
         if not isinstance(guided_decoding, dict):
             return {}
