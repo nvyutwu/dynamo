@@ -16,7 +16,10 @@ from dynamo.common.utils.otel_tracing import build_trace_headers
 from dynamo.sglang._compat import filter_supported_async_generate_kwargs
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
-from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
+from dynamo.sglang.request_handlers.handler_base import (
+    _DYN_REQUIRE_REASONING_CV,
+    BaseWorkerHandler,
+)
 
 
 def _extract_media_urls(mm_data: Dict[str, Any], media_key: str) -> list[str] | None:
@@ -333,22 +336,35 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             routing = request.get("routing") or {}
             dp_rank = routing.get("dp_rank")
 
-            decode = await self.engine.async_generate(
-                **input_param,
-                sampling_params=sampling_params,
-                stream=True,
-                **self._routed_experts_kwargs,
-                bootstrap_host=bootstrap_info["bootstrap_host"],
-                bootstrap_port=bootstrap_info["bootstrap_port"],
-                bootstrap_room=bootstrap_info["bootstrap_room"],
-                external_trace_header=trace_header,
-                rid=trace_id,
-                data_parallel_rank=dp_rank,
-                **self._session_kwargs(request),
-                lora_path=lora_path,
-                **logprob_kwargs,
-                **self._priority_kwargs(priority),
+            # Set require_reasoning in a contextvar that the proxy installed
+            # on tokenizer_manager.generate_request reads. SGLang v0.5.10.post1
+            # doesn't expose this kwarg on Engine.async_generate, so we go
+            # through the wrapper path instead. See
+            # handler_base._install_require_reasoning_proxy.
+            cv_token = _DYN_REQUIRE_REASONING_CV.set(
+                self._resolve_require_reasoning(input_param)
             )
+            try:
+                decode = await self.engine.async_generate(
+                    **input_param,
+                    sampling_params=sampling_params,
+                    stream=True,
+                    **self._routed_experts_kwargs,
+                    bootstrap_host=bootstrap_info["bootstrap_host"],
+                    bootstrap_port=bootstrap_info["bootstrap_port"],
+                    bootstrap_room=bootstrap_info["bootstrap_room"],
+                    external_trace_header=trace_header,
+                    rid=trace_id,
+                    data_parallel_rank=dp_rank,
+                    **self._session_kwargs(request),
+                    lora_path=lora_path,
+                    **logprob_kwargs,
+                    **self._priority_kwargs(priority),
+                )
+            finally:
+                # The wrapper has already mutated the GenerateReqInput, so
+                # we can safely reset before iterating the stream.
+                _DYN_REQUIRE_REASONING_CV.reset(cv_token)
 
             if not self.use_sglang_tokenizer:
                 async for out in self._process_token_stream(decode, context):
@@ -369,21 +385,27 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             routing = request.get("routing") or {}
             dp_rank = routing.get("dp_rank")
 
-            agg = await self.engine.async_generate(
-                **input_param,
-                image_data=image_data,
-                video_data=video_data,
-                sampling_params=sampling_params,
-                stream=True,
-                **self._routed_experts_kwargs,
-                external_trace_header=trace_header,
-                rid=trace_id,
-                data_parallel_rank=dp_rank,
-                **self._session_kwargs(request),
-                lora_path=lora_path,
-                **logprob_kwargs,
-                **self._priority_kwargs(priority),
+            cv_token = _DYN_REQUIRE_REASONING_CV.set(
+                self._resolve_require_reasoning(input_param)
             )
+            try:
+                agg = await self.engine.async_generate(
+                    **input_param,
+                    image_data=image_data,
+                    video_data=video_data,
+                    sampling_params=sampling_params,
+                    stream=True,
+                    **self._routed_experts_kwargs,
+                    external_trace_header=trace_header,
+                    rid=trace_id,
+                    data_parallel_rank=dp_rank,
+                    **self._session_kwargs(request),
+                    lora_path=lora_path,
+                    **logprob_kwargs,
+                    **self._priority_kwargs(priority),
+                )
+            finally:
+                _DYN_REQUIRE_REASONING_CV.reset(cv_token)
             if not self.use_sglang_tokenizer:
                 async for out in self._process_token_stream(agg, context):
                     yield out
