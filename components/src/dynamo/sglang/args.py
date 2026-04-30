@@ -79,7 +79,35 @@ def _preprocess_for_encode_config(
 def _validate_parser_flags(
     sglang_val: Optional[str], dynamo_val: Optional[str], name: str
 ) -> None:
-    """Validate that --{name} (SGLang) and --dyn-{name} (Dynamo) are not both set."""
+    """Validate parser-flag combinations.
+
+    For ``tool-call-parser``: SGLang's and Dynamo's parsers both consume the
+    model's raw output stream and produce ``tool_calls``. Running both at once
+    would double-parse, so this remains an error.
+
+    For ``reasoning-parser``: the two flags do **different** things and need
+    to be allowed to coexist. ``--reasoning-parser`` (SGLang side) activates
+    ``ReasonerGrammarBackend``, which gates the grammar/json_schema constraint
+    mask until after the reasoning end token (e.g. ``</think>``). This is
+    required so guided decoding doesn't force JSON from token 0 in
+    thinking-on mode. ``--dyn-reasoning-parser`` (Dynamo side) splits the
+    worker's output text into ``reasoning_content`` and ``content`` at the
+    Dynamo OpenAI frontend. Dynamo uses SGLang's Engine API rather than its
+    OpenAI HTTP layer, so the SGLang-side parser does not populate
+    ``reasoning_content`` on its own — both flags are required for correct
+    thinking-on guided JSON output.
+    """
+    if name == "reasoning-parser":
+        if sglang_val and dynamo_val:
+            logging.info(
+                "Both --reasoning-parser (SGLang: %s) and --dyn-reasoning-parser "
+                "(Dynamo: %s) are set. SGLang side activates ReasonerGrammarBackend "
+                "for thinking-aware guided decoding; Dynamo side handles the "
+                "OpenAI response reasoning_content split.",
+                sglang_val,
+                dynamo_val,
+            )
+        return
     if sglang_val and dynamo_val:
         logging.error(f"Cannot use both --{name} and --dyn-{name}.")
         sys.exit(1)

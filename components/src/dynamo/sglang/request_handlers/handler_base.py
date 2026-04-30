@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import contextvars
 import dataclasses
 import importlib
 import inspect
@@ -121,6 +122,60 @@ class SGLangEngineQuiesceController:
 
 RequestT = TypeVar("RequestT")
 ResponseT = TypeVar("ResponseT")
+
+
+# Per-task contextvar carrying the require_reasoning bit for the current
+# request, set by the LLM handler before each engine.async_generate call and
+# read by the wrapper installed on tokenizer_manager.generate_request below.
+#
+# Why a contextvar rather than a kwarg on Engine.async_generate:
+#   SGLang v0.5.10.post1's `Engine.async_generate` does not expose
+#   `require_reasoning` as a parameter — the OpenAI HTTP layer is the only
+#   in-tree caller that sets `GenerateReqInput.require_reasoning`, and
+#   Dynamo bypasses that layer. Patching SGLang upstream is preferable, but
+#   we need a working fix on the pinned base image without forking SGLang,
+#   so we instead intercept the request object inside the
+#   `tokenizer_manager.generate_request` call and flip `require_reasoning`
+#   from the contextvar value. The wrapper is per-engine (idempotent) and
+#   the contextvar is per-asyncio-task, so concurrent in-flight requests
+#   don't clobber each other.
+_DYN_REQUIRE_REASONING_CV: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "dynamo_sglang_require_reasoning", default=False
+)
+
+
+def _install_require_reasoning_proxy(engine: "sgl.Engine") -> None:
+    """Wrap the engine's tokenizer_manager.generate_request once.
+
+    The wrapper sets `obj.require_reasoning = True` on the SGLang
+    `GenerateReqInput` whenever ``_DYN_REQUIRE_REASONING_CV`` is True for
+    the current asyncio task. This is what activates SGLang's
+    ``ReasonerGrammarBackend`` so that grammar/json_schema masks are
+    deferred until after the reasoning end token (e.g. ``</think>``).
+
+    Idempotent — re-invoking on a wrapped tokenizer_manager is a no-op.
+    """
+    tm = getattr(engine, "tokenizer_manager", None)
+    if tm is None or getattr(tm, "_dynamo_require_reasoning_wrapped", False):
+        return
+
+    original = tm.generate_request
+
+    def _wrapped(obj, request):  # signature mirrors TokenizerManager.generate_request
+        try:
+            if _DYN_REQUIRE_REASONING_CV.get():
+                # `require_reasoning` is a plain attribute on
+                # GenerateReqInput; assignment is safe even if the
+                # in-tree default is False.
+                obj.require_reasoning = True
+        except Exception as exc:  # pragma: no cover - best-effort, never fail the request
+            logger.debug(
+                "Failed to set require_reasoning on GenerateReqInput: %s", exc
+            )
+        return original(obj, request)
+
+    tm.generate_request = _wrapped  # type: ignore[assignment]
+    tm._dynamo_require_reasoning_wrapped = True  # type: ignore[attr-defined]
 
 
 class BaseGenerativeHandler(ABC, Generic[RequestT, ResponseT]):
@@ -702,6 +757,11 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         self.enable_trace = getattr(config.server_args, "enable_trace", False)
 
         if engine is not None:
+            # Install the require_reasoning wrapper on this engine's
+            # tokenizer_manager. See _install_require_reasoning_proxy for why
+            # we need it. Idempotent across multiple handlers sharing one
+            # engine (decode + prefill in disagg, etc.).
+            _install_require_reasoning_proxy(engine)
             self.input_param_manager = InputParamManager(
                 self.engine.tokenizer_manager.tokenizer
                 if self.use_sglang_tokenizer
@@ -1041,6 +1101,56 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             "prompt" if isinstance(request_input, str) else "input_ids": request_input
         }
 
+    def _resolve_require_reasoning(self, input_param: Dict[str, Any]) -> bool:
+        """Detect whether the request is in the reasoning phase.
+
+        Returns True when the chat template injected a reasoning-start token
+        (e.g. `<think>`) at the end of the prompt — i.e. the worker should
+        treat the model output as continuing reasoning until the matching
+        end token (`</think>`) is emitted. This mirrors Dynamo's Rust-side
+        `prompt_injected_reasoning` heuristic in `lib/llm/src/preprocessor.rs`.
+
+        Used to flip SGLang's ``ReasonerGrammarBackend`` into "defer the
+        grammar mask until after </think>" mode for thinking-on guided
+        decoding. Without it, the schema mask fires from token 0, the model
+        cannot escape JSON to emit `</think>`, and Dynamo's frontend captures
+        the entire constrained output as ``reasoning_content`` with empty
+        ``content``.
+
+        No-ops (returns False) when the worker has no reasoning parser
+        configured, so the cost is one attribute lookup on non-reasoning
+        deployments.
+        """
+        # Only meaningful when the worker advertises a reasoning parser.
+        # `--dyn-reasoning-parser` and/or `--reasoning-parser` (SGLang side)
+        # set this. If neither is on, treat the request as non-reasoning.
+        server_args = self.config.server_args
+        if not getattr(server_args, "reasoning_parser", None) and not getattr(
+            self.config.dynamo_args, "dyn_reasoning_parser", None
+        ):
+            return False
+
+        if "prompt" in input_param:
+            prompt = input_param["prompt"]
+            return isinstance(prompt, str) and prompt.rstrip().endswith("<think>")
+
+        input_ids = input_param.get("input_ids")
+        if not input_ids:
+            return False
+
+        # Decode the trailing window — `<think>` may tokenize to 1+ tokens
+        # depending on the model. 8 covers all current GLM/Qwen/DeepSeek
+        # tokenizers without paying for a full decode.
+        suffix_ids = (
+            input_ids[-8:] if isinstance(input_ids[0], int) else input_ids[-1][-8:]
+        )
+        try:
+            tokenizer = self.engine.tokenizer_manager.tokenizer
+            suffix_text = tokenizer.decode(suffix_ids, skip_special_tokens=False)
+        except Exception:  # pragma: no cover - tokenizer access best-effort
+            return False
+        return suffix_text.rstrip().endswith("<think>")
+
     def _session_kwargs(self, request: Dict[str, Any]) -> Dict[str, Any]:
         if not getattr(self.config.server_args, "enable_streaming_session", False):
             return {}
@@ -1057,11 +1167,43 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
     def _get_guided_decoding_params(
         guided_decoding: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Extract guided decoding params (e.g. json_schema) for SGLang sampling_params."""
-        if isinstance(guided_decoding, dict):
-            json_schema = guided_decoding.get("json")
-            if json_schema is not None:
-                return {"json_schema": json.dumps(json_schema)}
+        """Extract guided decoding params for SGLang sampling_params.
+
+        Maps Dynamo's `GuidedDecodingOptions` (snake_case fields from the Rust
+        protocol struct) onto SGLang `SamplingParams` fields. Only one
+        constraint is honored per request — priority order matches SGLang's
+        own `verify()` logic (`json_schema` → `regex` → `ebnf`) plus
+        `structural_tag` and `choice`. Fields without an SGLang equivalent on
+        this code path (`backend`, `whitespace_pattern`) are ignored.
+        """
+        if not isinstance(guided_decoding, dict):
+            return {}
+
+        json_schema = guided_decoding.get("json")
+        if json_schema is not None:
+            return {"json_schema": json.dumps(json_schema)}
+
+        structural_tag = guided_decoding.get("structural_tag")
+        if structural_tag is not None:
+            if hasattr(structural_tag, "model_dump"):
+                structural_tag = structural_tag.model_dump()
+            return {"structural_tag": json.dumps(structural_tag)}
+
+        regex = guided_decoding.get("regex")
+        if regex:
+            return {"regex": regex}
+
+        grammar = guided_decoding.get("grammar")
+        if grammar:
+            return {"ebnf": grammar}
+
+        choice = guided_decoding.get("choice")
+        if choice:
+            import re
+
+            alternation = "|".join(re.escape(c) for c in choice)
+            return {"regex": f"(?:{alternation})"}
+
         return {}
 
     @staticmethod
