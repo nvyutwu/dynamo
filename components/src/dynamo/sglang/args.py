@@ -387,9 +387,6 @@ async def parse_args(args: list[str]) -> Config:
             )
 
     model_path = parsed_args.model_path
-    # Name the model
-    if not parsed_args.served_model_name:
-        parsed_args.served_model_name = model_path
 
     # Multi-model-name support — same semantics as the TRT-LLM backend
     # (commit 8911a6eb0b). SGLang's --served-model-name is a single string
@@ -400,9 +397,16 @@ async def parse_args(args: list[str]) -> Config:
     # Examples:
     #   --served-model-name "my-model alias1 alias2"
     #   DYN_SGL_SERVED_MODEL_NAME="my-model,alias1,alias2"
-    served_model_aliases: List[str] = _split_served_model_names(
-        parsed_args, dynamo_config
-    )
+    #
+    # Split BEFORE the model_path fallback below — otherwise a model path
+    # containing whitespace (e.g. ``/data/My Models/glm``) would be fed
+    # through the same splitter and produce spurious aliases.
+    _split_served_model_names(parsed_args, dynamo_config)
+
+    # Name the model — falls back to model_path only if neither
+    # --served-model-name nor an env var supplied one.
+    if not parsed_args.served_model_name:
+        parsed_args.served_model_name = model_path
     # Download the model if necessary using modelexpress.
     # We don't set `parsed_args.model_path` to the local path fetch_model returns
     # because sglang will send this to its pipeline-parallel workers, which may

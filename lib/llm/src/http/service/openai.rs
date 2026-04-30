@@ -499,7 +499,7 @@ async fn completions(
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
@@ -509,19 +509,28 @@ async fn completions_single(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = request.inner.model.clone();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    // Resolve any alias to the canonical primary served name and rewrite the
+    // request in place. Engine routing, metrics labels, and the OpenAI
+    // response.model all derive from this single name afterwards — matching
+    // vLLM/SGLang behavior where alias requests still respond with primary.
+    let canonical = state
+        .manager()
+        .resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
+    }
+    let model = canonical;
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &metrics_model,
+        &model,
         Endpoint::Completions,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
@@ -533,7 +542,7 @@ async fn completions_single(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -641,7 +650,7 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
@@ -651,19 +660,26 @@ async fn completions_batch(
 
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
-    let model = request.inner.model.clone();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name.
+    let canonical = state
+        .manager()
+        .resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
+    }
+    let model = canonical;
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &metrics_model,
+        &model,
         Endpoint::Completions,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     let (engine, parsing_options) = state
         .manager()
@@ -674,7 +690,7 @@ async fn completions_batch(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -822,33 +838,36 @@ async fn completions_batch(
 async fn embeddings(
     State(state): State<Arc<service_v2::State>>,
     headers: HeaderMap,
-    Json(request): Json<NvCreateEmbeddingRequest>,
+    Json(mut request): Json<NvCreateEmbeddingRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(&headers);
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name.
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical.clone();
+    }
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
     // Embeddings are typically not streamed, so we default to non-streaming
     let streaming = false;
 
-    // todo - make the protocols be optional for model name
-    // todo - when optional, if none, apply a default
     let model = &request.inner.model;
-    let metrics_model = state.manager().resolve_canonical_name(model);
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight = state.metrics_clone().create_inflight_guard(
-        &metrics_model,
+        model,
         Endpoint::Embeddings,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
 
     // todo - error handling should be more robust
     let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
@@ -857,8 +876,8 @@ async fn embeddings(
         err_response
     })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
-    let model_name = metrics_model.clone();
+    let mut response_collector = state.metrics_clone().create_response_collector(model);
+    let model_name = model.to_string();
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1215,14 +1234,21 @@ async fn chat_completions(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
-    let model = request.inner.model.clone();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name.
+    let canonical = state
+        .manager()
+        .resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
+    }
+    let model = canonical;
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
     // Create inflight_guard early to ensure all errors (including validation) are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &metrics_model,
+        &model,
         Endpoint::ChatCompletions,
         streaming,
         &request_id,
@@ -1269,7 +1295,7 @@ async fn chat_completions(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     let annotations = request.annotations();
 
@@ -1594,14 +1620,21 @@ async fn responses(
     }
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name. The Responses API
+    // wraps model in Option<String>, so we re-wrap after resolution.
+    let original = request.inner.model.clone().unwrap_or_default();
+    let canonical = state.manager().resolve_canonical_name(&original);
+    if canonical != original {
+        request.inner.model = Some(canonical.clone());
+    }
+    let model = canonical;
     let streaming = request.inner.stream.unwrap_or(false);
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &metrics_model,
+        &model,
         Endpoint::Responses,
         streaming,
         request.id(),
@@ -1690,7 +1723,7 @@ async fn responses(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     tracing::trace!("Issuing generate call for responses");
 
