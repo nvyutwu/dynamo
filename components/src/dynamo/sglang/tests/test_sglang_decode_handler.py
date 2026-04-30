@@ -354,8 +354,10 @@ def test_validate_parser_flags_rejects_both_tool_call_parsers():
 
 
 class _FakeServerArgs:
-    def __init__(self, reasoning_parser):
+    def __init__(self, reasoning_parser, model_path=None):
         self.reasoning_parser = reasoning_parser
+        self.model_path = model_path
+        self.tokenizer_path = None
 
 
 class _FakeDynamoArgs:
@@ -364,8 +366,8 @@ class _FakeDynamoArgs:
 
 
 class _FakeConfig:
-    def __init__(self, sglang_parser=None, dynamo_parser=None):
-        self.server_args = _FakeServerArgs(sglang_parser)
+    def __init__(self, sglang_parser=None, dynamo_parser=None, model_path=None):
+        self.server_args = _FakeServerArgs(sglang_parser, model_path)
         self.dynamo_args = _FakeDynamoArgs(dynamo_parser)
 
 
@@ -387,14 +389,42 @@ class _FakeEngine:
     tokenizer_manager = _TM()
 
 
-class _StubHandler:
-    """Just enough surface to call BaseWorkerHandler._resolve_require_reasoning."""
+class _FakeEngineNoTokenizer:
+    """Mirrors SGLang's skip_tokenizer_init=True: tokenizer_manager exists but
+    tokenizer_manager.tokenizer is None. This is the production deployment
+    shape for Dynamo+SGLang and was the silent-failure case the v3 fix
+    addresses.
+    """
 
-    def __init__(self, sglang_parser=None, dynamo_parser=None):
-        self.config = _FakeConfig(sglang_parser, dynamo_parser)
-        self.engine = _FakeEngine()
+    class _TM:
+        tokenizer = None
+
+    tokenizer_manager = _TM()
+
+
+class _StubHandler:
+    """Just enough surface to call BaseWorkerHandler._resolve_require_reasoning.
+
+    Bypasses BaseWorkerHandler.__init__, so we set ``_reasoning_tokenizer``
+    directly the way the real init would have (engine tokenizer if available,
+    else fallback).
+    """
+
+    def __init__(
+        self,
+        sglang_parser=None,
+        dynamo_parser=None,
+        engine=None,
+        reasoning_tokenizer=_FakeTokenizer(),
+        model_path=None,
+    ):
+        self.config = _FakeConfig(sglang_parser, dynamo_parser, model_path)
+        self.engine = engine if engine is not None else _FakeEngine()
+        self._reasoning_tokenizer = reasoning_tokenizer
 
     _resolve_require_reasoning = BaseWorkerHandler._resolve_require_reasoning
+    _has_reasoning_parser = BaseWorkerHandler._has_reasoning_parser
+    _acquire_reasoning_tokenizer = BaseWorkerHandler._acquire_reasoning_tokenizer
 
 
 def test_resolve_require_reasoning_no_parser_returns_false():
@@ -535,3 +565,243 @@ def test_install_require_reasoning_proxy_handles_none_engine():
         tokenizer_manager = None
 
     _install_require_reasoning_proxy(_NoTM())
+
+
+def test_install_require_reasoning_proxy_preserves_function_metadata():
+    """functools.wraps lets debuggers/tracers see through the wrapper."""
+    from dynamo.sglang.request_handlers.handler_base import (
+        _install_require_reasoning_proxy,
+    )
+
+    tm = _RecorderTokenizerManager()
+    original = tm.generate_request
+    engine = _EngineWithTM(tm)
+    _install_require_reasoning_proxy(engine)
+
+    wrapped = tm.generate_request
+    # __wrapped__ is the canonical breadcrumb left by functools.wraps.
+    assert getattr(wrapped, "__wrapped__", None) is original
+    assert wrapped.__name__ == original.__name__
+
+
+# ─── tokenizer fallback when engine.tokenizer_manager.tokenizer is None ─────
+
+
+def test_resolve_require_reasoning_returns_false_when_tokenizer_missing():
+    """When skip_tokenizer_init=True and no fallback tokenizer was loaded,
+    token-input requests must still terminate cleanly with False (not raise).
+    Pre-fix this branch swallowed an AttributeError on None.decode and
+    silently disabled the entire fix.
+    """
+    h = _StubHandler(
+        sglang_parser="glm45",
+        engine=_FakeEngineNoTokenizer(),
+        reasoning_tokenizer=None,
+    )
+    # Even though the prompt ends in <think> (token id 99), with no tokenizer
+    # we cannot decode the suffix and must return False.
+    assert h._resolve_require_reasoning({"input_ids": [1, 2, 3, 99]}) is False
+    # The text-input branch does not need a tokenizer and should still work.
+    assert h._resolve_require_reasoning({"prompt": "hello\n<think>"}) is True
+
+
+def test_acquire_reasoning_tokenizer_returns_engine_tokenizer():
+    """Happy path: engine has a tokenizer, no fallback load needed."""
+    h = _StubHandler(sglang_parser="glm45")  # engine = _FakeEngine() with tokenizer
+    assert h._acquire_reasoning_tokenizer() is _FakeEngine.tokenizer_manager.tokenizer
+
+
+def test_acquire_reasoning_tokenizer_returns_none_without_parser():
+    """If no reasoning parser is configured, don't waste time loading
+    a tokenizer — every request will return False anyway."""
+    h = _StubHandler(sglang_parser=None, dynamo_parser=None)
+    assert h._acquire_reasoning_tokenizer() is None
+
+
+def test_acquire_reasoning_tokenizer_warns_when_no_path(caplog):
+    """skip_tokenizer_init=True path with no model_path on server_args:
+    must return None and emit a warning so operators can diagnose."""
+    import logging as _logging
+
+    h = _StubHandler(
+        sglang_parser="glm45",
+        engine=_FakeEngineNoTokenizer(),
+        model_path=None,
+    )
+    with caplog.at_level(_logging.WARNING):
+        result = h._acquire_reasoning_tokenizer()
+    assert result is None
+    assert any(
+        "no tokenizer is available" in rec.message
+        or "no model_path" in rec.message
+        or "Reasoning parser is configured" in rec.message
+        for rec in caplog.records
+    )
+
+
+# ─── concurrent CV propagation ───────────────────────────────────────────────
+
+
+def test_cv_propagates_across_concurrent_tasks():
+    """Two concurrent asyncio tasks must each see their own CV value when
+    the wrapper executes, even when they share a single tokenizer_manager.
+    Regression guard: if the wrapper ever moved CV-read out of the synchronous
+    call into a thread pool or to a non-task-bound coroutine, this would fail.
+    """
+    import asyncio
+
+    from dynamo.sglang.request_handlers.handler_base import (
+        _DYN_REQUIRE_REASONING_CV,
+        _install_require_reasoning_proxy,
+    )
+
+    tm = _RecorderTokenizerManager()
+    seen_flags: list[tuple[str, bool]] = []
+
+    original = tm.generate_request
+
+    def _record_call(obj, request):
+        result = original(obj, request)
+        seen_flags.append((request, obj.require_reasoning))
+        return result
+
+    tm.generate_request = _record_call
+    engine = _EngineWithTM(tm)
+    _install_require_reasoning_proxy(engine)
+
+    async def one_request(label: str, expect: bool):
+        token = _DYN_REQUIRE_REASONING_CV.set(expect)
+        try:
+            await asyncio.sleep(0)  # yield so tasks interleave
+            obj = _GenerateReqInputStub()
+            tm.generate_request(obj, label)
+            await asyncio.sleep(0)
+            assert obj.require_reasoning is expect
+        finally:
+            _DYN_REQUIRE_REASONING_CV.reset(token)
+
+    async def main():
+        await asyncio.gather(
+            one_request("task-true", True),
+            one_request("task-false", False),
+        )
+
+    asyncio.run(main())
+
+    # Each task saw its own CV value — no cross-contamination.
+    by_label = dict(seen_flags)
+    assert by_label["task-true"] is True
+    assert by_label["task-false"] is False
+
+
+def test_cv_resets_on_cancellation_between_set_and_await():
+    """Mirrors decode_handler's try/finally invariant: even if the awaited
+    engine.async_generate is cancelled, the contextvar must be reset on the
+    way out so the next request on the same task sees the default.
+    """
+    import asyncio
+
+    from dynamo.sglang.request_handlers.handler_base import (
+        _DYN_REQUIRE_REASONING_CV,
+    )
+
+    async def main():
+        token = _DYN_REQUIRE_REASONING_CV.set(True)
+        try:
+            # Simulate engine.async_generate being awaited then cancelled.
+            task = asyncio.create_task(asyncio.sleep(10))
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            _DYN_REQUIRE_REASONING_CV.reset(token)
+        # After reset, default applies.
+        assert _DYN_REQUIRE_REASONING_CV.get() is False
+
+    asyncio.run(main())
+
+
+# ─── end-to-end: fake engine.async_generate routes through the wrapper ──────
+
+
+def test_end_to_end_engine_async_generate_routes_through_wrapper():
+    """Smokes the full chain that decode_handler / prefill_handler relies on:
+
+    handler sets CV → handler awaits engine.async_generate → engine internally
+    calls tokenizer_manager.generate_request (wrapped) with a GenerateReqInput
+    constructed during the call → wrapper reads CV → wrapper mutates obj →
+    handler's finally resets CV → engine returns the async generator.
+
+    The mutation must persist on `obj` after the CV is reset.
+    """
+    import asyncio
+
+    from dynamo.sglang.request_handlers.handler_base import (
+        _DYN_REQUIRE_REASONING_CV,
+        _install_require_reasoning_proxy,
+    )
+
+    tm = _RecorderTokenizerManager()
+
+    class _FakeAsyncGenerator:
+        async def __aiter__(self):
+            yield {"meta_info": {"id": "x", "finish_reason": None}, "output_ids": [1]}
+
+    class _FakeEngineRoutes:
+        def __init__(self, tm):
+            self.tokenizer_manager = tm
+
+        async def async_generate(self, **kwargs):
+            # Mirrors SGLang's Engine.async_generate: build a GenerateReqInput,
+            # call tokenizer_manager.generate_request synchronously inside the
+            # await (before returning the async generator).
+            obj = _GenerateReqInputStub()
+            self.tokenizer_manager.generate_request(obj, None)
+            # Snapshot so the test can assert on it post-await.
+            self.last_obj = obj
+            return _FakeAsyncGenerator()
+
+    engine = _FakeEngineRoutes(tm)
+    _install_require_reasoning_proxy(engine)
+
+    async def run_request(expect: bool):
+        token = _DYN_REQUIRE_REASONING_CV.set(expect)
+        try:
+            stream = await engine.async_generate()
+        finally:
+            _DYN_REQUIRE_REASONING_CV.reset(token)
+        # CV is back to default by now — but mutation on obj persists.
+        assert engine.last_obj.require_reasoning is expect
+        # The returned async generator is still usable.
+        async for _ in stream:
+            pass
+
+    asyncio.run(run_request(True))
+    asyncio.run(run_request(False))
+
+
+# ─── prefill handler call site is wrapped ────────────────────────────────────
+
+
+def test_prefill_handler_imports_cv_and_wraps_async_generate():
+    """Source-level guard that the prefill handler also drives the CV.
+    Without this wrap, disagg requests enter SGLang prefill with
+    require_reasoning=False even when the prompt is mid-thinking, which
+    can defeat the gate when grammar state is shared with decode.
+    """
+    import inspect
+
+    from dynamo.sglang.request_handlers.llm import prefill_handler
+
+    src = inspect.getsource(prefill_handler)
+    assert "_DYN_REQUIRE_REASONING_CV" in src, (
+        "prefill_handler must import _DYN_REQUIRE_REASONING_CV"
+    )
+    assert "_DYN_REQUIRE_REASONING_CV.set(" in src and (
+        "_DYN_REQUIRE_REASONING_CV.reset(" in src
+    ), "prefill handler must wrap engine.async_generate with CV try/finally"
+    assert "self._resolve_require_reasoning(" in src, (
+        "prefill handler must derive the CV value via _resolve_require_reasoning"
+    )
