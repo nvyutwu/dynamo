@@ -52,6 +52,7 @@ async def _register_model_with_runtime_config(
         if output_type != ModelType.Embedding:
             output_type = ModelType.Chat
 
+    aliases = list(getattr(dynamo_args, "served_model_aliases", []) or [])
     try:
         await register_model(
             input_type,
@@ -63,8 +64,15 @@ async def _register_model_with_runtime_config(
             kv_cache_block_size=server_args.page_size,
             runtime_config=runtime_config,
             custom_template_path=dynamo_args.custom_jinja_template,
+            model_aliases=aliases or None,
         )
-        logging.info("Successfully registered LLM with runtime config")
+        if aliases:
+            logging.info(
+                "Successfully registered LLM with runtime config (aliases: %s)",
+                aliases,
+            )
+        else:
+            logging.info("Successfully registered LLM with runtime config")
         return True
     except Exception as e:
         logging.error(f"Failed to register with runtime config: {e}")
