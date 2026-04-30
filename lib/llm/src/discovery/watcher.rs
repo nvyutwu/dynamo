@@ -1091,6 +1091,17 @@ impl ModelWatcher {
             );
         }
 
+        // Register alias→primary mappings BEFORE the engine becomes visible.
+        // Order matters: any request landing between engine-visible and
+        // alias-mapped would see correct routing but mis-labelled metrics
+        // (and an OpenAI response.model echoing the alias instead of the
+        // primary). Recording the mapping first closes that gap.
+        for alias in &card.aliases {
+            if alias != card.name() {
+                self.manager.register_alias(alias, card.name());
+            }
+        }
+
         // Add the completed WorkerSet to the Model
         self.manager
             .add_worker_set(card.name(), &ws_key, worker_set);
@@ -1108,7 +1119,6 @@ impl ModelWatcher {
                             );
                             self.manager
                                 .add_worker_set_arc(alias, &ws_key, ws_arc.clone());
-                            self.manager.register_alias(alias, card.name());
                         }
                     }
                 }

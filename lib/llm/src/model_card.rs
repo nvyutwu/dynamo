@@ -416,6 +416,22 @@ impl ModelDeploymentCard {
                     bytes_to_hash.extend(blake3::hash(&bytes).as_bytes());
                 }
 
+                // Aliases — sorted for deterministic ordering. Including them
+                // means a worker rejoining the namespace with a different
+                // alias list fails the checksum-compatibility check (rather
+                // than silently dropping the alias delta on the rejoin path
+                // in watcher.rs::handle_put).
+                if !self.aliases.is_empty() {
+                    let mut sorted_aliases = self.aliases.clone();
+                    sorted_aliases.sort();
+                    for alias in &sorted_aliases {
+                        bytes_to_hash.extend(alias.as_bytes());
+                        bytes_to_hash.push(0);
+                    }
+                }
+
+                // TODO: Do we want any of user_data or runtime_config?
+
                 blake3::hash(&bytes_to_hash).to_string()
             })
             .as_ref()
