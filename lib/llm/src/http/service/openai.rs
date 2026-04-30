@@ -712,7 +712,7 @@ async fn completions(
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
@@ -722,8 +722,20 @@ async fn completions_single(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = request.inner.model.clone();
-    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
+    // Resolve any alias to the canonical primary served name and rewrite the
+    // request in place. Engine routing, metrics labels, and the OpenAI
+    // response.model all derive from this single name afterwards — matching
+    // vLLM/SGLang behavior where alias requests still respond with primary.
+    let canonical = state
+        .manager()
+        .resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
+    }
+    let model = canonical;
+    // Bound unknown/unregistered model names to the sentinel so they cannot
+    // pollute Prometheus label cardinality.
+    let metric_model = state.manager().metric_model_for(&model).to_string();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -735,6 +747,7 @@ async fn completions_single(
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
@@ -749,6 +762,7 @@ async fn completions_single(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -863,7 +877,7 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
@@ -873,8 +887,18 @@ async fn completions_batch(
 
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
-    let model = request.inner.model.clone();
-    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name.
+    let canonical = state
+        .manager()
+        .resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
+    }
+    let model = canonical;
+    // Bound unknown/unregistered model names to the sentinel so they cannot
+    // pollute Prometheus label cardinality.
+    let metric_model = state.manager().metric_model_for(&model).to_string();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -886,6 +910,7 @@ async fn completions_batch(
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     let (engine, parsing_options) = state
         .manager()
@@ -899,6 +924,7 @@ async fn completions_batch(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1069,6 +1095,12 @@ async fn embeddings(
     }
 
     let request_id = get_or_create_request_id(&headers);
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name.
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical.clone();
+    }
     let request = context_from_headers(request, request_id, &headers)?;
     let request_id = request.id().to_string();
 
@@ -1089,10 +1121,10 @@ async fn embeddings(
     // Embeddings are typically not streamed, so we default to non-streaming
     let streaming = false;
 
-    // todo - make the protocols be optional for model name
-    // todo - when optional, if none, apply a default
     let model = &request.inner.model;
-    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(model)).to_string();
+    // `model` was rewritten to the canonical primary above; bound unknown names
+    // to the sentinel so they cannot pollute Prometheus label cardinality.
+    let metric_model = state.manager().metric_model_for(model).to_string();
 
     // Start the embedding-specific latency timer. Distinct from
     // `request_duration` (which has 1..512s LLM-gen buckets); pooling-model
@@ -1111,6 +1143,7 @@ async fn embeddings(
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
 
     // todo - error handling should be more robust
     let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
@@ -1122,6 +1155,7 @@ async fn embeddings(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(model);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -1636,14 +1670,25 @@ async fn chat_completions(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
-    let model = request.inner.model.clone();
-    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name.
+    let canonical = state
+        .manager()
+        .resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
+    }
+    let model = canonical;
+    // Bound unknown/unregistered model names to the sentinel so they cannot
+    // pollute Prometheus label cardinality.
+    let metric_model = state.manager().metric_model_for(&model).to_string();
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
     // Create inflight_guard early to ensure all errors (including validation) are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
         &metric_model,
+        &model,
         Endpoint::ChatCompletions,
         streaming,
         &request_id,
@@ -1711,6 +1756,7 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     let annotations = request.annotations();
 
@@ -2076,7 +2122,18 @@ async fn responses(
     }
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
+    // Resolve alias → primary served name; rewrite request so engine, metrics,
+    // and OpenAI response.model all use the canonical name. The Responses API
+    // wraps model in Option<String>, so we re-wrap after resolution.
+    let original = request.inner.model.clone().unwrap_or_default();
+    let canonical = state.manager().resolve_canonical_name(&original);
+    if canonical != original {
+        request.inner.model = Some(canonical.clone());
+    }
+    let model = canonical;
+    // Bound unknown/unregistered model names to the sentinel so they cannot
+    // pollute Prometheus label cardinality.
+    let metric_model = state.manager().metric_model_for(&model).to_string();
     let streaming = request.inner.stream.unwrap_or(false);
     let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
 
@@ -2084,6 +2141,9 @@ async fn responses(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
         &metric_model,
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
+    let mut inflight_guard = state.metrics_clone().create_inflight_guard(
+        &model,
         Endpoint::Responses,
         streaming,
         request.id(),
@@ -2190,6 +2250,7 @@ async fn responses(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     tracing::trace!("Issuing generate call for responses");
 

@@ -189,18 +189,58 @@ impl ModelManager {
 
     /// Add an already-Arc-wrapped WorkerSet to a Model. Creates the Model if it doesn't exist.
     /// Used to register the same WorkerSet under multiple model names (aliases).
+    ///
+    /// Logs a warning and skips if a *different* primary already owns this name —
+    /// this guards against operator misconfiguration where two unrelated models
+    /// declare a colliding alias. The first claim wins; the second is rejected.
     pub fn add_worker_set_arc(
         &self,
         model_name: &str,
         namespace: &str,
         worker_set: Arc<WorkerSet>,
     ) {
+        // Collision check: if `model_name` already exists as a primary (i.e.
+        // not currently mapped to anything in alias_to_primary, AND already
+        // has worker sets), refuse to clobber it.
+        if let Some(existing) = self.models.get(model_name) {
+            if !existing.is_empty()
+                && !self.alias_to_primary.contains_key(model_name)
+            {
+                tracing::warn!(
+                    alias = model_name,
+                    namespace,
+                    "Alias collides with a registered primary model — skipping. \
+                     Choose a different alias or rename the conflicting model."
+                );
+                return;
+            }
+        }
+
         let model = self.get_or_create_model(model_name);
         model.add_worker_set(namespace.to_string(), worker_set);
     }
 
     /// Record that `alias` is an alternate name for `primary`. Used to normalize metrics labels.
+    ///
+    /// Logs a warning and refuses to overwrite if `alias` is already mapped to a
+    /// *different* primary. First-write-wins semantics so operators can detect
+    /// alias conflicts in logs rather than discovering them by silent metric
+    /// re-attribution.
     pub fn register_alias(&self, alias: &str, primary: &str) {
+        if let Some(existing) = self.alias_to_primary.get(alias) {
+            if existing.value() != primary {
+                tracing::warn!(
+                    alias,
+                    new_primary = primary,
+                    existing_primary = existing.value().as_str(),
+                    "Alias is already claimed by a different primary — refusing to overwrite. \
+                     Existing claim wins."
+                );
+                return;
+            }
+            // Same alias→same primary — idempotent, no-op.
+            return;
+        }
         self.alias_to_primary
             .insert(alias.to_string(), primary.to_string());
     }
