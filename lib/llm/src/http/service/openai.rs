@@ -811,9 +811,10 @@ async fn embeddings(
     let request_id = get_or_create_request_id(&headers);
     // Resolve alias → primary served name; rewrite request so engine, metrics,
     // and OpenAI response.model all use the canonical name.
-    let canonical = state.manager().resolve_canonical_name(&request.model);
-    if canonical != request.model {
-        request.model = canonical.clone();
+    // NvCreateEmbeddingRequest wraps an inner OpenAI struct, hence .inner.model.
+    let canonical = state.manager().resolve_canonical_name(&request.inner.model);
+    if canonical != request.inner.model {
+        request.inner.model = canonical.clone();
     }
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
