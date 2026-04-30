@@ -5,13 +5,14 @@ import contextlib
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import tempfile
 import warnings
 from argparse import Namespace
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import yaml
 from sglang.srt.server_args import ServerArgs
@@ -108,6 +109,45 @@ def _validate_parser_flags(
     if sglang_val and dynamo_val:
         logging.error(f"Cannot use both --{name} and --dyn-{name}.")
         sys.exit(1)
+
+
+def _split_served_model_names(
+    parsed_args: argparse.Namespace, dynamo_config: DynamoSGLangConfig
+) -> List[str]:
+    """Split a packed --served-model-name into primary + aliases.
+
+    SGLang's upstream ``--served-model-name`` is a single string field; we
+    keep that interface and treat whitespace- or comma-separated values as
+    multiple names — first wins as the primary, rest become aliases.
+
+    Mutates ``parsed_args.served_model_name`` to the primary string and
+    stores the alias list on ``dynamo_config.served_model_aliases``.
+    Returns the alias list for the caller's convenience.
+
+    No-op when only one name is given. Empty list when no names parse out.
+    """
+    raw = parsed_args.served_model_name
+    if isinstance(raw, (list, tuple)):
+        # SGLang doesn't pass a list today, but be defensive.
+        names = [str(n).strip() for n in raw if str(n).strip()]
+    elif isinstance(raw, str):
+        names = [n for n in re.split(r"[\s,]+", raw.strip()) if n]
+    else:
+        names = []
+
+    if not names:
+        return []
+
+    primary, *aliases = names
+    parsed_args.served_model_name = primary
+    dynamo_config.served_model_aliases = aliases
+    if aliases:
+        logging.info(
+            "Multi-name registration: primary=%r, aliases=%s",
+            primary,
+            aliases,
+        )
+    return aliases
 
 
 def _has_cli_flag(args: list[str], flag: str) -> bool:
@@ -431,6 +471,19 @@ async def parse_args(args: list[str]) -> Config:
     # Name the model
     if not parsed_args.served_model_name:
         parsed_args.served_model_name = model_path
+
+    # Multi-model-name support — same semantics as the TRT-LLM backend
+    # (commit 8911a6eb0b). SGLang's --served-model-name is a single string
+    # in upstream, but a user can pack multiple names into it (whitespace-
+    # or comma-separated). The first becomes the primary served name, the
+    # rest become aliases plumbed to register_model() via dynamo_config.
+    #
+    # Examples:
+    #   --served-model-name "my-model alias1 alias2"
+    #   DYN_SGL_SERVED_MODEL_NAME="my-model,alias1,alias2"
+    served_model_aliases: List[str] = _split_served_model_names(
+        parsed_args, dynamo_config
+    )
     # Download the model if necessary using modelexpress.
     # We don't set `parsed_args.model_path` to the local path fetch_model returns
     # because sglang will send this to its pipeline-parallel workers, which may
