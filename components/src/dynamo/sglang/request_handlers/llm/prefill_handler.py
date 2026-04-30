@@ -11,7 +11,10 @@ from dynamo._core import Context
 from dynamo.common.utils.otel_tracing import build_trace_headers
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
-from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
+from dynamo.sglang.request_handlers.handler_base import (
+    _DYN_REQUIRE_REASONING_CV,
+    BaseWorkerHandler,
+)
 
 # Sentinel value matching u32::MAX from the C/Go prefill-routing ABI.
 # This remains as a compatibility fallback for older callers that still encode
@@ -153,20 +156,35 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 f"Prefill request {context.id()} will use LoRA adapter: {lora_path}"
             )
 
-        results = await self.engine.async_generate(
-            **input_param,
-            sampling_params=sampling_params,
-            stream=True,
-            bootstrap_host=bootstrap_host,
-            bootstrap_port=bootstrap_port,
-            bootstrap_room=bootstrap_room,
-            external_trace_header=trace_header,
-            rid=trace_id,
-            data_parallel_rank=dp_rank,
-            **self._session_kwargs(inner_request),
-            lora_path=lora_path,
-            **self._priority_kwargs(priority),
+        # Set require_reasoning in the contextvar so the wrapper installed on
+        # tokenizer_manager.generate_request flips obj.require_reasoning before
+        # SGLang materializes the grammar/json_schema mask. Mirrors the decode
+        # handler — without this, prefill enters SGLang with
+        # require_reasoning=False even when the prompt is mid-thinking, which
+        # at minimum breaks aggregated grammar state shared with decode and
+        # in some SGLang versions defeats the gate entirely.
+        cv_token = _DYN_REQUIRE_REASONING_CV.set(
+            self._resolve_require_reasoning(input_param)
         )
+        try:
+            results = await self.engine.async_generate(
+                **input_param,
+                sampling_params=sampling_params,
+                stream=True,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=bootstrap_room,
+                external_trace_header=trace_header,
+                rid=trace_id,
+                data_parallel_rank=dp_rank,
+                **self._session_kwargs(inner_request),
+                lora_path=lora_path,
+                **self._priority_kwargs(priority),
+            )
+        finally:
+            # The wrapper has already mutated the GenerateReqInput in-place,
+            # so it is safe to reset before iterating the stream.
+            _DYN_REQUIRE_REASONING_CV.reset(cv_token)
 
         task = asyncio.create_task(self._consume_results(results, context))
         self._consume_tasks.add(task)

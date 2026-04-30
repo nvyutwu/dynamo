@@ -4,6 +4,7 @@
 import asyncio
 import contextvars
 import dataclasses
+import functools
 import importlib
 import inspect
 import json
@@ -144,6 +145,13 @@ _DYN_REQUIRE_REASONING_CV: contextvars.ContextVar[bool] = contextvars.ContextVar
 )
 
 
+# Module-level lock guarding the proxy install — handler __init__ is sync today,
+# but a future code path that constructs handlers from a coroutine (e.g.
+# asyncio.gather of prefill+decode init sharing one engine) could race the
+# check-then-set sequence and chain wrappers. Cheap insurance.
+_PROXY_INSTALL_LOCK = threading.Lock()
+
+
 def _install_require_reasoning_proxy(engine: "sgl.Engine") -> None:
     """Wrap the engine's tokenizer_manager.generate_request once.
 
@@ -156,26 +164,39 @@ def _install_require_reasoning_proxy(engine: "sgl.Engine") -> None:
     Idempotent — re-invoking on a wrapped tokenizer_manager is a no-op.
     """
     tm = getattr(engine, "tokenizer_manager", None)
-    if tm is None or getattr(tm, "_dynamo_require_reasoning_wrapped", False):
+    if tm is None:
         return
 
-    original = tm.generate_request
+    with _PROXY_INSTALL_LOCK:
+        # Re-check inside the lock (CAS pattern).
+        if getattr(tm, "_dynamo_require_reasoning_wrapped", False):
+            return
 
-    def _wrapped(obj, request):  # signature mirrors TokenizerManager.generate_request
-        try:
-            if _DYN_REQUIRE_REASONING_CV.get():
-                # `require_reasoning` is a plain attribute on
-                # GenerateReqInput; assignment is safe even if the
-                # in-tree default is False.
-                obj.require_reasoning = True
-        except Exception as exc:  # pragma: no cover - best-effort, never fail the request
-            logger.debug(
-                "Failed to set require_reasoning on GenerateReqInput: %s", exc
-            )
-        return original(obj, request)
+        original = tm.generate_request
 
-    tm.generate_request = _wrapped  # type: ignore[assignment]
-    tm._dynamo_require_reasoning_wrapped = True  # type: ignore[attr-defined]
+        @functools.wraps(original)
+        def _wrapped(obj, request):
+            try:
+                if _DYN_REQUIRE_REASONING_CV.get():
+                    # `require_reasoning` is a plain attribute on
+                    # GenerateReqInput; assignment is safe even if the
+                    # in-tree default is False. The wrapper runs synchronously
+                    # inside the await of engine.async_generate, so the
+                    # mutation lands on `obj` before the returned async
+                    # generator is iterated and before the caller's
+                    # try/finally resets the contextvar.
+                    obj.require_reasoning = True
+            except Exception as exc:  # pragma: no cover - best-effort, never fail the request
+                logger.debug(
+                    "Failed to set require_reasoning on GenerateReqInput: %s", exc
+                )
+            return original(obj, request)
+
+        # Set the sentinel BEFORE swapping generate_request so a concurrent
+        # second installer sees the flag and bails out, even if it reads
+        # _dynamo_require_reasoning_wrapped before acquiring the lock.
+        tm._dynamo_require_reasoning_wrapped = True  # type: ignore[attr-defined]
+        tm.generate_request = _wrapped  # type: ignore[assignment]
 
 
 class BaseGenerativeHandler(ABC, Generic[RequestT, ResponseT]):
@@ -775,6 +796,13 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             # have an sgl.Engine.
             self.input_param_manager = InputParamManager(None)
             self._engine_supports_priority = False
+
+        # Resolve a tokenizer for reasoning suffix detection in
+        # _resolve_require_reasoning. The engine's tokenizer_manager.tokenizer
+        # is None when SGLang runs with skip_tokenizer_init=True (Dynamo's
+        # default token-id wire format), so we fall back to loading from
+        # server_args.model_path.
+        self._reasoning_tokenizer = self._acquire_reasoning_tokenizer()
         self._quiesce_controller = (
             SGLangEngineQuiesceController(engine) if engine is not None else None
         )
@@ -1101,6 +1129,79 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             "prompt" if isinstance(request_input, str) else "input_ids": request_input
         }
 
+    def _has_reasoning_parser(self) -> bool:
+        server_args = self.config.server_args
+        return bool(
+            getattr(server_args, "reasoning_parser", None)
+            or getattr(self.config.dynamo_args, "dyn_reasoning_parser", None)
+        )
+
+    def _acquire_reasoning_tokenizer(self) -> Any:
+        """Resolve a tokenizer for reasoning-suffix detection.
+
+        Returns:
+            A tokenizer with a ``decode`` method, or None if no reasoning
+            parser is configured / no tokenizer can be obtained. When None,
+            ``_resolve_require_reasoning`` will return False for token-input
+            requests (the text-input path doesn't need a tokenizer).
+
+        Resolution order:
+          1. ``engine.tokenizer_manager.tokenizer`` — present when SGLang runs
+             with ``skip_tokenizer_init=False`` (e.g. integration tests using
+             ``use_sglang_tokenizer=True``).
+          2. Fallback: ``AutoTokenizer.from_pretrained(server_args.model_path)``
+             — required for the production path where Dynamo tokenizes at the
+             frontend and SGLang runs with ``skip_tokenizer_init=True``.
+
+        Logs a single warning if neither succeeds; emits no warning on the
+        non-reasoning path (cheap default).
+        """
+        if not self._has_reasoning_parser():
+            return None
+
+        engine_tok = None
+        tm = getattr(self.engine, "tokenizer_manager", None) if self.engine else None
+        if tm is not None:
+            engine_tok = getattr(tm, "tokenizer", None)
+        if engine_tok is not None:
+            return engine_tok
+
+        server_args = self.config.server_args
+        model_path = getattr(server_args, "model_path", None) or getattr(
+            server_args, "tokenizer_path", None
+        )
+        if not model_path:
+            logger.warning(
+                "Reasoning parser is configured but no tokenizer is available "
+                "(engine.tokenizer_manager.tokenizer is None and "
+                "server_args.model_path is unset). Token-input requests will "
+                "not activate ReasonerGrammarBackend; thinking-on guided "
+                "decoding may misbehave."
+            )
+            return None
+
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True
+            )
+            logger.info(
+                "Loaded fallback tokenizer for reasoning detection from %s",
+                model_path,
+            )
+            return tokenizer
+        except Exception as exc:
+            logger.warning(
+                "Failed to load fallback tokenizer from %s for reasoning "
+                "detection: %s. Token-input requests will not activate "
+                "ReasonerGrammarBackend; thinking-on guided decoding may "
+                "misbehave.",
+                model_path,
+                exc,
+            )
+            return None
+
     def _resolve_require_reasoning(self, input_param: Dict[str, Any]) -> bool:
         """Detect whether the request is in the reasoning phase.
 
@@ -1124,10 +1225,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         # Only meaningful when the worker advertises a reasoning parser.
         # `--dyn-reasoning-parser` and/or `--reasoning-parser` (SGLang side)
         # set this. If neither is on, treat the request as non-reasoning.
-        server_args = self.config.server_args
-        if not getattr(server_args, "reasoning_parser", None) and not getattr(
-            self.config.dynamo_args, "dyn_reasoning_parser", None
-        ):
+        if not self._has_reasoning_parser():
             return False
 
         if "prompt" in input_param:
@@ -1138,15 +1236,25 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         if not input_ids:
             return False
 
+        tokenizer = self._reasoning_tokenizer
+        if tokenizer is None:
+            # Init already logged the reason; the request silently falls
+            # back to require_reasoning=False (matches pre-fix behavior).
+            return False
+
         # Decode the trailing window — `<think>` may tokenize to 1+ tokens
         # depending on the model. 8 covers all current GLM/Qwen/DeepSeek
         # tokenizers without paying for a full decode.
         suffix_ids = (
-            input_ids[-8:] if isinstance(input_ids[0], int) else input_ids[-1][-8:]
+            input_ids[-8:]
+            if isinstance(input_ids[0], (int,))
+            and not isinstance(input_ids[0], bool)
+            else input_ids[-1][-8:]
         )
         try:
-            tokenizer = self.engine.tokenizer_manager.tokenizer
-            suffix_text = tokenizer.decode(suffix_ids, skip_special_tokens=False)
+            suffix_text = tokenizer.decode(
+                list(suffix_ids), skip_special_tokens=False
+            )
         except Exception:  # pragma: no cover - tokenizer access best-effort
             return False
         return suffix_text.rstrip().endswith("<think>")
