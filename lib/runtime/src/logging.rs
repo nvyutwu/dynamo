@@ -985,6 +985,72 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     let otel_filter_layer = filters(load_config());
     let otel_logs_filter_layer = filters(load_config());
 
+    // Build OTLP tracer + logger providers BEFORE the JSONL branch so the OTEL
+    // log bridge is registered regardless of console format. Addresses V1 from
+    // review: previously the bridge lived only inside `if jsonl_logging_enabled()`,
+    // so DYNAMO_LOG_PAYLOADS=1 + OTEL_EXPORT_ENABLED=1 produced events that went
+    // nowhere unless DYN_LOGGING_JSONL=1 was also set.
+    let service_name = get_service_name();
+    let (tracer_provider, logger_provider_opt, endpoint_opt) = if otlp_exporter_enabled() {
+        // Export enabled: create OTLP exporters with batch processors
+        let traces_endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+            .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
+        let logs_endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
+            .unwrap_or_else(|_| traces_endpoint.clone());
+
+        let resource = opentelemetry_sdk::Resource::builder_empty()
+            .with_service_name(service_name.clone())
+            .build();
+
+        // Initialize OTLP span exporter using gRPC (Tonic)
+        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&traces_endpoint)
+            .build()?;
+
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(span_exporter)
+            .with_resource(resource.clone())
+            .build();
+
+        // Initialize OTLP log exporter using gRPC (Tonic)
+        let log_exporter = opentelemetry_otlp::LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(&logs_endpoint)
+            .build()?;
+
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_batch_exporter(log_exporter)
+            .with_resource(resource)
+            .build();
+
+        (
+            tracer_provider,
+            Some(logger_provider),
+            Some(traces_endpoint),
+        )
+    } else {
+        // No export - traces generated locally only (for logging/trace IDs)
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(
+                opentelemetry_sdk::Resource::builder_empty()
+                    .with_service_name(service_name.clone())
+                    .build(),
+            )
+            .build();
+
+        (provider, None, None)
+    };
+
+    let tracer = tracer_provider.tracer(service_name.clone());
+    let otel_logs_layer = logger_provider_opt
+        .as_ref()
+        .map(|lp| OpenTelemetryTracingBridge::new(lp).with_filter(otel_logs_filter_layer));
+    let otel_trace_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(otel_filter_layer);
+    let distributed_trace_layer = DistributedTraceIdLayer.with_filter(trace_filter_layer);
+
     if jsonl_logging_enabled() {
         let span_events = if span_events_enabled() {
             FmtSpan::CLOSE
@@ -998,94 +1064,12 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
             .with_writer(std::io::stderr)
             .with_filter(fmt_filter_layer);
 
-        // Create OpenTelemetry tracer - conditionally export to OTLP based on env var
-        let service_name = get_service_name();
-
-        // Build tracer and logger providers - with or without OTLP export
-        let (tracer_provider, logger_provider_opt, endpoint_opt) = if otlp_exporter_enabled() {
-            // Export enabled: create OTLP exporters with batch processors
-            let traces_endpoint =
-                std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                    .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
-            let logs_endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
-                .unwrap_or_else(|_| traces_endpoint.clone());
-
-            let resource = opentelemetry_sdk::Resource::builder_empty()
-                .with_service_name(service_name.clone())
-                .build();
-
-            // Initialize OTLP span exporter using gRPC (Tonic)
-            let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(&traces_endpoint)
-                .build()?;
-
-            let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(span_exporter)
-                .with_resource(resource.clone())
-                .build();
-
-            // Initialize OTLP log exporter using gRPC (Tonic)
-            let log_exporter = opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_endpoint(&logs_endpoint)
-                .build()?;
-
-            let logger_provider = SdkLoggerProvider::builder()
-                .with_batch_exporter(log_exporter)
-                .with_resource(resource)
-                .build();
-
-            (
-                tracer_provider,
-                Some(logger_provider),
-                Some(traces_endpoint),
-            )
-        } else {
-            // No export - traces generated locally only (for logging/trace IDs)
-            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_resource(
-                    opentelemetry_sdk::Resource::builder_empty()
-                        .with_service_name(service_name.clone())
-                        .build(),
-                )
-                .build();
-
-            (provider, None, None)
-        };
-
-        // Get a tracer from the provider
-        let tracer = tracer_provider.tracer(service_name.clone());
-
-        // Build the OTLP logs bridge layer (only when export is enabled)
-        let otel_logs_layer = logger_provider_opt
-            .as_ref()
-            .map(|lp| OpenTelemetryTracingBridge::new(lp).with_filter(otel_logs_filter_layer));
-
         tracing_subscriber::registry()
-            .with(
-                tracing_opentelemetry::layer()
-                    .with_tracer(tracer)
-                    .with_filter(otel_filter_layer),
-            )
+            .with(otel_trace_layer)
             .with(otel_logs_layer)
-            .with(DistributedTraceIdLayer.with_filter(trace_filter_layer))
+            .with(distributed_trace_layer)
             .with(l)
             .init();
-
-        // Log initialization status after subscriber is ready
-        if let Some(endpoint) = endpoint_opt {
-            tracing::info!(
-                endpoint = %endpoint,
-                service = %service_name,
-                "OpenTelemetry OTLP export enabled (traces and logs)"
-            );
-        } else {
-            tracing::info!(
-                service = %service_name,
-                "OpenTelemetry OTLP export disabled, traces local only"
-            );
-        }
     } else {
         let l = fmt::layer()
             .with_ansi(!disable_ansi_logging())
@@ -1093,7 +1077,26 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
             .with_writer(std::io::stderr)
             .with_filter(fmt_filter_layer);
 
-        tracing_subscriber::registry().with(l).init();
+        tracing_subscriber::registry()
+            .with(otel_trace_layer)
+            .with(otel_logs_layer)
+            .with(distributed_trace_layer)
+            .with(l)
+            .init();
+    }
+
+    // Log initialization status after subscriber is ready (works in both branches now).
+    if let Some(endpoint) = endpoint_opt {
+        tracing::info!(
+            endpoint = %endpoint,
+            service = %service_name,
+            "OpenTelemetry OTLP export enabled (traces and logs)"
+        );
+    } else {
+        tracing::info!(
+            service = %service_name,
+            "OpenTelemetry OTLP export disabled, traces local only"
+        );
     }
 
     Ok(())
