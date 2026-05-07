@@ -482,6 +482,27 @@ async fn completions(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    // Log request payload to OTEL BEFORE validation so invalid requests are also captured
+    // (the audit value of payload logging is highest for malformed/rejected requests).
+    // Uses the alias model name from the request — completions_single/_batch resolve
+    // canonical separately for routing/metrics; the response log uses canonical.
+    if log_payloads_enabled() {
+        let request_id = request.id();
+        let streaming = request.inner.stream.unwrap_or(false);
+        let model_alias = request.inner.model.as_str();
+        let (payload, truncated) = truncate_for_log(request.content());
+        tracing::info!(
+            target: PAYLOAD_LOG_TARGET,
+            request_id = %request_id,
+            model = %model_alias,
+            endpoint = "completions",
+            streaming = streaming,
+            payload_type = "request",
+            truncated = truncated,
+            payload = %payload,
+        );
+    }
+
     // Validate stream_options is only used when streaming (NVBug 5662680)
     validate_completion_stream_options(&request)?;
 
@@ -535,20 +556,8 @@ async fn completions_single(
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
-    // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled() {
-        let (payload, truncated) = truncate_for_log(request.content());
-        tracing::info!(
-            target: PAYLOAD_LOG_TARGET,
-            request_id = %request_id,
-            model = %model,
-            endpoint = "completions",
-            streaming = streaming,
-            payload_type = "request",
-            truncated = truncated,
-            payload = %payload,
-        );
-    }
+    // Note: request payload log is emitted in `completions()` before validation,
+    // so both single and batch paths are covered.
 
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
@@ -877,14 +886,83 @@ async fn completions_batch(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
+
+        // Payload log accumulators for batch streaming completions.
+        // Same shape as completions_single but expected_n is batch_size * n
+        // because the remap above re-keys choices into a global index space.
+        let log_payloads = log_payloads_enabled();
+        let mut payload_text_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_finished_indices: HashSet<u32> = HashSet::new();
+        let mut payload_emitted = false;
+        let payload_expected_n: u32 = (batch_size as u32) * (n as u32);
+        let request_id_for_log = request_id.clone();
+        let model_for_log = model.clone();
+
         let stream = merged_stream
             .map(move |response| {
+                let mut is_final = false;
+                if log_payloads
+                    && !payload_emitted
+                    && let Some(data) = &response.data
+                {
+                    for choice in &data.inner.choices {
+                        payload_text_bufs
+                            .entry(choice.index)
+                            .or_default()
+                            .append(&choice.text);
+                        if choice.finish_reason.is_some() {
+                            payload_finished_indices.insert(choice.index);
+                        }
+                    }
+                    if payload_finished_indices.len() as u32 >= payload_expected_n {
+                        payload_emitted = true;
+                        is_final = true;
+                    }
+                }
+
                 // Calls observe_response() on each token
-                process_response_using_event_converter_and_observe_metrics(
+                let sse_result = process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
                     &mut response_collector,
                     &mut http_queue_guard,
-                )
+                );
+
+                if is_final {
+                    let mut any_truncated = false;
+                    let choices_json: Vec<serde_json::Value> = payload_text_bufs
+                        .iter()
+                        .map(|(idx, buf)| {
+                            if buf.truncated {
+                                any_truncated = true;
+                            }
+                            let mut choice =
+                                serde_json::json!({ "index": idx, "text": &buf.content });
+                            if buf.truncated {
+                                choice["truncated"] = serde_json::Value::Bool(true);
+                            }
+                            choice
+                        })
+                        .collect();
+                    let mut payload_value = serde_json::json!({ "choices": choices_json });
+                    if any_truncated {
+                        payload_value["truncated"] = serde_json::Value::Bool(true);
+                    }
+                    if let Ok(payload) = serde_json::to_string(&payload_value) {
+                        tracing::info!(
+                            target: PAYLOAD_LOG_TARGET,
+                            request_id = %request_id_for_log,
+                            model = %model_for_log,
+                            endpoint = "completions",
+                            streaming = true,
+                            payload_type = "response",
+                            truncated = any_truncated,
+                            batch_size = payload_expected_n,
+                            payload = %payload,
+                        );
+                    }
+                }
+
+                sse_result
             })
             .filter_map(|result| {
                 use futures::future;
@@ -927,6 +1005,22 @@ async fn completions_batch(
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
+
+        // Log response payload to OTEL for non-streaming batch (suppressed from console)
+        if log_payloads_enabled() {
+            let (payload, truncated) = truncate_for_log(&response);
+            tracing::info!(
+                target: PAYLOAD_LOG_TARGET,
+                request_id = %request_id,
+                model = %model,
+                endpoint = "completions",
+                streaming = false,
+                payload_type = "response",
+                truncated = truncated,
+                batch_size = (batch_size as u32) * (n as u32),
+                payload = %payload,
+            );
+        }
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -1436,6 +1530,23 @@ async fn chat_completions(
         &request_id,
     );
 
+    // Log request payload to OTEL BEFORE validation so invalid requests are also captured.
+    // Template + canonical resolution have already happened above, so this logs what the
+    // engine will see (post-template, post-alias-resolve), not the raw client input.
+    if log_payloads_enabled() {
+        let (payload, truncated) = truncate_for_log(request.content());
+        tracing::info!(
+            target: PAYLOAD_LOG_TARGET,
+            request_id = %request_id,
+            model = %model,
+            endpoint = "chat_completions",
+            streaming = streaming,
+            payload_type = "request",
+            truncated = truncated,
+            payload = %payload,
+        );
+    }
+
     // Handle unsupported fields - if Some(resp) is returned by
     // validate_chat_completion_unsupported_fields,
     // then a field was used that is unsupported. We will log an error message
@@ -1465,21 +1576,6 @@ async fn chat_completions(
 
     // Create HTTP queue guard after template resolution so labels are correct
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
-
-    // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled() {
-        let (payload, truncated) = truncate_for_log(request.content());
-        tracing::info!(
-            target: PAYLOAD_LOG_TARGET,
-            request_id = %request_id,
-            model = %model,
-            endpoint = "chat_completions",
-            streaming = streaming,
-            payload_type = "request",
-            truncated = truncated,
-            payload = %payload,
-        );
-    }
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
