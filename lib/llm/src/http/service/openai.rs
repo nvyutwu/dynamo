@@ -87,10 +87,37 @@ pub(super) fn get_body_limit() -> usize {
 /// Suppressed from console output; visible only in the OTEL log pipeline.
 const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
 
+/// Hard cap on serialized payload size for non-streaming request/response logs.
+/// Set well above streaming per-choice cap because a single non-streaming payload
+/// includes the full prompt/messages (vision URLs, long history) plus tools schema.
+/// 1 MiB matches vLLM's default.
+const MAX_PAYLOAD_LOG_BYTES: usize = 1024 * 1024;
+
 /// Returns true if OTEL payload logging is enabled via `DYNAMO_LOG_PAYLOADS`.
 fn log_payloads_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS))
+}
+
+/// Serialize `value` to a string, capping at `MAX_PAYLOAD_LOG_BYTES`.
+/// Returns `(payload, truncated)`. On serialization error returns
+/// `("<serialize failed>", false)` so the caller can still emit a log record
+/// with the surrounding context (request_id, model, endpoint).
+fn truncate_for_log<T: serde::Serialize>(value: &T) -> (String, bool) {
+    match serde_json::to_string(value) {
+        Ok(s) if s.len() <= MAX_PAYLOAD_LOG_BYTES => (s, false),
+        Ok(mut s) => {
+            // Truncate at largest UTF-8 char boundary <= cap.
+            let mut end = MAX_PAYLOAD_LOG_BYTES;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            s.push_str(PAYLOAD_TRUNCATION_MARKER);
+            (s, true)
+        }
+        Err(_) => ("<serialize failed>".to_string(), false),
+    }
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -509,9 +536,8 @@ async fn completions_single(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled()
-        && let Ok(payload) = serde_json::to_string(request.content())
-    {
+    if log_payloads_enabled() {
+        let (payload, truncated) = truncate_for_log(request.content());
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
             request_id = %request_id,
@@ -519,6 +545,7 @@ async fn completions_single(
             endpoint = "completions",
             streaming = streaming,
             payload_type = "request",
+            truncated = truncated,
             payload = %payload,
         );
     }
@@ -702,9 +729,8 @@ async fn completions_single(
             })?;
 
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
-        if log_payloads_enabled()
-            && let Ok(payload) = serde_json::to_string(&response)
-        {
+        if log_payloads_enabled() {
+            let (payload, truncated) = truncate_for_log(&response);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
                 request_id = %request_id,
@@ -712,6 +738,7 @@ async fn completions_single(
                 endpoint = "completions",
                 streaming = false,
                 payload_type = "response",
+                truncated = truncated,
                 payload = %payload,
             );
         }
@@ -1440,9 +1467,8 @@ async fn chat_completions(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled()
-        && let Ok(payload) = serde_json::to_string(request.content())
-    {
+    if log_payloads_enabled() {
+        let (payload, truncated) = truncate_for_log(request.content());
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
             request_id = %request_id,
@@ -1450,6 +1476,7 @@ async fn chat_completions(
             endpoint = "chat_completions",
             streaming = streaming,
             payload_type = "request",
+            truncated = truncated,
             payload = %payload,
         );
     }
@@ -1677,9 +1704,8 @@ async fn chat_completions(
                 })?;
 
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
-        if log_payloads_enabled()
-            && let Ok(payload) = serde_json::to_string(&response)
-        {
+        if log_payloads_enabled() {
+            let (payload, truncated) = truncate_for_log(&response);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
                 request_id = %request_id,
@@ -1687,6 +1713,7 @@ async fn chat_completions(
                 endpoint = "chat_completions",
                 streaming = false,
                 payload_type = "response",
+                truncated = truncated,
                 payload = %payload,
             );
         }
