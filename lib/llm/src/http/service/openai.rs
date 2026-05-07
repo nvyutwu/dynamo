@@ -1588,22 +1588,13 @@ impl ResponseLogMetadata {
             map.insert("id".to_string(), serde_json::Value::String(id.clone()));
         }
         if let Some(c) = self.created {
-            map.insert(
-                "created".to_string(),
-                serde_json::Value::Number(c.into()),
-            );
+            map.insert("created".to_string(), serde_json::Value::Number(c.into()));
         }
         if let Some(m) = &self.model {
-            map.insert(
-                "model".to_string(),
-                serde_json::Value::String(m.clone()),
-            );
+            map.insert("model".to_string(), serde_json::Value::String(m.clone()));
         }
         if let Some(o) = &self.object {
-            map.insert(
-                "object".to_string(),
-                serde_json::Value::String(o.clone()),
-            );
+            map.insert("object".to_string(), serde_json::Value::String(o.clone()));
         }
         if let Some(sf) = &self.system_fingerprint {
             map.insert(

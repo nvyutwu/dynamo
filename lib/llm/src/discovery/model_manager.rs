@@ -144,9 +144,7 @@ impl ModelManager {
         // not currently mapped to anything in alias_to_primary, AND already
         // has worker sets), refuse to clobber it.
         if let Some(existing) = self.models.get(model_name) {
-            if !existing.is_empty()
-                && !self.alias_to_primary.contains_key(model_name)
-            {
+            if !existing.is_empty() && !self.alias_to_primary.contains_key(model_name) {
                 tracing::warn!(
                     alias = model_name,
                     namespace,
