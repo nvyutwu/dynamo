@@ -57,54 +57,25 @@ Each log record carries structured fields:
 | `OTEL_EXPORT_ENABLED` | Enable OTLP export for logs and traces | `false` |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | OTLP gRPC endpoint for logs | same as traces endpoint |
 
+### Streaming Response Assembly
+
+Streaming responses for both `/v1/chat/completions` and `/v1/completions` are accumulated chunk-by-chunk inside the existing `flat_map` closure (alongside `streaming_tool_dispatch_events()` and `accumulate_reasoning_dispatch()`) and emitted as a single payload log on stream completion.
+
+**Per-choice state (chat):** content + reasoning_content into separate `BoundedBuf`s keyed by `choice.index`. Each `BoundedBuf` has a 256 KB cap (`MAX_PAYLOAD_ACCUMULATE_BYTES`); when the cap is hit, a `…[TRUNCATED]` marker is appended once and a per-buffer `truncated: bool` is set. The emitted JSON includes a top-level `truncated: true` field and per-choice `truncated: true` fields whenever any buffer was capped.
+
+**Per-choice state (completions):** text into a single `BoundedBuf` per `choice.index`, with the same cap and truncation behavior.
+
+**Finish gating:** the helper tracks `finished_indices: HashSet<u32>` and an `already_emitted: bool`. The emit fires exactly once — on the first chunk where `finished_indices.len() >= request.n.unwrap_or(1)`. This prevents duplicate log records for `n > 1` requests where choices finish at different chunks.
+
+**Error / disconnect paths:** if the stream is cancelled by a client disconnect, `monitor_for_disconnects` cancels the closure mid-stream — no `is_final` ever fires, no payload log is emitted. Engine-side errors arrive as `Annotated::error` with `data: None`, which short-circuits the accumulator (returns `false`); for these streams a request log is emitted but no response log. (Tracking improvement: emit a partial-response log with `truncated_due_to_error=true`.)
+
 ### Current Limitations
 
-- **Streaming responses are not logged.** Only non-streaming (`stream: false`) responses are captured. The streaming path returns HTTP 200 immediately and drives the SSE stream through the HTTP layer, so there is no natural "after stream ends" hook in the current architecture.
-- **Completion endpoint only** (non-streaming). Chat completions streaming is also not captured.
-
-### Next Step: Streaming Response Assembly
-
-To cover streaming responses, accumulate delta content within the existing `flat_map` closure in `chat_completions()` and `completions_single()`. The pattern follows how `streaming_tool_dispatch_events()` and `accumulate_reasoning_dispatch()` already inspect `&response` before `EventConverter::from(response)` consumes it.
-
-**Implementation plan:**
-
-1. **Add a helper** `extract_streaming_delta(response: &Annotated<...>) -> StreamingDelta` that borrows the response and extracts:
-   - `delta.content: Option<String>`
-   - `delta.reasoning_content: Option<String>`
-   - `delta.tool_calls: Option<Vec<...>>`
-   - `finish_reason: Option<String>`
-
-2. **Add accumulator state** inside the `flat_map` closure (captured by `move`):
-   ```rust
-   let mut accumulated_content = String::new();
-   let mut accumulated_reasoning = String::new();
-   let mut accumulated_tool_calls: Vec<...> = vec![];
-   ```
-
-3. **Accumulate per chunk** before `EventConverter::from(response)`:
-   ```rust
-   let delta = extract_streaming_delta(&response);
-   if let Some(c) = delta.content { accumulated_content.push_str(&c); }
-   let is_final = delta.finish_reason.is_some();
-   ```
-
-4. **Emit payload log on the final chunk:**
-   ```rust
-   if is_final && log_payloads_enabled() {
-       tracing::info!(
-           target: PAYLOAD_LOG_TARGET,
-           request_id = %request_id_log,
-           model = %model_log,
-           streaming = true,
-           payload_type = "response",
-           content = %accumulated_content,
-       );
-   }
-   ```
-
-5. Apply the same pattern to `completions_single()` streaming path.
-
-This mirrors vLLM's approach (`previous_content_texts`, `previous_reasoning_texts`, `previous_tool_calls` accumulated in `chat_completion_stream_generator`, emitted after the loop).
+- **`completions_batch` is not logged.** Multi-prompt completion requests (where `prompt` is an array) dispatch into `completions_batch` which currently bypasses payload logging entirely. Tracked separately.
+- **Tool calls are not yet captured** in the streaming-chat accumulated payload — only `content` and `reasoning_content` are. Tool-only choices (`delta.content` is `None` throughout the stream) currently produce no entry in the logged choices array. Tracked separately.
+- **Request payload is logged after validation.** Requests that fail field-level validation (`validate_chat_completion_unsupported_fields`, etc.) are never logged. Tracked separately.
+- **OTEL bridge requires `DYN_LOGGING_JSONL=1`.** The `OpenTelemetryTracingBridge` is only registered in the JSONL branch of `init_dyn_logging`. Without `DYN_LOGGING_JSONL=1`, payload events are produced but have no exporter — they are dropped silently. This is a known wiring gap in `lib/runtime/src/logging.rs`. To export payloads to OTEL, set: `DYNAMO_LOG_PAYLOADS=1 DYN_LOGGING_JSONL=1 OTEL_EXPORT_ENABLED=1`.
+- **Toggle requires restart.** `log_payloads_enabled()` reads `DYNAMO_LOG_PAYLOADS` once via `OnceLock`; in-flight and future streams keep the original value until the process restarts.
 
 ---
 
@@ -213,8 +184,10 @@ finally:
 
 | Feature | Pipeline | Wired | Status |
 |---------|----------|-------|--------|
-| Payload logging (non-streaming) | OTEL Logs | Yes | Done (eb0b6a9) |
-| Payload logging (streaming) | OTEL Logs | Yes | Planned (Part 1) |
+| Payload logging (non-streaming) | OTEL Logs | Yes | Done |
+| Payload logging (streaming, content+reasoning) | OTEL Logs | Yes | Done — bounded 256 KB/choice with truncation marker, finish-gated emit |
+| Payload logging (streaming tool_calls) | OTEL Logs | Yes | Planned |
+| Payload logging (`completions_batch`) | OTEL Logs | Yes | Planned |
 | HTTP request spans (`http-request`) | OTEL Traces | Yes | Done |
 | Worker spans (`handle_payload`) | OTEL Traces | Yes | Done |
 | KV transfer span (`kv_transfer_wait`) | OTEL Traces | Infrastructure yes | Planned (Part 2) |

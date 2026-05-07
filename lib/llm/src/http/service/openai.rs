@@ -540,6 +540,10 @@ async fn completions_single(
     // prepare to process any annotations
     let annotations = request.annotations();
 
+    // Capture expected number of choices before request is consumed by `engine.generate`.
+    // Used by streaming payload logging to know when all choices have finished.
+    let payload_expected_n: u32 = request.inner.n.unwrap_or(1) as u32;
+
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -581,26 +585,33 @@ async fn completions_single(
 
         // Payload log accumulators for streaming completions.
         let log_payloads = log_payloads_enabled();
-        let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
+        let mut payload_text_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_finished_indices: HashSet<u32> = HashSet::new();
+        let mut payload_emitted = false;
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
 
         let stream = stream
             .map(move |response| {
                 // Accumulate text content for payload logging before response is consumed.
+                // is_final fires exactly once — when all `payload_expected_n` choices have finished.
                 let mut is_final = false;
-                if log_payloads {
+                if log_payloads && !payload_emitted {
                     if let Some(data) = &response.data {
                         // data.inner is CreateCompletionResponse (NvCreateCompletionResponse
                         // wraps it with #[serde(flatten)] but no Deref)
                         for choice in &data.inner.choices {
-                            let buf = payload_text_bufs.entry(choice.index).or_default();
-                            if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
-                                buf.push_str(&choice.text);
-                            }
+                            payload_text_bufs
+                                .entry(choice.index)
+                                .or_default()
+                                .append(&choice.text);
                             if choice.finish_reason.is_some() {
-                                is_final = true;
+                                payload_finished_indices.insert(choice.index);
                             }
+                        }
+                        if payload_finished_indices.len() as u32 >= payload_expected_n {
+                            payload_emitted = true;
+                            is_final = true;
                         }
                     }
                 }
@@ -614,13 +625,27 @@ async fn completions_single(
 
                 // Emit assembled payload log on the final chunk.
                 if is_final {
+                    let mut any_truncated = false;
                     let choices_json: Vec<serde_json::Value> = payload_text_bufs
                         .iter()
-                        .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
+                        .map(|(idx, buf)| {
+                            if buf.truncated {
+                                any_truncated = true;
+                            }
+                            let mut choice =
+                                serde_json::json!({ "index": idx, "text": &buf.content });
+                            if buf.truncated {
+                                choice["truncated"] = serde_json::Value::Bool(true);
+                            }
+                            choice
+                        })
                         .collect();
-                    if let Ok(payload) =
-                        serde_json::to_string(&serde_json::json!({ "choices": choices_json }))
-                    {
+                    let mut payload_value =
+                        serde_json::json!({ "choices": choices_json });
+                    if any_truncated {
+                        payload_value["truncated"] = serde_json::Value::Bool(true);
+                    }
+                    if let Ok(payload) = serde_json::to_string(&payload_value) {
                         tracing::info!(
                             target: PAYLOAD_LOG_TARGET,
                             request_id = %request_id_for_log,
@@ -628,6 +653,7 @@ async fn completions_single(
                             endpoint = "completions",
                             streaming = true,
                             payload_type = "response",
+                            truncated = any_truncated,
                             payload = %payload,
                         );
                     }
@@ -1253,46 +1279,80 @@ fn accumulate_reasoning_dispatch(
 /// Prevents unbounded memory growth for very long completions.
 const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
 
+/// Marker appended once when a `BoundedBuf` first hits its cap.
+const PAYLOAD_TRUNCATION_MARKER: &str = "…[TRUNCATED]";
+
+/// String buffer with a hard byte cap. Once the cap is hit, a marker is
+/// appended once and further `append` calls are no-ops; `truncated` flips to true.
+#[derive(Default)]
+struct BoundedBuf {
+    content: String,
+    truncated: bool,
+}
+
+impl BoundedBuf {
+    fn append(&mut self, text: &str) {
+        if self.truncated || text.is_empty() {
+            return;
+        }
+        let remaining = MAX_PAYLOAD_ACCUMULATE_BYTES.saturating_sub(self.content.len());
+        if text.len() <= remaining {
+            self.content.push_str(text);
+            return;
+        }
+        // Truncate at the largest UTF-8 char boundary <= `remaining` so we never split a codepoint.
+        let mut end = remaining;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.content.push_str(&text[..end]);
+        self.content.push_str(PAYLOAD_TRUNCATION_MARKER);
+        self.truncated = true;
+    }
+}
+
 /// Accumulates chat completion content and reasoning tokens for payload logging.
 ///
 /// Borrows the response chunk before it is consumed by `EventConverter`.
-/// Returns `true` when any choice carries a `finish_reason` (stream ending).
+/// Returns `true` exactly once — on the first chunk where every expected choice
+/// has reported a `finish_reason` — so the caller emits a single final log per request.
 /// Only intended to be called when `log_payloads_enabled()` is true.
 fn accumulate_payload_chat(
     response: &Annotated<NvCreateChatCompletionStreamResponse>,
-    content_bufs: &mut HashMap<u32, String>,
-    reasoning_bufs: &mut HashMap<u32, String>,
+    content_bufs: &mut HashMap<u32, BoundedBuf>,
+    reasoning_bufs: &mut HashMap<u32, BoundedBuf>,
+    finished_indices: &mut HashSet<u32>,
+    expected_n: u32,
+    already_emitted: &mut bool,
 ) -> bool {
+    if *already_emitted {
+        return false;
+    }
     let Some(data) = &response.data else {
         return false;
     };
-    let mut is_final = false;
-    // Note: for n > 1, is_final fires on the first choice to finish; subsequent choices
-    // may still have content arriving. This is acceptable for the n = 1 common case.
-    for choice in &data.choices {
+    for choice in &data.inner.choices {
         if let Some(dynamo_async_openai::types::ChatCompletionMessageContent::Text(s)) =
             &choice.delta.content
         {
-            if !s.is_empty() {
-                let buf = content_bufs.entry(choice.index).or_default();
-                if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
-                    buf.push_str(s);
-                }
-            }
+            content_bufs.entry(choice.index).or_default().append(s);
         }
         if let Some(reasoning) = &choice.delta.reasoning_content {
-            if !reasoning.is_empty() {
-                let buf = reasoning_bufs.entry(choice.index).or_default();
-                if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
-                    buf.push_str(reasoning);
-                }
-            }
+            reasoning_bufs
+                .entry(choice.index)
+                .or_default()
+                .append(reasoning);
         }
         if choice.finish_reason.is_some() {
-            is_final = true;
+            finished_indices.insert(choice.index);
         }
     }
-    is_final
+    if finished_indices.len() as u32 >= expected_n {
+        *already_emitted = true;
+        true
+    } else {
+        false
+    }
 }
 
 /// OpenAI Chat Completions Request Handler
@@ -1415,6 +1475,10 @@ async fn chat_completions(
 
     let annotations = request.annotations();
 
+    // Capture expected number of choices before request is consumed by `engine.generate`.
+    // Used by streaming payload logging to know when all choices have finished.
+    let payload_expected_n: u32 = request.inner.n.unwrap_or(1) as u32;
+
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -1466,8 +1530,10 @@ async fn chat_completions(
         // Payload log accumulators for streaming responses.
         // Only allocated/used when payload logging is enabled; gated to avoid overhead.
         let log_payloads = log_payloads_enabled();
-        let mut payload_content_bufs: HashMap<u32, String> = HashMap::new();
-        let mut payload_reasoning_bufs: HashMap<u32, String> = HashMap::new();
+        let mut payload_content_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_reasoning_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_finished_indices: HashSet<u32> = HashSet::new();
+        let mut payload_emitted = false;
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
 
@@ -1492,13 +1558,16 @@ async fn chat_completions(
             }
 
             // Accumulate content for payload logging before response is consumed.
-            // Only fires on cleanly-finished responses (finish_reason set); client-disconnected
-            // streams are silently skipped since monitor_for_disconnects cancels the stream.
+            // Returns true exactly once — when all `payload_expected_n` choices have finished.
+            // Client-disconnected and engine-errored streams (data=None) never trigger an emit.
             let is_final = if log_payloads {
                 accumulate_payload_chat(
                     &response,
                     &mut payload_content_bufs,
                     &mut payload_reasoning_bufs,
+                    &mut payload_finished_indices,
+                    payload_expected_n,
+                    &mut payload_emitted,
                 )
             } else {
                 false
@@ -1514,25 +1583,39 @@ async fn chat_completions(
 
             // Emit assembled payload log on the final chunk.
             if is_final {
+                let mut any_truncated = false;
                 let choices_json: Vec<serde_json::Value> = payload_content_bufs
                     .iter()
-                    .map(|(idx, content)| {
-                        let reasoning =
-                            payload_reasoning_bufs.get(idx).map(String::as_str).unwrap_or("");
+                    .map(|(idx, content_buf)| {
+                        let reasoning_buf = payload_reasoning_bufs.get(idx);
+                        let truncated =
+                            content_buf.truncated || reasoning_buf.is_some_and(|b| b.truncated);
+                        if truncated {
+                            any_truncated = true;
+                        }
                         let mut msg = serde_json::json!({
                             "role": "assistant",
-                            "content": content,
+                            "content": &content_buf.content,
                         });
-                        if !reasoning.is_empty() {
-                            msg["reasoning_content"] =
-                                serde_json::Value::String(reasoning.to_owned());
+                        if let Some(b) = reasoning_buf {
+                            if !b.content.is_empty() {
+                                msg["reasoning_content"] =
+                                    serde_json::Value::String(b.content.clone());
+                            }
                         }
-                        serde_json::json!({ "index": idx, "message": msg })
+                        let mut choice = serde_json::json!({ "index": idx, "message": msg });
+                        if truncated {
+                            choice["truncated"] = serde_json::Value::Bool(true);
+                        }
+                        choice
                     })
                     .collect();
-                if let Ok(payload) =
-                    serde_json::to_string(&serde_json::json!({ "choices": choices_json }))
-                {
+                let mut payload_value =
+                    serde_json::json!({ "choices": choices_json });
+                if any_truncated {
+                    payload_value["truncated"] = serde_json::Value::Bool(true);
+                }
+                if let Ok(payload) = serde_json::to_string(&payload_value) {
                     tracing::info!(
                         target: PAYLOAD_LOG_TARGET,
                         request_id = %request_id_for_log,
@@ -1540,6 +1623,7 @@ async fn chat_completions(
                         endpoint = "chat_completions",
                         streaming = true,
                         payload_type = "response",
+                        truncated = any_truncated,
                         payload = %payload,
                     );
                 }
