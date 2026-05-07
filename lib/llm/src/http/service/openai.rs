@@ -87,11 +87,17 @@ pub(super) fn get_body_limit() -> usize {
 /// Suppressed from console output; visible only in the OTEL log pipeline.
 const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
 
-/// Hard cap on serialized payload size for non-streaming request/response logs.
-/// Set well above streaming per-choice cap because a single non-streaming payload
-/// includes the full prompt/messages (vision URLs, long history) plus tools schema.
-/// 1 MiB matches vLLM's default.
-const MAX_PAYLOAD_LOG_BYTES: usize = 1024 * 1024;
+/// Per-media-asset byte cap for payload logs. Single inline `data:...;base64,...`
+/// URIs (or any string field) larger than this get replaced with a redaction
+/// placeholder. The text JSON shape around them (messages, prompts, tool_calls,
+/// reasoning) is **never truncated** — only oversized media bytes are redacted.
+///
+/// TODO(yutwu): when the upstream S3-asset-offload pipeline is wired in, the
+/// redaction placeholder should also include the resulting S3 URL so logged
+/// payloads remain traceable to the actual content. Today, large media that
+/// somehow reaches this layer (because offload is bypassed or hasn't run yet)
+/// gets redacted and the original bytes are unrecoverable from logs.
+const MAX_MEDIA_ASSET_BYTES: usize = 1024 * 1024;
 
 /// Returns true if OTEL payload logging is enabled via `DYNAMO_LOG_PAYLOADS`.
 fn log_payloads_enabled() -> bool {
@@ -99,25 +105,54 @@ fn log_payloads_enabled() -> bool {
     *ENABLED.get_or_init(|| env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS))
 }
 
-/// Serialize `value` to a string, capping at `MAX_PAYLOAD_LOG_BYTES`.
-/// Returns `(payload, truncated)`. On serialization error returns
-/// `("<serialize failed>", false)` so the caller can still emit a log record
-/// with the surrounding context (request_id, model, endpoint).
-fn truncate_for_log<T: serde::Serialize>(value: &T) -> (String, bool) {
-    match serde_json::to_string(value) {
-        Ok(s) if s.len() <= MAX_PAYLOAD_LOG_BYTES => (s, false),
-        Ok(mut s) => {
-            // Truncate at largest UTF-8 char boundary <= cap.
-            let mut end = MAX_PAYLOAD_LOG_BYTES;
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            s.truncate(end);
-            s.push_str(PAYLOAD_TRUNCATION_MARKER);
-            (s, true)
+/// Walk a serde_json `Value` tree and redact any string field that:
+///   1. starts with `data:` (a base64-inlined media asset), AND
+///   2. exceeds `MAX_MEDIA_ASSET_BYTES`.
+/// Replaces the bytes with `<media:<mime> redacted=true original_bytes=N>`.
+/// Returns the number of redactions performed (used to set a structured
+/// `media_redacted` field on the log record).
+fn redact_oversized_media(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s)
+            if s.len() > MAX_MEDIA_ASSET_BYTES && s.starts_with("data:") =>
+        {
+            // Extract mime hint from "data:<mime>;..." for human-readable placeholder.
+            let mime = s
+                .strip_prefix("data:")
+                .and_then(|rest| rest.split([';', ',']).next())
+                .filter(|m| !m.is_empty())
+                .unwrap_or("unknown");
+            let original_len = s.len();
+            *s = format!("<media:{mime} redacted=true original_bytes={original_len}>");
+            1
         }
-        Err(_) => ("<serialize failed>".to_string(), false),
+        serde_json::Value::Object(map) => map.values_mut().map(redact_oversized_media).sum(),
+        serde_json::Value::Array(arr) => arr.iter_mut().map(redact_oversized_media).sum(),
+        _ => 0,
     }
+}
+
+/// Serialize `value` to a JSON string for OTEL payload logging.
+///
+/// Walks the JSON tree once to redact oversized media `data:` URIs (per
+/// `MAX_MEDIA_ASSET_BYTES`). Text content (messages, prompts, tool_calls,
+/// reasoning) is **never truncated**. The architecture upstream of this layer
+/// is expected to offload large image/video/audio assets to an S3 bucket and
+/// replace them with S3 URLs; this redaction is a backstop for cases where
+/// that offload is bypassed.
+///
+/// Returns `(payload, media_redacted_count)`. On serialization error returns
+/// `("<serialize failed>", 0)` so the caller can still emit a log record with
+/// the surrounding context (request_id, model, endpoint).
+fn serialize_for_log<T: serde::Serialize>(value: &T) -> (String, usize) {
+    let mut json_value = match serde_json::to_value(value) {
+        Ok(v) => v,
+        Err(_) => return ("<serialize failed>".to_string(), 0),
+    };
+    let redactions = redact_oversized_media(&mut json_value);
+    let payload =
+        serde_json::to_string(&json_value).unwrap_or_else(|_| "<serialize failed>".to_string());
+    (payload, redactions)
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -490,7 +525,7 @@ async fn completions(
         let request_id = request.id();
         let streaming = request.inner.stream.unwrap_or(false);
         let model_alias = request.inner.model.as_str();
-        let (payload, truncated) = truncate_for_log(request.content());
+        let (payload, media_redacted) = serialize_for_log(request.content());
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
             request_id = %request_id,
@@ -498,7 +533,7 @@ async fn completions(
             endpoint = "completions",
             streaming = streaming,
             payload_type = "request",
-            truncated = truncated,
+            media_redacted = media_redacted,
             payload = %payload,
         );
     }
@@ -619,7 +654,7 @@ async fn completions_single(
 
         // Payload log accumulators for streaming completions.
         let log_payloads = log_payloads_enabled();
-        let mut payload_text_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
         let request_id_for_log = request_id.clone();
@@ -640,7 +675,7 @@ async fn completions_single(
                         payload_text_bufs
                             .entry(choice.index)
                             .or_default()
-                            .append(&choice.text);
+                            .push_str(&choice.text);
                         if choice.finish_reason.is_some() {
                             payload_finished_indices.insert(choice.index);
                         }
@@ -660,25 +695,11 @@ async fn completions_single(
 
                 // Emit assembled payload log on the final chunk.
                 if is_final {
-                    let mut any_truncated = false;
                     let choices_json: Vec<serde_json::Value> = payload_text_bufs
                         .iter()
-                        .map(|(idx, buf)| {
-                            if buf.truncated {
-                                any_truncated = true;
-                            }
-                            let mut choice =
-                                serde_json::json!({ "index": idx, "text": &buf.content });
-                            if buf.truncated {
-                                choice["truncated"] = serde_json::Value::Bool(true);
-                            }
-                            choice
-                        })
+                        .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
                         .collect();
-                    let mut payload_value = serde_json::json!({ "choices": choices_json });
-                    if any_truncated {
-                        payload_value["truncated"] = serde_json::Value::Bool(true);
-                    }
+                    let payload_value = serde_json::json!({ "choices": choices_json });
                     if let Ok(payload) = serde_json::to_string(&payload_value) {
                         tracing::info!(
                             target: PAYLOAD_LOG_TARGET,
@@ -687,7 +708,6 @@ async fn completions_single(
                             endpoint = "completions",
                             streaming = true,
                             payload_type = "response",
-                            truncated = any_truncated,
                             payload = %payload,
                         );
                     }
@@ -739,7 +759,7 @@ async fn completions_single(
 
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
         if log_payloads_enabled() {
-            let (payload, truncated) = truncate_for_log(&response);
+            let (payload, media_redacted) = serialize_for_log(&response);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
                 request_id = %request_id,
@@ -747,7 +767,7 @@ async fn completions_single(
                 endpoint = "completions",
                 streaming = false,
                 payload_type = "response",
-                truncated = truncated,
+                media_redacted = media_redacted,
                 payload = %payload,
             );
         }
@@ -891,7 +911,7 @@ async fn completions_batch(
         // Same shape as completions_single but expected_n is batch_size * n
         // because the remap above re-keys choices into a global index space.
         let log_payloads = log_payloads_enabled();
-        let mut payload_text_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
         let payload_expected_n: u32 = (batch_size as u32) * (n as u32);
@@ -909,7 +929,7 @@ async fn completions_batch(
                         payload_text_bufs
                             .entry(choice.index)
                             .or_default()
-                            .append(&choice.text);
+                            .push_str(&choice.text);
                         if choice.finish_reason.is_some() {
                             payload_finished_indices.insert(choice.index);
                         }
@@ -928,25 +948,11 @@ async fn completions_batch(
                 );
 
                 if is_final {
-                    let mut any_truncated = false;
                     let choices_json: Vec<serde_json::Value> = payload_text_bufs
                         .iter()
-                        .map(|(idx, buf)| {
-                            if buf.truncated {
-                                any_truncated = true;
-                            }
-                            let mut choice =
-                                serde_json::json!({ "index": idx, "text": &buf.content });
-                            if buf.truncated {
-                                choice["truncated"] = serde_json::Value::Bool(true);
-                            }
-                            choice
-                        })
+                        .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
                         .collect();
-                    let mut payload_value = serde_json::json!({ "choices": choices_json });
-                    if any_truncated {
-                        payload_value["truncated"] = serde_json::Value::Bool(true);
-                    }
+                    let payload_value = serde_json::json!({ "choices": choices_json });
                     if let Ok(payload) = serde_json::to_string(&payload_value) {
                         tracing::info!(
                             target: PAYLOAD_LOG_TARGET,
@@ -955,7 +961,6 @@ async fn completions_batch(
                             endpoint = "completions",
                             streaming = true,
                             payload_type = "response",
-                            truncated = any_truncated,
                             batch_size = payload_expected_n,
                             payload = %payload,
                         );
@@ -1008,7 +1013,7 @@ async fn completions_batch(
 
         // Log response payload to OTEL for non-streaming batch (suppressed from console)
         if log_payloads_enabled() {
-            let (payload, truncated) = truncate_for_log(&response);
+            let (payload, media_redacted) = serialize_for_log(&response);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
                 request_id = %request_id,
@@ -1016,7 +1021,7 @@ async fn completions_batch(
                 endpoint = "completions",
                 streaming = false,
                 payload_type = "response",
-                truncated = truncated,
+                media_redacted = media_redacted,
                 batch_size = (batch_size as u32) * (n as u32),
                 payload = %payload,
             );
@@ -1392,44 +1397,9 @@ fn accumulate_reasoning_dispatch(
     events
 }
 
-/// Maximum bytes to accumulate per choice for streaming payload logs.
-/// Prevents unbounded memory growth for very long completions.
-const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
-
-/// Marker appended once when a `BoundedBuf` first hits its cap.
-const PAYLOAD_TRUNCATION_MARKER: &str = "…[TRUNCATED]";
-
-/// String buffer with a hard byte cap. Once the cap is hit, a marker is
-/// appended once and further `append` calls are no-ops; `truncated` flips to true.
-#[derive(Default)]
-struct BoundedBuf {
-    content: String,
-    truncated: bool,
-}
-
-impl BoundedBuf {
-    fn append(&mut self, text: &str) {
-        if self.truncated || text.is_empty() {
-            return;
-        }
-        let remaining = MAX_PAYLOAD_ACCUMULATE_BYTES.saturating_sub(self.content.len());
-        if text.len() <= remaining {
-            self.content.push_str(text);
-            return;
-        }
-        // Truncate at the largest UTF-8 char boundary <= `remaining` so we never split a codepoint.
-        let mut end = remaining;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        self.content.push_str(&text[..end]);
-        self.content.push_str(PAYLOAD_TRUNCATION_MARKER);
-        self.truncated = true;
-    }
-}
-
 /// Maximum number of tool_call chunks accumulated per choice for payload logging.
 /// Beyond this we set `tool_calls_truncated = true` and stop appending.
+/// Bytes-of-text are NOT capped — see `serialize_for_log` rationale.
 const MAX_TOOL_CALLS_PER_CHOICE: usize = 64;
 
 /// Per-choice payload log state. Combines what the twin HashMaps held before
@@ -1437,19 +1407,20 @@ const MAX_TOOL_CALLS_PER_CHOICE: usize = 64;
 /// payload mirrors `ChatCompletionResponse` shape — addresses V4 from review
 /// (tool-only choices used to disappear from the log entirely; tool_calls
 /// were dropped even on choices with content).
+///
+/// Text fields (`content`, `reasoning`) are unbounded `String`s — naturally
+/// bounded by the engine's `max_seq_len` setting. Per the project policy of
+/// "no truncation on text", we accept that memory bound rather than imposing
+/// a separate cap here. Only the count of `tool_calls` is capped (a different
+/// concern: count, not bytes), and oversized media bytes are redacted at
+/// serialization time by `serialize_for_log`.
 #[derive(Default)]
 struct ChoiceLogState {
-    content: BoundedBuf,
-    reasoning: BoundedBuf,
+    content: String,
+    reasoning: String,
     tool_calls: Vec<dynamo_protocols::types::ChatCompletionMessageToolCall>,
     tool_calls_truncated: bool,
     finish_reason: Option<dynamo_protocols::types::FinishReason>,
-}
-
-impl ChoiceLogState {
-    fn truncated(&self) -> bool {
-        self.content.truncated || self.reasoning.truncated || self.tool_calls_truncated
-    }
 }
 
 /// Convert a streaming `ChatCompletionMessageToolCallChunk` into the aggregated
@@ -1500,10 +1471,13 @@ fn accumulate_payload_chat(
         if let Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(s)) =
             &choice.delta.content
         {
-            state.content.append(s);
+            state.content.push_str(s);
         }
+        // TODO: ChatCompletionMessageContent::Parts (multimodal output) is currently
+        // dropped from the streaming log. When we start serving image/audio output
+        // models, accumulate parts as a Vec<...> on the state struct here.
         if let Some(reasoning) = &choice.delta.reasoning_content {
-            state.reasoning.append(reasoning);
+            state.reasoning.push_str(reasoning);
         }
         if let Some(tool_call_chunks) = &choice.delta.tool_calls
             && !tool_call_chunks.is_empty()
@@ -1593,7 +1567,7 @@ async fn chat_completions(
     // Template + canonical resolution have already happened above, so this logs what the
     // engine will see (post-template, post-alias-resolve), not the raw client input.
     if log_payloads_enabled() {
-        let (payload, truncated) = truncate_for_log(request.content());
+        let (payload, media_redacted) = serialize_for_log(request.content());
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
             request_id = %request_id,
@@ -1601,7 +1575,7 @@ async fn chat_completions(
             endpoint = "chat_completions",
             streaming = streaming,
             payload_type = "request",
-            truncated = truncated,
+            media_redacted = media_redacted,
             payload = %payload,
         );
     }
@@ -1757,20 +1731,20 @@ async fn chat_completions(
 
             // Emit assembled payload log on the final chunk.
             if is_final {
-                let mut any_truncated = false;
+                let mut any_tool_calls_truncated = false;
                 let choices_json: Vec<serde_json::Value> = payload_choice_state
                     .iter()
                     .map(|(idx, st)| {
-                        if st.truncated() {
-                            any_truncated = true;
+                        if st.tool_calls_truncated {
+                            any_tool_calls_truncated = true;
                         }
                         let mut msg = serde_json::json!({
                             "role": "assistant",
-                            "content": &st.content.content,
+                            "content": &st.content,
                         });
-                        if !st.reasoning.content.is_empty() {
+                        if !st.reasoning.is_empty() {
                             msg["reasoning_content"] =
-                                serde_json::Value::String(st.reasoning.content.clone());
+                                serde_json::Value::String(st.reasoning.clone());
                         }
                         if !st.tool_calls.is_empty() {
                             msg["tool_calls"] = serde_json::to_value(&st.tool_calls)
@@ -1781,19 +1755,13 @@ async fn chat_completions(
                             choice["finish_reason"] =
                                 serde_json::to_value(fr).unwrap_or(serde_json::Value::Null);
                         }
-                        if st.truncated() {
-                            choice["truncated"] = serde_json::Value::Bool(true);
-                            if st.tool_calls_truncated {
-                                choice["tool_calls_truncated"] = serde_json::Value::Bool(true);
-                            }
+                        if st.tool_calls_truncated {
+                            choice["tool_calls_truncated"] = serde_json::Value::Bool(true);
                         }
                         choice
                     })
                     .collect();
-                let mut payload_value = serde_json::json!({ "choices": choices_json });
-                if any_truncated {
-                    payload_value["truncated"] = serde_json::Value::Bool(true);
-                }
+                let payload_value = serde_json::json!({ "choices": choices_json });
                 if let Ok(payload) = serde_json::to_string(&payload_value) {
                     tracing::info!(
                         target: PAYLOAD_LOG_TARGET,
@@ -1802,7 +1770,7 @@ async fn chat_completions(
                         endpoint = "chat_completions",
                         streaming = true,
                         payload_type = "response",
-                        truncated = any_truncated,
+                        tool_calls_truncated = any_tool_calls_truncated,
                         payload = %payload,
                     );
                 }
@@ -1865,7 +1833,7 @@ async fn chat_completions(
 
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
         if log_payloads_enabled() {
-            let (payload, truncated) = truncate_for_log(&response);
+            let (payload, media_redacted) = serialize_for_log(&response);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
                 request_id = %request_id,
@@ -1873,7 +1841,7 @@ async fn chat_completions(
                 endpoint = "chat_completions",
                 streaming = false,
                 payload_type = "response",
-                truncated = truncated,
+                media_redacted = media_redacted,
                 payload = %payload,
             );
         }
