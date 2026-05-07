@@ -105,6 +105,40 @@ fn log_payloads_enabled() -> bool {
     *ENABLED.get_or_init(|| env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS))
 }
 
+/// Header names whose values are redacted in payload logs. Case-insensitive
+/// match. Mirrors the conservative "secrets only" approach: log everything
+/// useful for routing/debugging (NVCF nca-id, x-dynamo-*, NVCF-FUNCTION-*,
+/// User-Agent, Content-Type, etc.) but never ship bearer tokens or session
+/// cookies into the OTEL log backend.
+fn is_sensitive_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+    )
+}
+
+/// Serialize an axum `HeaderMap` to a JSON object string with sensitive
+/// header values redacted. Returns an empty `"{}"` if there's nothing to log
+/// (so the log record always has a parseable headers field).
+fn format_headers_for_log(headers: &HeaderMap) -> String {
+    let mut map = serde_json::Map::with_capacity(headers.len());
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        let value_json = if is_sensitive_header(name_str) {
+            serde_json::Value::String("<redacted>".to_string())
+        } else {
+            match value.to_str() {
+                Ok(s) => serde_json::Value::String(s.to_string()),
+                Err(_) => serde_json::Value::String("<non-utf8>".to_string()),
+            }
+        };
+        map.insert(name_str.to_string(), value_json);
+    }
+    serde_json::to_string(&serde_json::Value::Object(map))
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Walk a serde_json `Value` tree and redact any string field that
 /// (a) starts with `data:` (a base64-inlined media asset), and
 /// (b) exceeds `MAX_MEDIA_ASSET_BYTES`. Replaces the bytes with
@@ -477,6 +511,10 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
+    // Capture headers for payload logging before request is wrapped/spawned.
+    // Only when payload logging is enabled — formatting + redaction is non-trivial.
+    let headers_json: Option<String> = log_payloads_enabled()
+        .then(|| format_headers_for_log(&headers));
     let request = Context::with_id(request, request_id);
     let context = request.context();
 
@@ -490,8 +528,10 @@ async fn handler_completions(
 
     // possibly long running task
     // if this returns a streaming response, the stream handle will be armed and captured by the response stream
-    let response = tokio::spawn(completions(state, request, stream_handle).in_current_span())
-        .await
+    let response = tokio::spawn(
+        completions(state, request, stream_handle, headers_json).in_current_span(),
+    )
+    .await
         .map_err(|e| {
             ErrorMessage::internal_server_error(&format!(
                 "Failed to await chat completions task: {:?}",
@@ -511,6 +551,7 @@ async fn completions(
     state: Arc<service_v2::State>,
     request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
+    headers_json: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
 
@@ -526,6 +567,7 @@ async fn completions(
         let streaming = request.inner.stream.unwrap_or(false);
         let model_alias = request.inner.model.as_str();
         let (payload, media_redacted) = serialize_for_log(request.content());
+        let headers_log = headers_json.as_deref().unwrap_or("{}");
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
             request_id = %request_id,
@@ -534,6 +576,7 @@ async fn completions(
             streaming = streaming,
             payload_type = "request",
             media_redacted = media_redacted,
+            headers = %headers_log,
             payload = %payload,
         );
     }
@@ -657,6 +700,7 @@ async fn completions_single(
         let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
+        let mut payload_metadata = ResponseLogMetadata::default();
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
 
@@ -669,6 +713,7 @@ async fn completions_single(
                     && !payload_emitted
                     && let Some(data) = &response.data
                 {
+                    payload_metadata.capture_completion(data);
                     // data.inner is CreateCompletionResponse (NvCreateCompletionResponse
                     // wraps it with #[serde(flatten)] but no Deref)
                     for choice in &data.inner.choices {
@@ -699,7 +744,8 @@ async fn completions_single(
                         .iter()
                         .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
                         .collect();
-                    let payload_value = serde_json::json!({ "choices": choices_json });
+                    let mut payload_value = serde_json::json!({ "choices": choices_json });
+                    payload_metadata.inject_into(&mut payload_value);
                     if let Ok(payload) = serde_json::to_string(&payload_value) {
                         tracing::info!(
                             target: PAYLOAD_LOG_TARGET,
@@ -914,6 +960,7 @@ async fn completions_batch(
         let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
+        let mut payload_metadata = ResponseLogMetadata::default();
         let payload_expected_n: u32 = (batch_size as u32) * (n as u32);
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
@@ -925,6 +972,7 @@ async fn completions_batch(
                     && !payload_emitted
                     && let Some(data) = &response.data
                 {
+                    payload_metadata.capture_completion(data);
                     for choice in &data.inner.choices {
                         payload_text_bufs
                             .entry(choice.index)
@@ -952,7 +1000,8 @@ async fn completions_batch(
                         .iter()
                         .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
                         .collect();
-                    let payload_value = serde_json::json!({ "choices": choices_json });
+                    let mut payload_value = serde_json::json!({ "choices": choices_json });
+                    payload_metadata.inject_into(&mut payload_value);
                     if let Ok(payload) = serde_json::to_string(&payload_value) {
                         tracing::info!(
                             target: PAYLOAD_LOG_TARGET,
@@ -1144,6 +1193,9 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
+    // Capture headers for payload logging before request is wrapped/spawned.
+    let headers_json: Option<String> = log_payloads_enabled()
+        .then(|| format_headers_for_log(&headers));
     let request = Context::with_id(request, request_id);
     let context = request.context();
 
@@ -1155,9 +1207,11 @@ async fn handler_chat_completions(
     )
     .await;
 
-    let response =
-        tokio::spawn(chat_completions(state, template, request, stream_handle).in_current_span())
-            .await
+    let response = tokio::spawn(
+        chat_completions(state, template, request, stream_handle, headers_json)
+            .in_current_span(),
+    )
+    .await
             .map_err(|e| {
                 ErrorMessage::internal_server_error(&format!(
                     "Failed to await chat completions task: {:?}",
@@ -1423,6 +1477,93 @@ struct ChoiceLogState {
     finish_reason: Option<dynamo_protocols::types::FinishReason>,
 }
 
+/// Per-response (not per-choice) metadata captured for streaming payload logs.
+/// Fields are populated on the first chunk where they're non-empty and persist
+/// until emit; `usage` is overwritten on every chunk so the final value (which
+/// only arrives in the last chunk when `stream_options.include_usage=true`)
+/// wins. Mirrors the structure of `CreateChatCompletionResponse` /
+/// `CreateCompletionResponse` so the streaming-emitted payload matches the
+/// non-streaming-emitted payload shape.
+#[derive(Default)]
+struct ResponseLogMetadata {
+    id: Option<String>,
+    created: Option<u32>,
+    model: Option<String>,
+    object: Option<String>,
+    system_fingerprint: Option<String>,
+    usage: Option<dynamo_protocols::types::CompletionUsage>,
+}
+
+impl ResponseLogMetadata {
+    /// Populate Option fields on first non-empty value seen; overwrite usage on every call.
+    fn capture_chat(&mut self, data: &NvCreateChatCompletionStreamResponse) {
+        if self.id.is_none() && !data.inner.id.is_empty() {
+            self.id = Some(data.inner.id.clone());
+        }
+        if self.created.is_none() && data.inner.created != 0 {
+            self.created = Some(data.inner.created);
+        }
+        if self.model.is_none() && !data.inner.model.is_empty() {
+            self.model = Some(data.inner.model.clone());
+        }
+        if self.object.is_none() && !data.inner.object.is_empty() {
+            self.object = Some(data.inner.object.clone());
+        }
+        if self.system_fingerprint.is_none() && data.inner.system_fingerprint.is_some() {
+            self.system_fingerprint = data.inner.system_fingerprint.clone();
+        }
+        if data.inner.usage.is_some() {
+            self.usage = data.inner.usage.clone();
+        }
+    }
+
+    /// Same as `capture_chat` but for `NvCreateCompletionResponse`. Fields have
+    /// identical shape so the body is duplicated rather than refactored —
+    /// Rust doesn't have structural typing across the two `inner` types.
+    fn capture_completion(&mut self, data: &NvCreateCompletionResponse) {
+        if self.id.is_none() && !data.inner.id.is_empty() {
+            self.id = Some(data.inner.id.clone());
+        }
+        if self.created.is_none() && data.inner.created != 0 {
+            self.created = Some(data.inner.created);
+        }
+        if self.model.is_none() && !data.inner.model.is_empty() {
+            self.model = Some(data.inner.model.clone());
+        }
+        if self.object.is_none() && !data.inner.object.is_empty() {
+            self.object = Some(data.inner.object.clone());
+        }
+        if self.system_fingerprint.is_none() && data.inner.system_fingerprint.is_some() {
+            self.system_fingerprint = data.inner.system_fingerprint.clone();
+        }
+        if data.inner.usage.is_some() {
+            self.usage = data.inner.usage.clone();
+        }
+    }
+
+    /// Inject captured fields onto a top-level JSON object (the response payload).
+    fn inject_into(&self, payload: &mut serde_json::Value) {
+        if let Some(id) = &self.id {
+            payload["id"] = serde_json::Value::String(id.clone());
+        }
+        if let Some(c) = self.created {
+            payload["created"] = serde_json::Value::Number(c.into());
+        }
+        if let Some(m) = &self.model {
+            payload["model"] = serde_json::Value::String(m.clone());
+        }
+        if let Some(o) = &self.object {
+            payload["object"] = serde_json::Value::String(o.clone());
+        }
+        if let Some(sf) = &self.system_fingerprint {
+            payload["system_fingerprint"] = serde_json::Value::String(sf.clone());
+        }
+        if let Some(u) = &self.usage {
+            payload["usage"] = serde_json::to_value(u).unwrap_or(serde_json::Value::Null);
+        }
+    }
+}
+
 /// Convert a streaming `ChatCompletionMessageToolCallChunk` into the aggregated
 /// `ChatCompletionMessageToolCall` shape — same shape that
 /// `aggregator::convert_tool_chunk_to_message_tool_call` produces, inlined here
@@ -1518,6 +1659,7 @@ async fn chat_completions(
     template: Option<RequestTemplate>,
     mut request: Context<NvCreateChatCompletionRequest>,
     mut stream_handle: ConnectionHandle,
+    headers_json: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -1568,6 +1710,7 @@ async fn chat_completions(
     // engine will see (post-template, post-alias-resolve), not the raw client input.
     if log_payloads_enabled() {
         let (payload, media_redacted) = serialize_for_log(request.content());
+        let headers_log = headers_json.as_deref().unwrap_or("{}");
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
             request_id = %request_id,
@@ -1576,6 +1719,7 @@ async fn chat_completions(
             streaming = streaming,
             payload_type = "request",
             media_redacted = media_redacted,
+            headers = %headers_log,
             payload = %payload,
         );
     }
@@ -1683,6 +1827,7 @@ async fn chat_completions(
         let mut payload_choice_state: HashMap<u32, ChoiceLogState> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
+        let mut payload_metadata = ResponseLogMetadata::default();
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
 
@@ -1710,6 +1855,9 @@ async fn chat_completions(
             // Returns true exactly once — when all `payload_expected_n` choices have finished.
             // Client-disconnected and engine-errored streams (data=None) never trigger an emit.
             let is_final = if log_payloads {
+                if let Some(data) = &response.data {
+                    payload_metadata.capture_chat(data);
+                }
                 accumulate_payload_chat(
                     &response,
                     &mut payload_choice_state,
@@ -1761,7 +1909,8 @@ async fn chat_completions(
                         choice
                     })
                     .collect();
-                let payload_value = serde_json::json!({ "choices": choices_json });
+                let mut payload_value = serde_json::json!({ "choices": choices_json });
+                payload_metadata.inject_into(&mut payload_value);
                 if let Ok(payload) = serde_json::to_string(&payload_value) {
                     tracing::info!(
                         target: PAYLOAD_LOG_TARGET,
