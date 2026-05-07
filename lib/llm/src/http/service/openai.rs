@@ -1332,7 +1332,7 @@ fn accumulate_payload_chat(
         return false;
     };
     for choice in &data.inner.choices {
-        if let Some(dynamo_async_openai::types::ChatCompletionMessageContent::Text(s)) =
+        if let Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(s)) =
             &choice.delta.content
         {
             content_bufs.entry(choice.index).or_default().append(s);
