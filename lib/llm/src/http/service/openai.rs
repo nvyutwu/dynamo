@@ -1778,8 +1778,8 @@ async fn chat_completions(
                         }
                         let mut choice = serde_json::json!({ "index": idx, "message": msg });
                         if let Some(fr) = &st.finish_reason {
-                            choice["finish_reason"] = serde_json::to_value(fr)
-                                .unwrap_or(serde_json::Value::Null);
+                            choice["finish_reason"] =
+                                serde_json::to_value(fr).unwrap_or(serde_json::Value::Null);
                         }
                         if st.truncated() {
                             choice["truncated"] = serde_json::Value::Bool(true);
