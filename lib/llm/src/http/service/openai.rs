@@ -105,12 +105,12 @@ fn log_payloads_enabled() -> bool {
     *ENABLED.get_or_init(|| env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS))
 }
 
-/// Walk a serde_json `Value` tree and redact any string field that:
-///   1. starts with `data:` (a base64-inlined media asset), AND
-///   2. exceeds `MAX_MEDIA_ASSET_BYTES`.
-/// Replaces the bytes with `<media:<mime> redacted=true original_bytes=N>`.
-/// Returns the number of redactions performed (used to set a structured
-/// `media_redacted` field on the log record).
+/// Walk a serde_json `Value` tree and redact any string field that
+/// (a) starts with `data:` (a base64-inlined media asset), and
+/// (b) exceeds `MAX_MEDIA_ASSET_BYTES`. Replaces the bytes with
+/// `<media:<mime> redacted=true original_bytes=N>`. Returns the number of
+/// redactions performed (used to set a structured `media_redacted` field on
+/// the log record).
 fn redact_oversized_media(value: &mut serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(s)
