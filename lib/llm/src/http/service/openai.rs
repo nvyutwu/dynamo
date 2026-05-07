@@ -23,9 +23,9 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
+use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::config::environment_names::logging as env_logging;
-use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -491,9 +491,7 @@ async fn completions_single(
     // request in place. Engine routing, metrics labels, and the OpenAI
     // response.model all derive from this single name afterwards — matching
     // vLLM/SGLang behavior where alias requests still respond with primary.
-    let canonical = state
-        .manager()
-        .resolve_canonical_name(&request.inner.model);
+    let canonical = state.manager().resolve_canonical_name(&request.inner.model);
     if canonical != request.inner.model {
         request.inner.model = canonical.clone();
     }
@@ -511,18 +509,18 @@ async fn completions_single(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled() {
-        if let Ok(payload) = serde_json::to_string(request.content()) {
-            tracing::info!(
-                target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
-                model = %model,
-                endpoint = "completions",
-                streaming = streaming,
-                payload_type = "request",
-                payload = %payload,
-            );
-        }
+    if log_payloads_enabled()
+        && let Ok(payload) = serde_json::to_string(request.content())
+    {
+        tracing::info!(
+            target: PAYLOAD_LOG_TARGET,
+            request_id = %request_id,
+            model = %model,
+            endpoint = "completions",
+            streaming = streaming,
+            payload_type = "request",
+            payload = %payload,
+        );
     }
 
     // todo - error handling should be more robust
@@ -596,23 +594,24 @@ async fn completions_single(
                 // Accumulate text content for payload logging before response is consumed.
                 // is_final fires exactly once — when all `payload_expected_n` choices have finished.
                 let mut is_final = false;
-                if log_payloads && !payload_emitted {
-                    if let Some(data) = &response.data {
-                        // data.inner is CreateCompletionResponse (NvCreateCompletionResponse
-                        // wraps it with #[serde(flatten)] but no Deref)
-                        for choice in &data.inner.choices {
-                            payload_text_bufs
-                                .entry(choice.index)
-                                .or_default()
-                                .append(&choice.text);
-                            if choice.finish_reason.is_some() {
-                                payload_finished_indices.insert(choice.index);
-                            }
+                if log_payloads
+                    && !payload_emitted
+                    && let Some(data) = &response.data
+                {
+                    // data.inner is CreateCompletionResponse (NvCreateCompletionResponse
+                    // wraps it with #[serde(flatten)] but no Deref)
+                    for choice in &data.inner.choices {
+                        payload_text_bufs
+                            .entry(choice.index)
+                            .or_default()
+                            .append(&choice.text);
+                        if choice.finish_reason.is_some() {
+                            payload_finished_indices.insert(choice.index);
                         }
-                        if payload_finished_indices.len() as u32 >= payload_expected_n {
-                            payload_emitted = true;
-                            is_final = true;
-                        }
+                    }
+                    if payload_finished_indices.len() as u32 >= payload_expected_n {
+                        payload_emitted = true;
+                        is_final = true;
                     }
                 }
 
@@ -640,8 +639,7 @@ async fn completions_single(
                             choice
                         })
                         .collect();
-                    let mut payload_value =
-                        serde_json::json!({ "choices": choices_json });
+                    let mut payload_value = serde_json::json!({ "choices": choices_json });
                     if any_truncated {
                         payload_value["truncated"] = serde_json::Value::Bool(true);
                     }
@@ -704,18 +702,18 @@ async fn completions_single(
             })?;
 
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
-        if log_payloads_enabled() {
-            if let Ok(payload) = serde_json::to_string(&response) {
-                tracing::info!(
-                    target: PAYLOAD_LOG_TARGET,
-                    request_id = %request_id,
-                    model = %model,
-                    endpoint = "completions",
-                    streaming = false,
-                    payload_type = "response",
-                    payload = %payload,
-                );
-            }
+        if log_payloads_enabled()
+            && let Ok(payload) = serde_json::to_string(&response)
+        {
+            tracing::info!(
+                target: PAYLOAD_LOG_TARGET,
+                request_id = %request_id,
+                model = %model,
+                endpoint = "completions",
+                streaming = false,
+                payload_type = "response",
+                payload = %payload,
+            );
         }
 
         inflight_guard.mark_ok();
@@ -744,9 +742,7 @@ async fn completions_batch(
     let streaming = request.inner.stream.unwrap_or(false);
     // Resolve alias → primary served name; rewrite request so engine, metrics,
     // and OpenAI response.model all use the canonical name.
-    let canonical = state
-        .manager()
-        .resolve_canonical_name(&request.inner.model);
+    let canonical = state.manager().resolve_canonical_name(&request.inner.model);
     if canonical != request.inner.model {
         request.inner.model = canonical.clone();
     }
@@ -1397,9 +1393,7 @@ async fn chat_completions(
     // todo - determine the proper error code for when a request model is not present
     // Resolve alias → primary served name; rewrite request so engine, metrics,
     // and OpenAI response.model all use the canonical name.
-    let canonical = state
-        .manager()
-        .resolve_canonical_name(&request.inner.model);
+    let canonical = state.manager().resolve_canonical_name(&request.inner.model);
     if canonical != request.inner.model {
         request.inner.model = canonical.clone();
     }
@@ -1446,18 +1440,18 @@ async fn chat_completions(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled() {
-        if let Ok(payload) = serde_json::to_string(request.content()) {
-            tracing::info!(
-                target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
-                model = %model,
-                endpoint = "chat_completions",
-                streaming = streaming,
-                payload_type = "request",
-                payload = %payload,
-            );
-        }
+    if log_payloads_enabled()
+        && let Ok(payload) = serde_json::to_string(request.content())
+    {
+        tracing::info!(
+            target: PAYLOAD_LOG_TARGET,
+            request_id = %request_id,
+            model = %model,
+            endpoint = "chat_completions",
+            streaming = streaming,
+            payload_type = "request",
+            payload = %payload,
+        );
     }
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
@@ -1597,11 +1591,10 @@ async fn chat_completions(
                             "role": "assistant",
                             "content": &content_buf.content,
                         });
-                        if let Some(b) = reasoning_buf {
-                            if !b.content.is_empty() {
-                                msg["reasoning_content"] =
-                                    serde_json::Value::String(b.content.clone());
-                            }
+                        if let Some(b) = reasoning_buf
+                            && !b.content.is_empty()
+                        {
+                            msg["reasoning_content"] = serde_json::Value::String(b.content.clone());
                         }
                         let mut choice = serde_json::json!({ "index": idx, "message": msg });
                         if truncated {
@@ -1610,8 +1603,7 @@ async fn chat_completions(
                         choice
                     })
                     .collect();
-                let mut payload_value =
-                    serde_json::json!({ "choices": choices_json });
+                let mut payload_value = serde_json::json!({ "choices": choices_json });
                 if any_truncated {
                     payload_value["truncated"] = serde_json::Value::Bool(true);
                 }
@@ -1685,18 +1677,18 @@ async fn chat_completions(
                 })?;
 
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
-        if log_payloads_enabled() {
-            if let Ok(payload) = serde_json::to_string(&response) {
-                tracing::info!(
-                    target: PAYLOAD_LOG_TARGET,
-                    request_id = %request_id,
-                    model = %model,
-                    endpoint = "chat_completions",
-                    streaming = false,
-                    payload_type = "response",
-                    payload = %payload,
-                );
-            }
+        if log_payloads_enabled()
+            && let Ok(payload) = serde_json::to_string(&response)
+        {
+            tracing::info!(
+                target: PAYLOAD_LOG_TARGET,
+                request_id = %request_id,
+                model = %model,
+                endpoint = "chat_completions",
+                streaming = false,
+                payload_type = "response",
+                payload = %payload,
+            );
         }
 
         inflight_guard.mark_ok();
