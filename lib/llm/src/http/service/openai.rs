@@ -108,13 +108,39 @@ fn log_payloads_enabled() -> bool {
 /// Header names whose values are redacted in payload logs. Case-insensitive
 /// match. Mirrors the conservative "secrets only" approach: log everything
 /// useful for routing/debugging (NVCF nca-id, x-dynamo-*, NVCF-FUNCTION-*,
-/// User-Agent, Content-Type, etc.) but never ship bearer tokens or session
-/// cookies into the OTEL log backend.
+/// User-Agent, Content-Type, etc.) but never ship bearer tokens, session
+/// cookies, or vendor API keys into the OTEL log backend.
+///
+/// **When to update**: any time we accept a new vendor / cloud provider
+/// integration that introduces a header carrying a secret, add it here.
+/// Common vendor headers covered:
+///   - OpenAI / Anthropic / Bearer-style: `authorization`, `proxy-authorization`
+///   - Azure OpenAI:                       `api-key`
+///   - NGC / NVIDIA / generic proxy:       `x-api-key`
+///   - Google AI Studio:                   `x-goog-api-key`
+///   - AWS sigv4 sessions:                 `x-amz-security-token`
+///   - SSO / service-mesh:                 `x-auth-token`, `x-access-token`
+///   - Cookies / sessions:                 `cookie`, `set-cookie`
+///   - HTTP auth challenge:                `proxy-authenticate`, `www-authenticate`
 fn is_sensitive_header(name: &str) -> bool {
+    // axum/http normalizes incoming HTTP/1.1 and HTTP/2 header names to lowercase,
+    // so `name` is already lowercase here — but lowercasing again is cheap and
+    // makes the function safe under all callers.
     let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api-key"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-amz-security-token"
+            | "x-auth-token"
+            | "x-access-token"
+            | "proxy-authenticate"
+            | "www-authenticate"
     )
 }
 
@@ -958,7 +984,14 @@ async fn completions_batch(
         let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
-        let mut payload_metadata = ResponseLogMetadata::default();
+        // Pre-stamp the outer request id so subsequent `capture_completion` calls skip
+        // overwriting from sub-stream chunks (each sub-stream got `{outer}-{prompt_idx}`
+        // as its inner.id; without this stamp, the embedded payload's `id` field would
+        // be whichever sub-stream emitted first).
+        let mut payload_metadata = ResponseLogMetadata {
+            id: Some(request_id.clone()),
+            ..Default::default()
+        };
         let payload_expected_n: u32 = (batch_size as u32) * (n as u32);
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
@@ -1058,9 +1091,16 @@ async fn completions_batch(
                 err_response
             })?;
 
-        // Log response payload to OTEL for non-streaming batch (suppressed from console)
+        // Log response payload to OTEL for non-streaming batch (suppressed from console).
+        // Clone-and-override `id`: the folded response inherits whichever sub-stream's
+        // id the aggregator saw last (each sub-stream had `{outer}-{prompt_idx}` as its
+        // id). Replace with the outer request_id so the embedded payload `id` matches
+        // the structured `request_id` log field. The original response (returned to the
+        // client) is unchanged.
         if log_payloads_enabled() {
-            let (payload, media_redacted) = serialize_for_log(&response);
+            let mut response_for_log = response.clone();
+            response_for_log.inner.id = request_id.clone();
+            let (payload, media_redacted) = serialize_for_log(&response_for_log);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
                 request_id = %request_id,
@@ -1539,24 +1579,43 @@ impl ResponseLogMetadata {
     }
 
     /// Inject captured fields onto a top-level JSON object (the response payload).
+    /// No-op if `payload` isn't an Object (defensive — `Value::String[k] = v` panics).
     fn inject_into(&self, payload: &mut serde_json::Value) {
+        let Some(map) = payload.as_object_mut() else {
+            return;
+        };
         if let Some(id) = &self.id {
-            payload["id"] = serde_json::Value::String(id.clone());
+            map.insert("id".to_string(), serde_json::Value::String(id.clone()));
         }
         if let Some(c) = self.created {
-            payload["created"] = serde_json::Value::Number(c.into());
+            map.insert(
+                "created".to_string(),
+                serde_json::Value::Number(c.into()),
+            );
         }
         if let Some(m) = &self.model {
-            payload["model"] = serde_json::Value::String(m.clone());
+            map.insert(
+                "model".to_string(),
+                serde_json::Value::String(m.clone()),
+            );
         }
         if let Some(o) = &self.object {
-            payload["object"] = serde_json::Value::String(o.clone());
+            map.insert(
+                "object".to_string(),
+                serde_json::Value::String(o.clone()),
+            );
         }
         if let Some(sf) = &self.system_fingerprint {
-            payload["system_fingerprint"] = serde_json::Value::String(sf.clone());
+            map.insert(
+                "system_fingerprint".to_string(),
+                serde_json::Value::String(sf.clone()),
+            );
         }
         if let Some(u) = &self.usage {
-            payload["usage"] = serde_json::to_value(u).unwrap_or(serde_json::Value::Null);
+            map.insert(
+                "usage".to_string(),
+                serde_json::to_value(u).unwrap_or(serde_json::Value::Null),
+            );
         }
     }
 }
