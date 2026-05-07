@@ -1428,7 +1428,52 @@ impl BoundedBuf {
     }
 }
 
-/// Accumulates chat completion content and reasoning tokens for payload logging.
+/// Maximum number of tool_call chunks accumulated per choice for payload logging.
+/// Beyond this we set `tool_calls_truncated = true` and stop appending.
+const MAX_TOOL_CALLS_PER_CHOICE: usize = 64;
+
+/// Per-choice payload log state. Combines what the twin HashMaps held before
+/// (content + reasoning) with tool_calls and finish_reason so the emitted
+/// payload mirrors `ChatCompletionResponse` shape — addresses V4 from review
+/// (tool-only choices used to disappear from the log entirely; tool_calls
+/// were dropped even on choices with content).
+#[derive(Default)]
+struct ChoiceLogState {
+    content: BoundedBuf,
+    reasoning: BoundedBuf,
+    tool_calls: Vec<dynamo_protocols::types::ChatCompletionMessageToolCall>,
+    tool_calls_truncated: bool,
+    finish_reason: Option<dynamo_protocols::types::FinishReason>,
+}
+
+impl ChoiceLogState {
+    fn truncated(&self) -> bool {
+        self.content.truncated || self.reasoning.truncated || self.tool_calls_truncated
+    }
+}
+
+/// Convert a streaming `ChatCompletionMessageToolCallChunk` into the aggregated
+/// `ChatCompletionMessageToolCall` shape — same shape that
+/// `aggregator::convert_tool_chunk_to_message_tool_call` produces, inlined here
+/// to avoid bumping that helper's visibility.
+fn tool_chunk_to_message_call(
+    chunk: &dynamo_protocols::types::ChatCompletionMessageToolCallChunk,
+) -> Option<dynamo_protocols::types::ChatCompletionMessageToolCall> {
+    let id = chunk.id.as_ref()?;
+    let function = chunk.function.as_ref()?;
+    let name = function.name.as_ref()?;
+    let arguments = function.arguments.as_ref()?;
+    Some(dynamo_protocols::types::ChatCompletionMessageToolCall {
+        id: id.clone(),
+        r#type: dynamo_protocols::types::FunctionType::Function,
+        function: dynamo_protocols::types::FunctionCall {
+            name: name.clone(),
+            arguments: arguments.clone(),
+        },
+    })
+}
+
+/// Accumulates chat completion content, reasoning, and tool_calls for payload logging.
 ///
 /// Borrows the response chunk before it is consumed by `EventConverter`.
 /// Returns `true` exactly once — on the first chunk where every expected choice
@@ -1436,8 +1481,7 @@ impl BoundedBuf {
 /// Only intended to be called when `log_payloads_enabled()` is true.
 fn accumulate_payload_chat(
     response: &Annotated<NvCreateChatCompletionStreamResponse>,
-    content_bufs: &mut HashMap<u32, BoundedBuf>,
-    reasoning_bufs: &mut HashMap<u32, BoundedBuf>,
+    choice_state: &mut HashMap<u32, ChoiceLogState>,
     finished_indices: &mut HashSet<u32>,
     expected_n: u32,
     already_emitted: &mut bool,
@@ -1449,18 +1493,33 @@ fn accumulate_payload_chat(
         return false;
     };
     for choice in &data.inner.choices {
+        // Always create state — ensures tool-only choices (delta.content=None throughout)
+        // and finish_reason-only chunks still produce a per-choice entry in the log.
+        let state = choice_state.entry(choice.index).or_default();
+
         if let Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(s)) =
             &choice.delta.content
         {
-            content_bufs.entry(choice.index).or_default().append(s);
+            state.content.append(s);
         }
         if let Some(reasoning) = &choice.delta.reasoning_content {
-            reasoning_bufs
-                .entry(choice.index)
-                .or_default()
-                .append(reasoning);
+            state.reasoning.append(reasoning);
         }
-        if choice.finish_reason.is_some() {
+        if let Some(tool_call_chunks) = &choice.delta.tool_calls
+            && !tool_call_chunks.is_empty()
+        {
+            for chunk in tool_call_chunks {
+                if state.tool_calls.len() >= MAX_TOOL_CALLS_PER_CHOICE {
+                    state.tool_calls_truncated = true;
+                    break;
+                }
+                if let Some(tc) = tool_chunk_to_message_call(chunk) {
+                    state.tool_calls.push(tc);
+                }
+            }
+        }
+        if let Some(fr) = choice.finish_reason {
+            state.finish_reason = Some(fr);
             finished_indices.insert(choice.index);
         }
     }
@@ -1647,8 +1706,7 @@ async fn chat_completions(
         // Payload log accumulators for streaming responses.
         // Only allocated/used when payload logging is enabled; gated to avoid overhead.
         let log_payloads = log_payloads_enabled();
-        let mut payload_content_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
-        let mut payload_reasoning_bufs: HashMap<u32, BoundedBuf> = HashMap::new();
+        let mut payload_choice_state: HashMap<u32, ChoiceLogState> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
         let request_id_for_log = request_id.clone();
@@ -1674,14 +1732,13 @@ async fn chat_completions(
                 ));
             }
 
-            // Accumulate content for payload logging before response is consumed.
+            // Accumulate content/reasoning/tool_calls for payload logging before response is consumed.
             // Returns true exactly once — when all `payload_expected_n` choices have finished.
             // Client-disconnected and engine-errored streams (data=None) never trigger an emit.
             let is_final = if log_payloads {
                 accumulate_payload_chat(
                     &response,
-                    &mut payload_content_bufs,
-                    &mut payload_reasoning_bufs,
+                    &mut payload_choice_state,
                     &mut payload_finished_indices,
                     payload_expected_n,
                     &mut payload_emitted,
@@ -1701,27 +1758,34 @@ async fn chat_completions(
             // Emit assembled payload log on the final chunk.
             if is_final {
                 let mut any_truncated = false;
-                let choices_json: Vec<serde_json::Value> = payload_content_bufs
+                let choices_json: Vec<serde_json::Value> = payload_choice_state
                     .iter()
-                    .map(|(idx, content_buf)| {
-                        let reasoning_buf = payload_reasoning_bufs.get(idx);
-                        let truncated =
-                            content_buf.truncated || reasoning_buf.is_some_and(|b| b.truncated);
-                        if truncated {
+                    .map(|(idx, st)| {
+                        if st.truncated() {
                             any_truncated = true;
                         }
                         let mut msg = serde_json::json!({
                             "role": "assistant",
-                            "content": &content_buf.content,
+                            "content": &st.content.content,
                         });
-                        if let Some(b) = reasoning_buf
-                            && !b.content.is_empty()
-                        {
-                            msg["reasoning_content"] = serde_json::Value::String(b.content.clone());
+                        if !st.reasoning.content.is_empty() {
+                            msg["reasoning_content"] =
+                                serde_json::Value::String(st.reasoning.content.clone());
+                        }
+                        if !st.tool_calls.is_empty() {
+                            msg["tool_calls"] = serde_json::to_value(&st.tool_calls)
+                                .unwrap_or(serde_json::Value::Null);
                         }
                         let mut choice = serde_json::json!({ "index": idx, "message": msg });
-                        if truncated {
+                        if let Some(fr) = &st.finish_reason {
+                            choice["finish_reason"] = serde_json::to_value(fr)
+                                .unwrap_or(serde_json::Value::Null);
+                        }
+                        if st.truncated() {
                             choice["truncated"] = serde_json::Value::Bool(true);
+                            if st.tool_calls_truncated {
+                                choice["tool_calls_truncated"] = serde_json::Value::Bool(true);
+                            }
                         }
                         choice
                     })
