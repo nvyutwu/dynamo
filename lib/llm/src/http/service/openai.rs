@@ -135,8 +135,7 @@ fn format_headers_for_log(headers: &HeaderMap) -> String {
         };
         map.insert(name_str.to_string(), value_json);
     }
-    serde_json::to_string(&serde_json::Value::Object(map))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Walk a serde_json `Value` tree and redact any string field that
@@ -513,8 +512,8 @@ async fn handler_completions(
     };
     // Capture headers for payload logging before request is wrapped/spawned.
     // Only when payload logging is enabled — formatting + redaction is non-trivial.
-    let headers_json: Option<String> = log_payloads_enabled()
-        .then(|| format_headers_for_log(&headers));
+    let headers_json: Option<String> =
+        log_payloads_enabled().then(|| format_headers_for_log(&headers));
     let request = Context::with_id(request, request_id);
     let context = request.context();
 
@@ -528,16 +527,15 @@ async fn handler_completions(
 
     // possibly long running task
     // if this returns a streaming response, the stream handle will be armed and captured by the response stream
-    let response = tokio::spawn(
-        completions(state, request, stream_handle, headers_json).in_current_span(),
-    )
-    .await
-        .map_err(|e| {
-            ErrorMessage::internal_server_error(&format!(
-                "Failed to await chat completions task: {:?}",
-                e,
-            ))
-        })?;
+    let response =
+        tokio::spawn(completions(state, request, stream_handle, headers_json).in_current_span())
+            .await
+            .map_err(|e| {
+                ErrorMessage::internal_server_error(&format!(
+                    "Failed to await chat completions task: {:?}",
+                    e,
+                ))
+            })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
@@ -1194,8 +1192,8 @@ async fn handler_chat_completions(
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
     // Capture headers for payload logging before request is wrapped/spawned.
-    let headers_json: Option<String> = log_payloads_enabled()
-        .then(|| format_headers_for_log(&headers));
+    let headers_json: Option<String> =
+        log_payloads_enabled().then(|| format_headers_for_log(&headers));
     let request = Context::with_id(request, request_id);
     let context = request.context();
 
@@ -1208,16 +1206,15 @@ async fn handler_chat_completions(
     .await;
 
     let response = tokio::spawn(
-        chat_completions(state, template, request, stream_handle, headers_json)
-            .in_current_span(),
+        chat_completions(state, template, request, stream_handle, headers_json).in_current_span(),
     )
     .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
-                    "Failed to await chat completions task: {:?}",
-                    e,
-                ))
-            })?;
+    .map_err(|e| {
+        ErrorMessage::internal_server_error(&format!(
+            "Failed to await chat completions task: {:?}",
+            e,
+        ))
+    })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
