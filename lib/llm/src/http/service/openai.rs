@@ -592,9 +592,12 @@ async fn completions(
         let model_alias = request.inner.model.as_str();
         let (payload, media_redacted) = serialize_for_log(request.content());
         let headers_log = headers_json.as_deref().unwrap_or("{}");
+        // Emit the OpenAI-wire id (cmpl-<uuid>) so log queries can grep the
+        // exact id the client sees in the response payload.
+        let log_request_id = format!("cmpl-{}", request_id);
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
-            request_id = %request_id,
+            request_id = %log_request_id,
             model = %model_alias,
             endpoint = "completions",
             streaming = streaming,
@@ -724,14 +727,20 @@ async fn completions_single(
         let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
+        // Defer-emit flag: see chat streaming handler for rationale — wait one
+        // chunk after all_finished so the trailing `usage` block is captured.
+        let mut payload_pending_emit = false;
         let mut payload_metadata = ResponseLogMetadata::default();
-        let request_id_for_log = request_id.clone();
+        // OpenAI-wire id (cmpl-<uuid>) for OTEL log correlation with the
+        // response payload's `id` field.
+        let request_id_for_log = format!("cmpl-{}", request_id);
         let model_for_log = model.clone();
 
         let stream = stream
             .map(move |response| {
                 // Accumulate text content for payload logging before response is consumed.
-                // is_final fires exactly once — when all `payload_expected_n` choices have finished.
+                // is_final fires exactly once — see emit-timing comment in
+                // accumulate_payload_chat for the defer-by-one-chunk rationale.
                 let mut is_final = false;
                 if log_payloads
                     && !payload_emitted
@@ -749,9 +758,21 @@ async fn completions_single(
                             payload_finished_indices.insert(choice.index);
                         }
                     }
-                    if payload_finished_indices.len() as u32 >= payload_expected_n {
+                    let all_finished = payload_finished_indices.len() as u32 >= payload_expected_n;
+                    if payload_pending_emit {
+                        // Trailing chunk after all_finished — emit now (captures
+                        // the trailing usage just absorbed by capture_completion).
                         payload_emitted = true;
                         is_final = true;
+                    } else if all_finished {
+                        if data.inner.usage.is_some() {
+                            // Single-chunk case: last finish_reason + usage in same chunk.
+                            payload_emitted = true;
+                            is_final = true;
+                        } else {
+                            // Defer one chunk for the trailing usage block.
+                            payload_pending_emit = true;
+                        }
                     }
                 }
 
@@ -830,9 +851,16 @@ async fn completions_single(
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
         if log_payloads_enabled() {
             let (payload, media_redacted) = serialize_for_log(&response);
+            // Use the response's wire id when available; fall back to
+            // constructing the cmpl-<uuid> form from the bare request_id.
+            let log_request_id = if !response.inner.id.is_empty() {
+                response.inner.id.clone()
+            } else {
+                format!("cmpl-{}", request_id)
+            };
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
+                request_id = %log_request_id,
                 model = %model,
                 endpoint = "completions",
                 streaming = false,
@@ -984,16 +1012,21 @@ async fn completions_batch(
         let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
+        // Defer-emit flag: see chat streaming handler for rationale — wait one
+        // chunk after all_finished so the trailing `usage` block is captured.
+        let mut payload_pending_emit = false;
         // Pre-stamp the outer request id so subsequent `capture_completion` calls skip
         // overwriting from sub-stream chunks (each sub-stream got `{outer}-{prompt_idx}`
         // as its inner.id; without this stamp, the embedded payload's `id` field would
-        // be whichever sub-stream emitted first).
+        // be whichever sub-stream emitted first). Use the OpenAI-wire form so the
+        // serialized payload's `id` matches what a non-batch wire id would look like.
         let mut payload_metadata = ResponseLogMetadata {
-            id: Some(request_id.clone()),
+            id: Some(format!("cmpl-{}", request_id)),
             ..Default::default()
         };
         let payload_expected_n: u32 = (batch_size as u32) * (n as u32);
-        let request_id_for_log = request_id.clone();
+        // OpenAI-wire id (cmpl-<uuid>) for OTEL log correlation.
+        let request_id_for_log = format!("cmpl-{}", request_id);
         let model_for_log = model.clone();
 
         let stream = merged_stream
@@ -1013,9 +1046,17 @@ async fn completions_batch(
                             payload_finished_indices.insert(choice.index);
                         }
                     }
-                    if payload_finished_indices.len() as u32 >= payload_expected_n {
+                    let all_finished = payload_finished_indices.len() as u32 >= payload_expected_n;
+                    if payload_pending_emit {
                         payload_emitted = true;
                         is_final = true;
+                    } else if all_finished {
+                        if data.inner.usage.is_some() {
+                            payload_emitted = true;
+                            is_final = true;
+                        } else {
+                            payload_pending_emit = true;
+                        }
                     }
                 }
 
@@ -1094,16 +1135,17 @@ async fn completions_batch(
         // Log response payload to OTEL for non-streaming batch (suppressed from console).
         // Clone-and-override `id`: the folded response inherits whichever sub-stream's
         // id the aggregator saw last (each sub-stream had `{outer}-{prompt_idx}` as its
-        // id). Replace with the outer request_id so the embedded payload `id` matches
+        // id). Replace with the OpenAI-wire id so the embedded payload `id` matches
         // the structured `request_id` log field. The original response (returned to the
         // client) is unchanged.
         if log_payloads_enabled() {
+            let log_request_id = format!("cmpl-{}", request_id);
             let mut response_for_log = response.clone();
-            response_for_log.inner.id = request_id.clone();
+            response_for_log.inner.id = log_request_id.clone();
             let (payload, media_redacted) = serialize_for_log(&response_for_log);
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
+                request_id = %log_request_id,
                 model = %model,
                 endpoint = "completions",
                 streaming = false,
@@ -1635,15 +1677,27 @@ fn tool_chunk_to_message_call(
 /// Accumulates chat completion content, reasoning, and tool_calls for payload logging.
 ///
 /// Borrows the response chunk before it is consumed by `EventConverter`.
-/// Returns `true` exactly once — on the first chunk where every expected choice
-/// has reported a `finish_reason` — so the caller emits a single final log per request.
-/// Only intended to be called when `log_payloads_enabled()` is true.
+/// Returns `true` exactly once per request — on the chunk that finalizes the
+/// payload log. Only intended to be called when `log_payloads_enabled()` is true.
+///
+/// Emit timing: when `stream_options.include_usage=true` (which the chat
+/// handler hardcodes), OpenAI streaming sends the per-token `usage` block in a
+/// trailing chunk with `choices: []` AFTER every choice's `finish_reason`. To
+/// capture that usage, we defer the emit by one chunk: the first chunk where
+/// all `expected_n` choices have finished sets `pending_emit=true`, and the
+/// next chunk (the trailing usage chunk) triggers the actual emit. The caller
+/// runs `capture_chat()` before this fn each chunk, so by the time we emit on
+/// the trailing chunk the usage is already in `payload_metadata`.
+///
+/// If a single chunk carries both the last finish_reason and a usage block
+/// (some engines do this), we emit immediately on that chunk.
 fn accumulate_payload_chat(
     response: &Annotated<NvCreateChatCompletionStreamResponse>,
     choice_state: &mut HashMap<u32, ChoiceLogState>,
     finished_indices: &mut HashSet<u32>,
     expected_n: u32,
     already_emitted: &mut bool,
+    pending_emit: &mut bool,
 ) -> bool {
     if *already_emitted {
         return false;
@@ -1685,12 +1739,25 @@ fn accumulate_payload_chat(
             finished_indices.insert(choice.index);
         }
     }
-    if finished_indices.len() as u32 >= expected_n {
+
+    // We deferred the previous chunk waiting for trailing usage — emit now.
+    // The handler's capture_chat() ran before this fn, so usage from this chunk
+    // (if present) is already in payload_metadata.
+    if *pending_emit {
         *already_emitted = true;
-        true
-    } else {
-        false
+        return true;
     }
+
+    if finished_indices.len() as u32 >= expected_n {
+        // Single-chunk case: engine packed last finish_reason + usage together.
+        if data.inner.usage.is_some() {
+            *already_emitted = true;
+            return true;
+        }
+        // Standard case: usage will arrive in the next chunk.
+        *pending_emit = true;
+    }
+    false
 }
 
 /// OpenAI Chat Completions Request Handler
@@ -1758,9 +1825,12 @@ async fn chat_completions(
     if log_payloads_enabled() {
         let (payload, media_redacted) = serialize_for_log(request.content());
         let headers_log = headers_json.as_deref().unwrap_or("{}");
+        // Emit the OpenAI-wire id (chatcmpl-<uuid>) so log queries can grep
+        // the exact id the client sees in the response payload.
+        let log_request_id = format!("chatcmpl-{}", request_id);
         tracing::info!(
             target: PAYLOAD_LOG_TARGET,
-            request_id = %request_id,
+            request_id = %log_request_id,
             model = %model,
             endpoint = "chat_completions",
             streaming = streaming,
@@ -1874,8 +1944,14 @@ async fn chat_completions(
         let mut payload_choice_state: HashMap<u32, ChoiceLogState> = HashMap::new();
         let mut payload_finished_indices: HashSet<u32> = HashSet::new();
         let mut payload_emitted = false;
+        // Defer-emit flag: when all choices report finish_reason in a content
+        // chunk, we wait one more chunk for the trailing usage block before
+        // emitting. See `accumulate_payload_chat` for full rationale.
+        let mut payload_pending_emit = false;
         let mut payload_metadata = ResponseLogMetadata::default();
-        let request_id_for_log = request_id.clone();
+        // OpenAI-wire id (chatcmpl-<uuid>) for OTEL log correlation with the
+        // response payload's `id` field that the client sees.
+        let request_id_for_log = format!("chatcmpl-{}", request_id);
         let model_for_log = model.clone();
 
         // flat_map lets us optionally prepend extra SSE events before each regular chunk:
@@ -1911,6 +1987,7 @@ async fn chat_completions(
                     &mut payload_finished_indices,
                     payload_expected_n,
                     &mut payload_emitted,
+                    &mut payload_pending_emit,
                 )
             } else {
                 false
@@ -2030,9 +2107,17 @@ async fn chat_completions(
         // Log response payload to OTEL for non-streaming requests (suppressed from console)
         if log_payloads_enabled() {
             let (payload, media_redacted) = serialize_for_log(&response);
+            // Use the response's wire id when available so the log matches
+            // exactly what the client sees; fall back to constructing it from
+            // the bare request_id (handler-level UUID).
+            let log_request_id = if !response.inner.id.is_empty() {
+                response.inner.id.clone()
+            } else {
+                format!("chatcmpl-{}", request_id)
+            };
             tracing::info!(
                 target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
+                request_id = %log_request_id,
                 model = %model,
                 endpoint = "chat_completions",
                 streaming = false,
