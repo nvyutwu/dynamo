@@ -160,33 +160,44 @@ mod tests {
                     .unwrap();
                 time::sleep(Duration::from_millis(100)).await;
 
-                // Emit audit record
+                // Emit a request + response pair as two separate records.
                 let request = create_test_request("nemotron", true);
-                let mut handle = handle::create_handle(&request, "test-req-1")
+                let handle = handle::create_handle(&request, "test-req-1")
                     .expect("Failed to create audit handle");
-                handle.set_request(Arc::new(request.clone()));
-                handle.set_response(Arc::new(create_test_response("nemotron", "test response")));
-                handle.emit();
+                handle.emit_request(Arc::new(request.clone()));
+                handle.emit_response(Arc::new(create_test_response("nemotron", "test response")));
 
                 time::sleep(Duration::from_millis(200)).await;
 
-                // Verify message in NATS
+                // Verify both records in NATS.
                 let messages = consume_messages(
                     &client,
                     &stream_name,
                     "test-consumer",
-                    1,
+                    2,
                     Duration::from_secs(2),
                 )
                 .await;
 
-                assert_eq!(messages.len(), 1, "Should receive exactly one audit record");
-                let record = &messages[0];
-                assert_eq!(record["schema_version"], 1);
-                assert_eq!(record["request_id"], "test-req-1");
-                assert_eq!(record["model"], "nemotron");
-                assert!(record["request"].is_object());
-                assert!(record["response"].is_object());
+                assert_eq!(messages.len(), 2, "Should receive request + response records");
+                let req_record = messages
+                    .iter()
+                    .find(|m| m["event_type"] == "request")
+                    .expect("request record missing");
+                let resp_record = messages
+                    .iter()
+                    .find(|m| m["event_type"] == "response")
+                    .expect("response record missing");
+
+                assert_eq!(req_record["schema_version"], 1);
+                assert_eq!(req_record["request_id"], "test-req-1");
+                assert_eq!(req_record["model"], "nemotron");
+                assert!(req_record["request"].is_object());
+                assert!(req_record.get("response").is_none());
+
+                assert_eq!(resp_record["request_id"], "test-req-1");
+                assert!(resp_record["response"].is_object());
+                assert!(resp_record.get("request").is_none());
 
                 client.jetstream().delete_stream(&stream_name).await.ok();
             },
@@ -219,9 +230,8 @@ mod tests {
 
                 // Request with store=true (should be audited)
                 let request_true = create_test_request("nemotron", true);
-                if let Some(mut handle) = handle::create_handle(&request_true, "store-true") {
-                    handle.set_request(Arc::new(request_true.clone()));
-                    handle.emit();
+                if let Some(handle) = handle::create_handle(&request_true, "store-true") {
+                    handle.emit_request(Arc::new(request_true.clone()));
                 }
 
                 // Request with store=false (should NOT be audited)
@@ -241,8 +251,13 @@ mod tests {
                     Duration::from_secs(2),
                 )
                 .await;
-                assert_eq!(messages.len(), 1, "Should only audit when store=true");
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "Should only emit the request record for the store=true case"
+                );
                 assert_eq!(messages[0]["request_id"], "store-true");
+                assert_eq!(messages[0]["event_type"], "request");
 
                 client.jetstream().delete_stream(&stream_name).await.ok();
             },

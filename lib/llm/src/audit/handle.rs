@@ -9,9 +9,24 @@ use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
 
+/// Distinguishes the two record types emitted per chat completion.
+///
+/// Request and response are published as separate `AuditRecord`s sharing the same
+/// `request_id`. Downstream consumers correlate by `request_id`; the request record
+/// is emitted before the worker dispatches, the response record is emitted after the
+/// response stream completes successfully. On client cancel mid-stream (or
+/// aggregation failure) only the request record is emitted.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditEventType {
+    Request,
+    Response,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AuditRecord {
     pub schema_version: u32,
+    pub event_type: AuditEventType,
     pub request_id: String,
     pub requested_streaming: bool,
     pub model: String,
@@ -25,8 +40,6 @@ pub struct AuditHandle {
     requested_streaming: bool,
     request_id: String,
     model: String,
-    req_full: Option<Arc<NvCreateChatCompletionRequest>>,
-    resp_full: Option<Arc<NvCreateChatCompletionResponse>>,
 }
 
 impl AuditHandle {
@@ -34,22 +47,38 @@ impl AuditHandle {
         self.requested_streaming
     }
 
-    pub fn set_request(&mut self, req: Arc<NvCreateChatCompletionRequest>) {
-        self.req_full = Some(req);
-    }
-    pub fn set_response(&mut self, resp: Arc<NvCreateChatCompletionResponse>) {
-        self.resp_full = Some(resp);
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 
-    /// Emit exactly once (publishes to the bus; sinks do I/O).
-    pub fn emit(self) {
+    /// Publish a `Request` event record on the audit bus. Call once, as soon as the
+    /// request is captured and before worker dispatch — this lets downstream
+    /// observers see hung / canceled requests that never produce a response record.
+    pub fn emit_request(&self, request: Arc<NvCreateChatCompletionRequest>) {
         let rec = AuditRecord {
             schema_version: 1,
+            event_type: AuditEventType::Request,
+            request_id: self.request_id.clone(),
+            requested_streaming: self.requested_streaming,
+            model: self.model.clone(),
+            request: Some(request),
+            response: None,
+        };
+        bus::publish(rec);
+    }
+
+    /// Publish a `Response` event record on the audit bus. Consumes the handle to
+    /// enforce one-response-per-request at the type level. The response record does
+    /// not duplicate the request payload — downstream JOINs on `request_id`.
+    pub fn emit_response(self, response: Arc<NvCreateChatCompletionResponse>) {
+        let rec = AuditRecord {
+            schema_version: 1,
+            event_type: AuditEventType::Response,
             request_id: self.request_id,
             requested_streaming: self.requested_streaming,
             model: self.model,
-            request: self.req_full,
-            response: self.resp_full,
+            request: None,
+            response: Some(response),
         };
         bus::publish(rec);
     }
@@ -71,8 +100,6 @@ pub fn create_handle(req: &NvCreateChatCompletionRequest, request_id: &str) -> O
         requested_streaming,
         request_id: request_id.to_string(),
         model,
-        req_full: None,
-        resp_full: None,
     })
 }
 
@@ -149,29 +176,97 @@ mod tests {
     }
 
     #[test]
-    fn audit_record_serializes_agent_context_and_response_content() {
+    fn request_record_carries_request_only() {
         let record = AuditRecord {
             schema_version: 1,
+            event_type: AuditEventType::Request,
             request_id: "req-123".to_string(),
             requested_streaming: true,
             model: "test-model".to_string(),
             request: Some(Arc::new(create_test_request_with_agent_context())),
-            response: Some(Arc::new(create_test_response("final answer"))),
+            response: None,
         };
 
-        let value = serde_json::to_value(record).unwrap();
-
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event_type"], "request");
+        assert_eq!(value["request_id"], "req-123");
         assert_eq!(
             value["request"]["nvext"]["agent_context"]["session_id"],
             "run-123"
         );
-        assert_eq!(
-            value["request"]["nvext"]["agent_context"]["trajectory_id"],
-            "run-123:researcher"
-        );
+        // Response side must be absent (skip_serializing_if).
+        assert!(value.get("response").is_none());
+    }
+
+    #[test]
+    fn response_record_carries_response_only() {
+        let record = AuditRecord {
+            schema_version: 1,
+            event_type: AuditEventType::Response,
+            request_id: "req-123".to_string(),
+            requested_streaming: true,
+            model: "test-model".to_string(),
+            request: None,
+            response: Some(Arc::new(create_test_response("final answer"))),
+        };
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event_type"], "response");
+        assert_eq!(value["request_id"], "req-123");
         assert_eq!(
             value["response"]["choices"][0]["message"]["content"],
             "final answer"
         );
+        // Request side must be absent (skip_serializing_if). Downstream JOINs on request_id.
+        assert!(value.get("request").is_none());
+    }
+
+    /// Test-only constructor. `create_handle` gates on env vars + a cached
+    /// `OnceLock` policy, which is too brittle for a focused bus-roundtrip test.
+    impl AuditHandle {
+        pub(crate) fn for_test(request_id: &str, model: &str, streaming: bool) -> Self {
+            Self {
+                requested_streaming: streaming,
+                request_id: request_id.to_string(),
+                model: model.to_string(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn emit_request_and_response_publish_two_records_in_order() {
+        // Exercises the end-to-end contract: emit_request + emit_response each
+        // publish exactly one record to the audit bus, in that order, with the
+        // expected `event_type` discriminant and request/response payload
+        // exclusivity (request record has no response, and vice versa).
+        bus::init(8);
+        let mut rx = bus::subscribe();
+
+        let request = create_test_request("test-model", true);
+        let response = create_test_response("hello");
+
+        let handle = AuditHandle::for_test("req-test-emit", "test-model", true);
+        handle.emit_request(Arc::new(request));
+        handle.emit_response(Arc::new(response));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first record arrives before timeout")
+            .expect("first record receives ok");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("second record arrives before timeout")
+            .expect("second record receives ok");
+
+        assert_eq!(first.event_type, AuditEventType::Request);
+        assert_eq!(first.request_id, "req-test-emit");
+        assert!(first.request.is_some());
+        assert!(first.response.is_none());
+
+        assert_eq!(second.event_type, AuditEventType::Response);
+        assert_eq!(second.request_id, "req-test-emit");
+        assert!(second.request.is_none());
+        assert!(second.response.is_some());
     }
 }

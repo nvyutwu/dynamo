@@ -21,7 +21,7 @@ use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use serde_json::json;
 
 use super::config::AuditPolicy;
-use super::handle::AuditRecord;
+use super::handle::{AuditEventType, AuditRecord};
 use super::sink::AuditSink;
 
 const DEFAULT_OTLP_HTTP_LOGS_ENDPOINT: &str = "http://localhost:4318/v1/logs";
@@ -136,11 +136,6 @@ impl OtelSink {
         rec: &AuditRecord,
         max_payload_bytes: usize,
     ) -> Option<(String, bool, Option<String>)> {
-        if is_aggregation_fallback(rec) {
-            let reason = "aggregation_failed_or_empty_response".to_string();
-            return marker_payload(rec, reason);
-        }
-
         let payload = match serde_json::to_string(rec) {
             Ok(s) => s,
             Err(err) => {
@@ -163,14 +158,11 @@ impl OtelSink {
     }
 }
 
-fn is_aggregation_fallback(rec: &AuditRecord) -> bool {
-    rec.response.as_ref().is_some_and(|resp| {
-        resp.inner.id.is_empty()
-            && resp.inner.created == 0
-            && resp.inner.choices.is_empty()
-            && resp.inner.usage.is_none()
-            && resp.inner.model.is_empty()
-    })
+fn event_type_attr(event_type: AuditEventType) -> &'static str {
+    match event_type {
+        AuditEventType::Request => "request",
+        AuditEventType::Response => "response",
+    }
 }
 
 fn marker_payload(rec: &AuditRecord, reason: String) -> Option<(String, bool, Option<String>)> {
@@ -183,6 +175,7 @@ fn marker_payload(rec: &AuditRecord, reason: String) -> Option<(String, bool, Op
 
     let payload = json!({
         "schema_version": rec.schema_version,
+        "event_type": event_type_attr(rec.event_type),
         "request_id": &rec.request_id,
         "requested_streaming": rec.requested_streaming,
         "model": &rec.model,
@@ -218,6 +211,10 @@ impl AuditSink for OtelSink {
         record.set_body(AnyValue::String(AUDIT_LOG_BODY.into()));
         record.add_attribute("request_id", AnyValue::String(rec.request_id.clone().into()));
         record.add_attribute(
+            "event_type",
+            AnyValue::String(event_type_attr(rec.event_type).into()),
+        );
+        record.add_attribute(
             "endpoint",
             AnyValue::String(AUDIT_ENDPOINT_CHAT_COMPLETION.into()),
         );
@@ -240,6 +237,7 @@ mod tests {
     fn sample_record() -> AuditRecord {
         AuditRecord {
             schema_version: 1,
+            event_type: AuditEventType::Request,
             request_id: "req-otel-1".to_string(),
             requested_streaming: true,
             model: "test-model".to_string(),
