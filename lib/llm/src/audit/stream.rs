@@ -88,7 +88,6 @@ where
         Box::pin(async move {
             rx.await.unwrap_or_else(|_| {
                 tracing::warn!("audit: aggregation future canceled/failed");
-                // Return minimal response if aggregation failed
                 NvCreateChatCompletionResponse {
                     inner: dynamo_protocols::types::CreateChatCompletionResponse {
                         id: String::new(),
