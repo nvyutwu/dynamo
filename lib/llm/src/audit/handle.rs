@@ -57,7 +57,7 @@ impl AuditHandle {
 
 pub fn create_handle(req: &NvCreateChatCompletionRequest, request_id: &str) -> Option<AuditHandle> {
     let policy = config::policy();
-    if !policy.enabled {
+    if !config::capture_enabled() {
         return None;
     }
     // If force_logging is enabled, ignore the store flag
