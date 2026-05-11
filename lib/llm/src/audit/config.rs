@@ -103,6 +103,13 @@ pub(crate) fn mark_capture_inactive() {
 }
 
 pub fn capture_enabled() -> bool {
+    // Require the explicit ACTIVE transition so that publishes happening before
+    // `init_from_env_with_shutdown` finishes — i.e. while the bus is still
+    // uninitialized — are skipped at the `create_handle` gate rather than
+    // silently dropped at `bus::publish`. Pre-init `create_handle` calls used
+    // to succeed and then lose their record on publish; with the request-side
+    // emit now firing synchronously at preprocessor entry, that race window is
+    // worth closing.
     let policy = policy();
-    policy.enabled && CAPTURE_STATE.load(Ordering::Acquire) != CAPTURE_INACTIVE
+    policy.enabled && CAPTURE_STATE.load(Ordering::Acquire) == CAPTURE_ACTIVE
 }

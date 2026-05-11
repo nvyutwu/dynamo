@@ -163,7 +163,11 @@ mod tests {
                 ("DYN_AUDIT_FORCE_LOGGING", Some("true")),
             ],
             || {
-                // Create request with store=false
+                // `capture_enabled()` now requires `CAPTURE_ACTIVE`; mimic the
+                // audit init lifecycle (`init_from_env_with_shutdown`) instead of
+                // relying on the old "uninitialized counts as enabled" semantics.
+                crate::audit::config::mark_capture_active();
+
                 let request = create_test_request("test-model", false);
                 let handle = create_handle(&request, "test-id");
 
