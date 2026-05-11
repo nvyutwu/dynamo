@@ -1464,11 +1464,13 @@ impl
         let request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
-        // Build audit handle (None if no DYN_AUDIT_SINKS)
-        let mut audit_handle = crate::audit::handle::create_handle(&request, &request_id);
+        // Build audit handle (None if no DYN_AUDIT_SINKS). Publish the request
+        // record immediately, before worker dispatch — this lets downstream
+        // observers see hung or canceled requests that never produce a response.
+        let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
 
-        if let Some(ref mut h) = audit_handle {
-            h.set_request(std::sync::Arc::new(request.clone()));
+        if let Some(ref h) = audit_handle {
+            h.emit_request(std::sync::Arc::new(request.clone()));
         }
 
         // For non-streaming requests (stream=false), enable usage by default
@@ -1557,7 +1559,7 @@ impl
         // Apply audit aggregation strategy.
         // The audit branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
         // while the non-audit branch boxes the impl Stream from postprocessor_parsing_stream.
-        let final_stream = if let Some(mut audit) = audit_handle {
+        let final_stream = if let Some(audit) = audit_handle {
             let (stream, agg_fut) = if audit.streaming() {
                 // Streaming: apply scan (pass-through + parallel aggregation)
                 crate::audit::stream::scan_aggregate_with_future(transformed_stream)
@@ -1566,11 +1568,18 @@ impl
                 crate::audit::stream::fold_aggregate_with_future(transformed_stream)
             };
 
-            // Spawn audit task
+            // Spawn the response-side audit task. The future resolves to None on
+            // client cancel or aggregation failure; in that case the request
+            // record (already published above) stands alone and we skip the
+            // response emit.
             tokio::spawn(async move {
-                let final_resp = agg_fut.await;
-                audit.set_response(Arc::new(final_resp));
-                audit.emit();
+                match agg_fut.await {
+                    Some(final_resp) => audit.emit_response(Arc::new(final_resp)),
+                    None => tracing::debug!(
+                        request_id = %audit.request_id(),
+                        "audit: response record skipped (client cancel or aggregation error)"
+                    ),
+                }
             });
 
             stream

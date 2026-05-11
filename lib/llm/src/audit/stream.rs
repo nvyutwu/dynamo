@@ -17,8 +17,13 @@ use futures::StreamExt;
 
 type AuditStream =
     Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>;
+
+/// Resolves to `Some(final_response)` when aggregation succeeds, or `None` when the
+/// client cancels mid-stream / the aggregator fails. Callers use `None` as the
+/// signal to skip the response audit emit (the request record was already
+/// published).
 type AuditFuture =
-    Pin<Box<dyn std::future::Future<Output = NvCreateChatCompletionResponse> + Send>>;
+    Pin<Box<dyn std::future::Future<Output = Option<NvCreateChatCompletionResponse>> + Send>>;
 
 /// Forwards transformed chunks unchanged; collects them for aggregation.
 pub struct PassThroughWithAgg<S> {
@@ -86,22 +91,19 @@ where
     (
         Box::pin(passthrough),
         Box::pin(async move {
-            rx.await.unwrap_or_else(|_| {
-                tracing::warn!("audit: aggregation future canceled/failed");
-                NvCreateChatCompletionResponse {
-                    inner: dynamo_protocols::types::CreateChatCompletionResponse {
-                        id: String::new(),
-                        created: 0,
-                        usage: None,
-                        model: String::new(),
-                        object: "chat.completion".to_string(),
-                        system_fingerprint: None,
-                        choices: vec![],
-                        service_tier: None,
-                    },
-                    nvext: None,
+            match rx.await {
+                Ok(resp) => Some(resp),
+                Err(_) => {
+                    // tx dropped without sending: either the SSE consumer dropped the
+                    // passthrough stream before end-of-stream (client cancel) or the
+                    // spawned `DeltaAggregator::apply` errored. Either way, no
+                    // response record is published; the request record stands alone.
+                    tracing::debug!(
+                        "audit: response aggregation produced no record (client cancel or aggregation error)"
+                    );
+                    None
                 }
-            })
+            }
         }),
     )
 }
@@ -125,6 +127,11 @@ where
             }
             Err(e) => {
                 tracing::warn!("fold aggregation failed: {e}");
+                // Drop tx without sending so the audit future resolves to None.
+                // The client still receives a (best-effort) empty fallback chunk so
+                // the HTTP response shape stays valid; audit just skips the
+                // response record rather than logging an empty placeholder.
+                drop(tx);
                 let fallback = NvCreateChatCompletionResponse {
                     inner: dynamo_protocols::types::CreateChatCompletionResponse {
                         id: String::new(),
@@ -138,29 +145,21 @@ where
                     },
                     nvext: None,
                 };
-                let _ = tx.send(fallback.clone());
                 final_response_to_one_chunk_stream(fallback)
             }
         }
     };
 
     let future = Box::pin(async move {
-        rx.await.unwrap_or_else(|_| {
-            tracing::warn!("fold aggregation future canceled");
-            NvCreateChatCompletionResponse {
-                inner: dynamo_protocols::types::CreateChatCompletionResponse {
-                    id: String::new(),
-                    created: 0,
-                    usage: None,
-                    model: String::new(),
-                    object: "chat.completion".to_string(),
-                    system_fingerprint: None,
-                    choices: vec![],
-                    service_tier: None,
-                },
-                nvext: None,
+        match rx.await {
+            Ok(resp) => Some(resp),
+            Err(_) => {
+                tracing::debug!(
+                    "audit: fold response aggregation produced no record (client cancel or aggregation error)"
+                );
+                None
             }
-        })
+        }
     });
 
     (
@@ -380,7 +379,7 @@ mod tests {
         let input_stream = stream::iter(chunks.clone());
         let (passthrough, future) = scan_aggregate_with_future(input_stream);
         let results: Vec<_> = passthrough.collect().await;
-        let final_resp = future.await;
+        let final_resp = future.await.expect("aggregation should produce a record");
 
         // Verify chunk count
         assert_eq!(results.len(), 3, "Should pass through all chunks unchanged");
@@ -404,7 +403,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_stream_handling() {
-        // Empty stream should not panic and should provide fallback response
+        // Empty stream is treated the same as a client-cancel mid-stream: the
+        // aggregator has nothing to apply, tx drops without sending, and the
+        // future resolves to None. The caller (preprocessor) is expected to skip
+        // emitting a response audit record in this case — the request record
+        // (published before stream wiring) stands alone.
         let chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = vec![];
 
         let input_stream = stream::iter(chunks);
@@ -412,12 +415,11 @@ mod tests {
         let results: Vec<_> = passthrough.collect().await;
         let final_resp = future.await;
 
-        // Verify empty passthrough
         assert_eq!(results.len(), 0, "Empty stream should produce no chunks");
-
-        // Verify fallback response (aggregation will fail on empty stream)
-        assert_eq!(final_resp.inner.object, "chat.completion");
-        // Should get fallback response, not panic
+        assert!(
+            final_resp.is_none(),
+            "Empty stream should resolve audit future to None, not a fallback record"
+        );
     }
 
     #[tokio::test]
@@ -428,7 +430,7 @@ mod tests {
         let input_stream = stream::iter(chunks);
         let (passthrough, future) = scan_aggregate_with_future(input_stream);
         let results: Vec<_> = passthrough.collect().await;
-        let final_resp = future.await;
+        let final_resp = future.await.expect("aggregation should produce a record");
 
         // Verify passthrough
         assert_eq!(results.len(), 1);
@@ -492,18 +494,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_futures() {
-        // Test that multiple concurrent audit streams don't interfere
+        // Test that multiple concurrent audit streams don't interfere. The
+        // passthrough streams are dropped immediately (the `_` destructure), which
+        // models a client cancel before the first poll — each future should
+        // independently resolve to None without crosstalk.
         let chunks1 = vec![create_mock_chunk("Stream 1".to_string(), 0)];
         let chunks2 = vec![create_mock_chunk("Stream 2".to_string(), 0)];
 
         let (_, future1) = scan_aggregate_with_future(stream::iter(chunks1));
         let (_, future2) = scan_aggregate_with_future(stream::iter(chunks2));
 
-        // Run both futures concurrently
         let (resp1, resp2) = tokio::join!(future1, future2);
 
-        // Both should complete successfully
-        assert_eq!(resp1.inner.object, "chat.completion");
-        assert_eq!(resp2.inner.object, "chat.completion");
+        assert!(resp1.is_none());
+        assert!(resp2.is_none());
     }
 }
