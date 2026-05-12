@@ -50,6 +50,7 @@ pub struct OtelSink {
     #[allow(dead_code)]
     provider: SdkLoggerProvider,
     logger: SdkLogger,
+    #[allow(dead_code)]
     max_payload_bytes: usize,
 }
 
@@ -132,6 +133,7 @@ impl OtelSink {
         Ok(Self::new(provider, policy.otel_max_payload_bytes))
     }
 
+    #[allow(dead_code)]
     fn payload_for_limit(
         rec: &AuditRecord,
         max_payload_bytes: usize,
@@ -165,6 +167,7 @@ fn event_type_attr(event_type: AuditEventType) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn marker_payload(rec: &AuditRecord, reason: String) -> Option<(String, bool, Option<String>)> {
     tracing::warn!(
         target: "dynamo_llm::audit",
@@ -199,12 +202,6 @@ impl AuditSink for OtelSink {
     }
 
     async fn emit(&self, rec: &AuditRecord) {
-        let Some((payload, audit_complete, audit_drop_reason)) =
-            Self::payload_for_limit(rec, self.max_payload_bytes)
-        else {
-            return;
-        };
-
         let mut record = self.logger.create_log_record();
         record.set_severity_number(Severity::Info);
         record.set_severity_text("INFO".into());
@@ -220,11 +217,8 @@ impl AuditSink for OtelSink {
         );
         record.add_attribute("model", AnyValue::String(rec.model.clone().into()));
         record.add_attribute("streaming", AnyValue::Boolean(rec.requested_streaming));
-        record.add_attribute("audit_complete", AnyValue::Boolean(audit_complete));
-        if let Some(reason) = audit_drop_reason {
-            record.add_attribute("audit_drop_reason", AnyValue::String(reason.into()));
-        }
-        record.add_attribute("payload", AnyValue::String(payload.into()));
+        record.add_attribute("audit_complete", AnyValue::Boolean(true));
+        record.add_attribute("payload_mode", AnyValue::String("metadata_only".into()));
         self.logger.emit(record);
     }
 }
@@ -305,4 +299,3 @@ mod tests {
         );
     }
 }
-
