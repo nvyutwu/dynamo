@@ -1469,8 +1469,20 @@ impl
         // observers see hung or canceled requests that never produce a response.
         let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
 
-        if let Some(ref h) = audit_handle {
-            h.emit_request(std::sync::Arc::new(request.clone()));
+        // v8.1 defer-emit (Option B): keep Arc::new(request.clone()) on the
+        // HTTP path so we still pay the clone CPU on-request, but move the
+        // bus::publish + per-subscriber tokio wakeup off-path into a detached
+        // task. This is the diagnostic split for Test 2 — comparing against
+        // Test 1b (clone + bus + sink all on-path) attributes the residual
+        // TTFT cost to bus-publish + scheduler wakeup vs the clone itself.
+        // Do NOT move the Arc::new(request.clone()) inside the spawn — that
+        // would conflate clone CPU with bus/scheduler cost and defeat the
+        // attribution.
+        if let Some(h) = audit_handle.clone() {
+            let audit_request = std::sync::Arc::new(request.clone());
+            tokio::spawn(async move {
+                h.emit_request(audit_request);
+            });
         }
 
         // For non-streaming requests (stream=false), enable usage by default
