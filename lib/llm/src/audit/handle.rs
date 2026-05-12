@@ -36,6 +36,7 @@ pub struct AuditRecord {
     pub response: Option<Arc<NvCreateChatCompletionResponse>>,
 }
 
+#[derive(Clone)]
 pub struct AuditHandle {
     requested_streaming: bool,
     request_id: String,
