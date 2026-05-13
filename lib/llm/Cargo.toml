@@ -84,6 +84,7 @@ parking_lot = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sonic-rs = "0.5"
 sha2 = "0.10"
 strum = { workspace = true }
 tempfile = { workspace = true }
