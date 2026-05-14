@@ -44,6 +44,22 @@ impl AuditSink for StderrSink {
     }
 }
 
+/// Diagnostic-only sink: registers with the bus and wakes on every record but
+/// performs no serialization, formatting, or export work. Used by the v8.3
+/// NullSink discriminator experiment to isolate the cost of
+/// `Arc::new(request.clone())` + bus publish + per-subscriber wakeup from any
+/// serde / IO done by real sinks. Lossy by design — DO NOT enable in prod.
+pub struct NullSink;
+#[async_trait]
+impl AuditSink for NullSink {
+    fn name(&self) -> &'static str {
+        "null"
+    }
+    async fn emit(&self, _rec: &AuditRecord) {
+        // intentionally empty
+    }
+}
+
 pub struct NatsSink {
     js: jetstream::Context,
     subject: String,
@@ -174,6 +190,7 @@ async fn parse_sinks_from_env() -> anyhow::Result<Vec<Arc<dyn AuditSink>>> {
     for name in &policy.sinks {
         match name.as_str() {
             "stderr" => out.push(Arc::new(StderrSink)),
+            "null" => out.push(Arc::new(NullSink)),
             "nats" => {
                 let nats_client = nats::ClientOptions::default()
                     .connect()
