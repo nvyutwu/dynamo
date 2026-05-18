@@ -150,6 +150,19 @@ class TestReasoningParserMetadata:
         assert reasoning_ended is True
         assert parser_kwargs == {"chat_template_kwargs": {"reasoning_effort": "low"}}
 
+    def test_streaming_postprocessor_include_reasoning_false_hides_delta(self):
+        from dynamo.frontend.prepost import StreamingPostProcessor
+
+        post = object.__new__(StreamingPostProcessor)
+        post.include_reasoning = False
+
+        assert post._compose_delta_message("hidden reasoning", None) is None
+
+        delta = post._compose_delta_message("hidden reasoning", "visible answer")
+        assert delta is not None
+        assert delta.reasoning is None
+        assert delta.content == "visible answer"
+
     def test_parser_receives_chat_template_kwargs(self):
         from dynamo.frontend.vllm_processor import _build_reasoning_parser_metadata
 

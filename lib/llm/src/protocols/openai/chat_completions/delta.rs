@@ -495,6 +495,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         }
     }
@@ -588,6 +589,7 @@ mod tests {
             ),
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         }
     }

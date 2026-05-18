@@ -59,6 +59,12 @@ pub struct NvCreateChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_io_kwargs: Option<MediaDecoder>,
 
+    /// Whether parsed model reasoning should be included in the API response.
+    /// Defaults to true. When false, reasoning is still parsed and stripped
+    /// from normal content, but `reasoning_content` is not emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_reasoning: Option<bool>,
+
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,
@@ -82,6 +88,12 @@ pub struct NvCreateChatCompletionStreamResponse {
     pub inner: dynamo_protocols::types::CreateChatCompletionStreamResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<serde_json::Value>,
+}
+
+impl NvCreateChatCompletionRequest {
+    pub fn include_reasoning(&self) -> bool {
+        self.include_reasoning.unwrap_or(true)
+    }
 }
 
 /// Implements `NvExtProvider` for `NvCreateChatCompletionRequest`,

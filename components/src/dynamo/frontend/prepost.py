@@ -230,6 +230,9 @@ class StreamingPostProcessor:
         self.request_for_sampling = request_for_sampling
         self.sampling_params = sampling_params
         self.tool_parser = tool_parser
+        self.include_reasoning = (
+            getattr(request_for_sampling, "include_reasoning", True) is not False
+        )
         # See https://github.com/ai-dynamo/dynamo/issues/8636 —
         # when the chat template runs with enable_thinking=False,
         # the reasoning open/close tags live in the prompt and the generated
@@ -311,10 +314,11 @@ class StreamingPostProcessor:
             and self.request_for_sampling.tool_choice != "none"
         )
 
-    @staticmethod
     def _compose_delta_message(
-        reasoning: str | None, content: str | None
+        self, reasoning: str | None, content: str | None
     ) -> DeltaMessage | None:
+        if not self.include_reasoning:
+            reasoning = None
         delta_message = DeltaMessage(reasoning=reasoning, content=content)
         if not delta_message.reasoning and not delta_message.content:
             return None
@@ -572,7 +576,7 @@ class StreamingPostProcessor:
                 content = None
             if content:
                 delta["content"] = content
-            if delta_message.reasoning:
+            if delta_message.reasoning and self.include_reasoning:
                 delta["reasoning_content"] = delta_message.reasoning
             if self.in_progress_tool_calls:
                 delta["tool_calls"] = self._dump_in_progress_tool_calls()

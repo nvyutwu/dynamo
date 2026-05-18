@@ -823,10 +823,11 @@ impl OpenAIPreprocessor {
         // To address the limitation if needed in future: move this step before transform_postprocessor_stream and add new field of reasoning_content to the backend output
         // Use backend_output.reasoning_content field to fill out the deltas.
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
-            Box::pin(Self::parse_reasoning_content_from_stream(
+            Box::pin(Self::parse_reasoning_content_from_stream_with_visibility(
                 stream,
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
                 prompt_injected_reasoning,
+                request.include_reasoning(),
             ))
         } else {
             Box::pin(stream)
@@ -1383,6 +1384,23 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
+        Self::parse_reasoning_content_from_stream_with_visibility(
+            stream,
+            parser_name,
+            prompt_injected_reasoning,
+            true,
+        )
+    }
+
+    pub fn parse_reasoning_content_from_stream_with_visibility<S>(
+        stream: S,
+        parser_name: String,
+        prompt_injected_reasoning: bool,
+        include_reasoning: bool,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
         // Initialize reasoning parser from parser_name
         let mut reasoning_parser = Box::new(ReasoningParserType::get_reasoning_parser_from_name(
             parser_name.as_ref(),
@@ -1416,7 +1434,11 @@ impl OpenAIPreprocessor {
                                 choice.delta.content = parser_result.get_some_normal_text().map(
                                     dynamo_protocols::types::ChatCompletionMessageContent::Text,
                                 );
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                choice.delta.reasoning_content = if include_reasoning {
+                                    parser_result.get_some_reasoning()
+                                } else {
+                                    None
+                                };
                             }
                             // For multimodal content, pass through unchanged
                         }

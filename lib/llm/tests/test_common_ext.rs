@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use dynamo_llm::engines::ValidateRequest;
 use dynamo_llm::protocols::{
     common::StopConditionsProvider,
     openai::{
@@ -43,6 +44,22 @@ fn test_chat_completions_include_stop_str_in_output_from_common() {
 }
 
 #[test]
+fn test_chat_completions_include_reasoning_accepted() {
+    let json_str = r#"{
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "include_reasoning": false
+    }"#;
+
+    let request: NvCreateChatCompletionRequest = serde_json::from_str(json_str).unwrap();
+
+    assert_eq!(request.include_reasoning, Some(false));
+    assert!(!request.include_reasoning());
+    assert!(request.unsupported_fields.is_empty());
+    assert!(request.validate().is_ok());
+}
+
+#[test]
 fn test_completions_include_stop_str_in_output_from_common() {
     let json_str = r#"{
         "model": "test-model",
@@ -69,6 +86,7 @@ fn test_sampling_parameters_include_stop_str_in_output_extraction() {
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        include_reasoning: None,
         unsupported_fields: Default::default(),
     };
 
@@ -299,6 +317,7 @@ fn test_serialization_preserves_structure() {
         }),
         chat_template_args: None,
         media_io_kwargs: None,
+        include_reasoning: None,
         unsupported_fields: Default::default(),
     };
 
@@ -351,6 +370,7 @@ fn test_sampling_parameters_extraction() {
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        include_reasoning: None,
         unsupported_fields: Default::default(),
     };
 
