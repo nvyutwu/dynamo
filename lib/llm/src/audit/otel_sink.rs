@@ -38,16 +38,12 @@ const ENV_OTEL_SERDE_THREADS: &str = "DYN_AUDIT_OTEL_SERDE_THREADS";
 const DEFAULT_OTLP_HTTP_LOGS_ENDPOINT: &str = "http://localhost:4318/v1/logs";
 const DEFAULT_OTLP_GRPC_ENDPOINT: &str = "http://localhost:4317";
 
-/// Static body string for every emitted record. Backends should filter by
-/// the `endpoint` attribute, not by body.
-const AUDIT_LOG_BODY: &str = "dynamo.audit";
-
 /// Logical endpoint label so phase 2 (completions / responses) can be
 /// distinguished without changing the body.
 const AUDIT_ENDPOINT_CHAT_COMPLETION: &str = "openai.chat_completion";
 
 /// Instrumentation scope name on the emitted `LogRecord`.
-const AUDIT_INSTRUMENTATION_SCOPE: &str = "dynamo.audit";
+const AUDIT_INSTRUMENTATION_SCOPE: &str = "dynamo.payload";
 
 /// Default service name when `OTEL_SERVICE_NAME` is unset.
 const DEFAULT_SERVICE_NAME: &str = "dynamo";
@@ -293,8 +289,14 @@ impl AuditSink for OtelSink {
         let mut record = self.logger.create_log_record();
         record.set_severity_number(Severity::Info);
         record.set_severity_text("INFO".into());
-        record.set_body(AnyValue::String(AUDIT_LOG_BODY.into()));
-        record.add_attribute("request_id", AnyValue::String(rec.request_id.clone().into()));
+        record.set_body(AnyValue::String(
+            match rec.event_type {
+                AuditEventType::Request => "openai.request",
+                AuditEventType::Response => "openai.response",
+            }
+            .into(),
+        ));
+        record.add_attribute("rid", AnyValue::String(rec.request_id.clone().into()));
         record.add_attribute(
             "event_type",
             AnyValue::String(event_type_attr(rec.event_type).into()),
