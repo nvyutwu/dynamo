@@ -194,6 +194,7 @@ fn create_chat_request(
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        include_reasoning: None,
         unsupported_fields: Default::default(),
     }
 }
@@ -528,6 +529,7 @@ fn create_nonstreaming_chat_request() -> NvCreateChatCompletionRequest {
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        include_reasoning: None,
         unsupported_fields: Default::default(),
     }
 }

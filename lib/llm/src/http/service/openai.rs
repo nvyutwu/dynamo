@@ -2913,6 +2913,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2945,6 +2946,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -3161,6 +3163,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
 
@@ -3191,6 +3194,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3220,6 +3224,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3249,6 +3254,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3280,6 +3286,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3309,6 +3316,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);

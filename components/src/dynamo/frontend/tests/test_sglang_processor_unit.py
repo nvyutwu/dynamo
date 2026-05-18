@@ -24,6 +24,7 @@ import dynamo.frontend.sglang_processor as sglang_processor_module
 from dynamo.frontend.sglang_prepost import (
     SglangPreprocessResult,
     SglangStreamingPostProcessor,
+    _client_includes_reasoning,
     _normalize_assistant_tool_call_arguments,
     _normalize_prompt_token_ids,
     _parse_json_array_buffer,
@@ -1653,6 +1654,35 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
         assert "think about this" in reasoning
         assert "42" in content
 
+    def test_include_reasoning_false_hides_reasoning(self, tokenizer):
+        """Reasoning is parsed out of content but not emitted."""
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        rp = ReasoningParser(model_type="qwen3", stream_reasoning=True)
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer,
+            tool_call_parser=None,
+            reasoning_parser=rp,
+            include_reasoning=False,
+        )
+        text = "<think>\nHidden reasoning.\n</think>\n\nThe answer is 42."
+        token_ids = tokenizer.encode(text)
+
+        content = ""
+        for i in range(0, len(token_ids), 5):
+            batch = token_ids[i : i + 5]
+            is_last = i + 5 >= len(token_ids)
+            choice = post.process_output(
+                {"token_ids": batch, "finish_reason": "stop" if is_last else None}
+            )
+            if choice:
+                delta = choice.get("delta", {})
+                assert "reasoning_content" not in delta
+                content += delta.get("content", "")
+
+        assert "Hidden reasoning" not in content
+        assert "42" in content
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -1667,6 +1697,11 @@ class TestUtilities:  # (mixed — see per-test annotations)
         uid = random_uuid()
         assert len(uid) == 16
         int(uid, 16)  # Should not raise
+
+    def test_client_includes_reasoning(self):
+        assert _client_includes_reasoning({}) is True
+        assert _client_includes_reasoning({"include_reasoning": False}) is False
+        assert _client_includes_reasoning({"include_reasoning": "false"}) is False
 
     def test_random_uuid_unique(self):  # FRONTEND.4
         """Two calls produce different UUIDs."""
