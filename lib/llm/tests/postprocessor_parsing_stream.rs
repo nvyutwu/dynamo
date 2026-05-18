@@ -456,6 +456,54 @@ fn mock_final_chunk() -> NvCreateChatCompletionStreamResponse {
     }
 }
 
+#[tokio::test]
+async fn postprocessor_parsing_stream_include_reasoning_false_hides_reasoning() {
+    let preprocessor = build_preprocessor(Some("qwen"), None);
+    let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "model": "Qwen/Qwen3-0.6B",
+        "stream": true,
+        "include_reasoning": false
+    }))
+    .unwrap();
+
+    let input_chunks = vec![
+        mock_content_chunk("<think>secret reasoning"),
+        mock_content_chunk("</think>Visible answer."),
+        mock_final_chunk(),
+    ];
+
+    let input_stream = stream::iter(input_chunks.into_iter().map(Annotated::from_data));
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, false, false)
+        .expect("postprocessor_parsing_stream should build");
+
+    let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
+        output_stream.collect().await;
+
+    let mut content = String::new();
+    for output in &output_chunks {
+        let Some(data) = output.data.as_ref() else {
+            continue;
+        };
+        for choice in &data.inner.choices {
+            assert!(
+                choice.delta.reasoning_content.is_none(),
+                "reasoning_content should be hidden when include_reasoning=false"
+            );
+            if let Some(c) = &choice.delta.content {
+                content.push_str(get_text(c));
+            }
+        }
+    }
+
+    assert_eq!(content, "Visible answer.");
+    assert!(
+        !content.contains("secret reasoning") && !content.contains("<think>"),
+        "reasoning leaked into content: {content:?}"
+    );
+}
+
 /// Regression for DeepSeek V4 tool-continuation turns.
 ///
 /// The V4 formatter seeds `<think>` into the prompt after a merged tool result,

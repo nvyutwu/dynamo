@@ -551,6 +551,7 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            include_reasoning: None,
             unsupported_fields: Default::default(),
         };
 

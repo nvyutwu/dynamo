@@ -121,6 +121,11 @@ pub struct NvCreateChatCompletionRequest {
     /// of decoded text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_tokens_as_token_ids: Option<bool>,
+    /// Whether parsed model reasoning should be included in the API response.
+    /// Defaults to true. When false, reasoning is still parsed and stripped
+    /// from normal content, but `reasoning_content` is not emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_reasoning: Option<bool>,
 
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
@@ -277,6 +282,12 @@ pub(super) fn stream_choice_chunk_from_template(
         event: None,
         comment: None,
         error: None,
+    }
+}
+
+impl NvCreateChatCompletionRequest {
+    pub fn include_reasoning(&self) -> bool {
+        self.include_reasoning.unwrap_or(true)
     }
 }
 

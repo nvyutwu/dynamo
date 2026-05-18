@@ -2236,6 +2236,7 @@ impl OpenAIPreprocessor {
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
                 prompt_injected_reasoning,
                 bypass_reasoning_for_bare_guided_json,
+                request.include_reasoning(),
             ))
         } else if should_strip_disabled_reasoning_start {
             Box::pin(Self::strip_leading_reasoning_start_from_stream(
@@ -3097,6 +3098,7 @@ impl OpenAIPreprocessor {
             parser_name,
             prompt_injected_reasoning,
             false,
+            true,
         )
     }
 
@@ -3105,6 +3107,7 @@ impl OpenAIPreprocessor {
         parser_name: String,
         prompt_injected_reasoning: bool,
         bypass_bare_guided_json: bool,
+        include_reasoning: bool,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -3125,7 +3128,7 @@ impl OpenAIPreprocessor {
             guided_json_bypass_decision: None,
         };
 
-        stream::unfold(state, |mut state| async move {
+        stream::unfold(state, move |mut state| async move {
             if let Some(response) = state.stream.next().await {
                 let guided_json_bypass_decision = if state.bypass_bare_guided_json {
                     match state.guided_json_bypass_decision {
@@ -3175,7 +3178,11 @@ impl OpenAIPreprocessor {
                                 choice.delta.content = parser_result
                                     .get_some_normal_text()
                                     .map(ChatCompletionMessageContent::Text);
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                choice.delta.reasoning_content = if include_reasoning {
+                                    parser_result.get_some_reasoning()
+                                } else {
+                                    None
+                                };
                             }
                             // For multimodal content, pass through unchanged
                         }
