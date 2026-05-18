@@ -26,6 +26,7 @@ from dynamo.llm.exceptions import InvalidArgument, Unknown
 from .sglang_prepost import (
     SglangStreamingPostProcessor,
     ToolCallParserType,
+    _client_includes_reasoning,
     _client_wants_separate_reasoning,
     _get_history_tool_calls_count,
     convert_tools,
@@ -444,6 +445,7 @@ class SglangProcessor:
             sglang_tools=convert_tools(request.get("tools")),
             tool_call_parser_name=self.tool_call_parser_name,
             eos_token_ids=self.eos_token_ids,
+            include_reasoning=_client_includes_reasoning(request),
         )
 
         async for item in self._generate_and_stream(
@@ -501,6 +503,7 @@ class SglangProcessor:
             sglang_tools=convert_tools(request.get("tools")),
             tool_call_parser_name=self.tool_call_parser_name,
             eos_token_ids=self.eos_token_ids,
+            include_reasoning=_client_includes_reasoning(request),
         )
 
         async for item in self._generate_and_stream(

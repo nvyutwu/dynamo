@@ -182,6 +182,16 @@ def _client_wants_separate_reasoning(request: dict[str, Any]) -> bool:
     return bool(value)
 
 
+def _client_includes_reasoning(request: dict[str, Any]) -> bool:
+    """Honor the client's ``include_reasoning`` flag (default True)."""
+    value = request.get("include_reasoning", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
 def convert_tools(tools: list[dict[str, Any]] | None) -> list[SglangTool] | None:
     """Convert OpenAI tool dicts to SGLang Tool objects."""
     if not tools:
@@ -884,10 +894,12 @@ class SglangStreamingPostProcessor:
         sglang_tools: list[SglangTool] | None = None,
         tool_call_parser_name: str | None = None,
         eos_token_ids: list[int] | None = None,
+        include_reasoning: bool = True,
     ) -> None:
         self.tokenizer = tokenizer
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
+        self.include_reasoning = include_reasoning
         self.history_tool_calls_count = history_tool_calls_count
         self._sglang_tools = sglang_tools or []
         self._tool_call_parser_name = _normalize_sglang_parser_name(
@@ -1045,7 +1057,7 @@ class SglangStreamingPostProcessor:
         if content_text:
             delta["content"] = content_text
             has_content = True
-        if reasoning_text:
+        if reasoning_text and self.include_reasoning:
             delta["reasoning_content"] = reasoning_text
             has_content = True
 
