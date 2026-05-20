@@ -18,7 +18,7 @@ use crate::telemetry::jsonl_gz::{JsonlGzipSinkOptions, JsonlGzipWriter};
 use super::{
     bus,
     config::{self, AuditPolicy},
-    handle::{AuditEventType, AuditRecord},
+    handle::AuditRecord,
     otel_sink::OtelSink,
 };
 
@@ -267,6 +267,7 @@ mod tests {
     use crate::telemetry::jsonl_gz::segment_path;
 
     use super::*;
+    use crate::audit::handle::AuditEventType;
 
     fn sample_record() -> AuditRecord {
         AuditRecord {
