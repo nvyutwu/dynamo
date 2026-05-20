@@ -880,11 +880,11 @@ impl OpenAIPreprocessor {
     ) -> impl Stream<Item = Annotated<Resp>> + Send
     where
         S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
-        Resp: Send + Sync + 'static + std::fmt::Debug,
+        Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
         struct State<Resp>
         where
-            Resp: Send + Sync + 'static + std::fmt::Debug,
+            Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
             response_stream: Pin<Box<dyn Stream<Item = Annotated<BackendOutput>> + Send>>,
             response_generator: Box<dyn DeltaGeneratorExt<Resp>>,
@@ -893,6 +893,9 @@ impl OpenAIPreprocessor {
             cumulative_output_tokens: usize,
             finish_reason_sent: bool,
             usage_chunk_sent: bool,
+            /// Buffered plain usage chunk to send to the client after the audit
+            /// chunk (ANNOTATION_LLM_METRICS). Only Some when is_usage_enabled().
+            pending_client_usage: Option<Annotated<Resp>>,
             finished: bool,
             trace_tokens_enabled: bool,
         }
@@ -905,6 +908,7 @@ impl OpenAIPreprocessor {
             cumulative_output_tokens: 0,
             finish_reason_sent: false,
             usage_chunk_sent: false,
+            pending_client_usage: None,
             finished: false,
             trace_tokens_enabled,
         };
@@ -913,7 +917,21 @@ impl OpenAIPreprocessor {
 
         stream::unfold(state, |mut inner| {
             async move {
-                // If already finished, return None immediately
+                // Drain the buffered client-facing plain usage chunk first.
+                // This MUST come before the `finished` guard: the stream-end
+                // handler sets inner.finished = true before returning the audit
+                // chunk, so on the very next iteration the finished guard would
+                // terminate before we ever emit the client chunk.
+                if let Some(client_chunk) = inner.pending_client_usage.take() {
+                    inner.finished = true;
+                    // Respect cancellation even for the trailing usage chunk.
+                    if inner.cancelled {
+                        return None;
+                    }
+                    return Some((client_chunk, inner));
+                }
+
+                // If already finished (and no pending client chunk), stop.
                 if inner.finished {
                     return None;
                 }
@@ -1019,11 +1037,12 @@ impl OpenAIPreprocessor {
                     }
 
                     if let Ok(metrics_annotated) = llm_metrics.to_annotation::<()>() {
-                        // Only set event if not already set to avoid overriding existing events (like errors)
-                        if response.event.is_none() {
-                            response.event = metrics_annotated.event;
-                            response.comment = metrics_annotated.comment;
-                        }
+                        // Per-chunk: only attach comment (stripped by EventConverter; tracing only).
+                        // Do NOT set event here — "llm_metrics" event is reserved for the
+                        // final ANNOTATION_LLM_METRICS usage chunk so EventConverter can
+                        // suppress its data from the client stream. Setting event on every
+                        // content chunk would cause EventConverter to strip all content data.
+                        response.comment = metrics_annotated.comment;
                     }
 
                     // Mark if we've seen a finish_reason
@@ -1107,20 +1126,35 @@ impl OpenAIPreprocessor {
                             Annotated::<()>::from_data(())
                         });
 
-                        // Send the usage chunk if needed
-                        let data = if inner.response_generator.is_usage_enabled() {
-                            Some(usage_chunk)
+                        // ANNOTATION_LLM_METRICS chunk: carries usage for the audit
+                        // DeltaAggregator. EventConverter always strips its `data`
+                        // before forwarding to the client (audit-only path).
+                        let audit_data = if crate::audit::config::capture_enabled() {
+                            Some(usage_chunk.clone())
                         } else {
                             None
                         };
 
                         let annotated_usage = Annotated::<Resp> {
                             id: None,
-                            data,
+                            data: audit_data,
                             event: Some(ANNOTATION_LLM_METRICS.to_string()),
                             comment: annotation.comment,
                             error: None,
                         };
+
+                        // When the client requested include_usage, buffer a separate
+                        // plain SSE data chunk (no event). EventConverter emits this
+                        // to the client on the next iteration, after the audit chunk.
+                        if inner.response_generator.is_usage_enabled() {
+                            inner.pending_client_usage = Some(Annotated::<Resp> {
+                                id: None,
+                                data: Some(usage_chunk),
+                                event: None,
+                                comment: None,
+                                error: None,
+                            });
+                        }
 
                         tracing::trace!(
                             request_id = inner.context.id(),

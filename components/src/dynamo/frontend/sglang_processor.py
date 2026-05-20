@@ -554,7 +554,21 @@ class SglangProcessor:
                         }
                         if pending_usage:
                             dynamo_out["usage"] = pending_usage
+                            pending_usage = None
 
+                        yield dynamo_out
+                    elif pending_usage and finish_reason:
+                        # Final chunk had no decodable tokens (e.g. pure EOS)
+                        # but usage must still propagate to the Rust aggregator.
+                        dynamo_out = {
+                            "id": request_id,
+                            "choices": [],
+                            "created": created_ts,
+                            "model": request["model"],
+                            "object": "chat.completion.chunk",
+                            "usage": pending_usage,
+                        }
+                        pending_usage = None
                         yield dynamo_out
 
                     pending_token_ids = []
