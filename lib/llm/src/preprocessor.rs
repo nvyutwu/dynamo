@@ -1415,7 +1415,7 @@ impl OpenAIPreprocessor {
             reasoning_parser: Some(reasoning_parser),
         };
 
-        stream::unfold(state, |mut state| async move {
+        stream::unfold(state, move |mut state| async move {
             if let Some(response) = state.stream.next().await {
                 // Process the response through reasoning parser if available
                 let processed_response = if let Some(ref mut parser) = state.reasoning_parser {
