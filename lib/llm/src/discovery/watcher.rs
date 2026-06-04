@@ -604,7 +604,7 @@ impl ModelWatcher {
                     if alias != &model_name {
                         self.manager.remove_worker_set(alias, &ws_key);
                         self.manager.remove_model_if_empty(alias);
-                        self.manager.unregister_alias(alias);
+                        self.manager.unregister_alias_if_empty(alias, &model_name);
                     }
                 }
             }
@@ -681,7 +681,7 @@ impl ModelWatcher {
         for alias in &card.aliases {
             if alias != &model_name {
                 let _ = self.manager.remove_model(alias);
-                self.manager.unregister_alias(alias);
+                self.manager.unregister_alias_if_empty(alias, &model_name);
             }
         }
 
@@ -1379,9 +1379,12 @@ impl ModelWatcher {
         // alias-mapped would see correct routing but mis-labelled metrics
         // (and an OpenAI response.model echoing the alias instead of the
         // primary). Recording the mapping first closes that gap.
+        let mut registered_aliases = Vec::new();
         for alias in &card.aliases {
             if alias != card.name() {
-                self.manager.register_alias(alias, card.name());
+                if self.manager.register_alias(alias, card.name()) {
+                    registered_aliases.push(alias.clone());
+                }
             }
         }
 
@@ -1390,19 +1393,17 @@ impl ModelWatcher {
             .add_worker_set(card.name(), &ws_key, worker_set);
 
         // Register under aliases — share the same Arc<WorkerSet>
-        if !card.aliases.is_empty() {
+        if !registered_aliases.is_empty() {
             if let Some(model) = self.manager.get_model(card.name()) {
                 if let Some(ws_arc) = model.get_worker_set(&ws_key) {
-                    for alias in &card.aliases {
-                        if alias != card.name() {
-                            tracing::info!(
-                                model_name = card.name(),
-                                alias,
-                                "Registering model alias"
-                            );
-                            self.manager
-                                .add_worker_set_arc(alias, &ws_key, ws_arc.clone());
-                        }
+                    for alias in &registered_aliases {
+                        tracing::info!(
+                            model_name = card.name(),
+                            alias,
+                            "Registering model alias"
+                        );
+                        self.manager
+                            .add_worker_set_arc(alias, &ws_key, ws_arc.clone());
                     }
                 }
             }

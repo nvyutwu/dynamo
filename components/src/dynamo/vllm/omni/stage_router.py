@@ -214,6 +214,7 @@ async def init_omni_stage_router(
         # Aggregated with no peer dependencies.
         worker_type=WorkerType.Aggregated,
         needs=[],
+        model_aliases=config.served_model_aliases or None,
     )
     logger.info("OmniStageRouter registered at '%s'", generate_endpoint)
 

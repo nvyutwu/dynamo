@@ -469,11 +469,11 @@ async def parse_args(args: list[str]) -> Config:
 
     model_path = parsed_args.model_path
 
-    # Multi-model-name support — same semantics as the TRT-LLM backend
-    # (commit 8911a6eb0b). SGLang's --served-model-name is a single string
-    # in upstream, but a user can pack multiple names into it (whitespace-
-    # or comma-separated). The first becomes the primary served name, the
-    # rest become aliases plumbed to register_model() via dynamo_config.
+    # Multi-model-name support. SGLang's --served-model-name is a single
+    # string in upstream, but a user can pack multiple names into it
+    # (whitespace- or comma-separated). The first becomes the primary served
+    # name, the rest become aliases plumbed to register_model() via
+    # dynamo_config.
     #
     # Examples:
     #   --served-model-name "my-model alias1 alias2"

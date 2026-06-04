@@ -85,6 +85,7 @@ async def init_omni(
             # frontend, so they register as Aggregated.
             worker_type=WorkerType.Aggregated,
             needs=[],
+            model_aliases=config.served_model_aliases or None,
         )
 
         logger.info("Starting to serve Omni worker endpoint...")
@@ -122,7 +123,8 @@ async def worker():
     dump_config(config.dump_config_to, config)
 
     if not config.served_model_name:
-        config.served_model_name = config.engine_args.served_model_name = config.model
+        config.served_model_name = config.model
+        config.engine_args.served_model_name = [config.model]
 
     if not os.path.exists(config.model):
         await fetch_model(config.model)

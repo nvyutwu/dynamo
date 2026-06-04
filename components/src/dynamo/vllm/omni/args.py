@@ -7,7 +7,8 @@ import argparse
 import dataclasses
 import logging
 import os
-from typing import Optional
+import re
+from typing import Any, Optional
 
 import huggingface_hub
 from vllm.transformers_utils.repo_utils import get_model_path
@@ -339,6 +340,7 @@ class OmniConfig(DynamoRuntimeConfig):
 
     model: str
     served_model_name: Optional[str] = None
+    served_model_aliases: list[str] = []
     engine_args: OmniEngineArgs
 
     stage_configs_path: Optional[str] = None
@@ -472,11 +474,36 @@ def parse_omni_args() -> OmniConfig:
     engine_args = OmniEngineArgs.from_cli_args(vllm_args)
 
     if getattr(engine_args, "served_model_name", None) is not None:
-        served = engine_args.served_model_name
-        if len(served) > 1:
-            raise ValueError("We do not support multiple model names.")
-        config.served_model_name = served[0]
+        served_names = _split_served_model_names(engine_args.served_model_name)
+        if served_names:
+            primary, *aliases = served_names
+            config.served_model_name = primary
+            config.served_model_aliases = aliases
+            engine_args.served_model_name = served_names
+            if aliases:
+                logger.info(
+                    "Multi-name registration: primary=%r, aliases=%s",
+                    primary,
+                    aliases,
+                )
 
     config.engine_args = engine_args
     config.validate()
     return config
+
+
+def _split_served_model_names(served_model_name: Any) -> list[str]:
+    if served_model_name is None:
+        return []
+
+    if isinstance(served_model_name, str):
+        raw_names = [served_model_name]
+    else:
+        raw_names = [str(name) for name in served_model_name]
+
+    names: list[str] = []
+    for raw_name in raw_names:
+        names.extend(
+            name for name in re.split(r"[\s,]+", raw_name.strip()) if name
+        )
+    return names
