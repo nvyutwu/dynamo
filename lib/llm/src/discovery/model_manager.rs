@@ -155,7 +155,7 @@ impl ModelManager {
         model_name: &str,
         namespace: &str,
         worker_set: Arc<WorkerSet>,
-    ) {
+    ) -> bool {
         // Collision check: if `model_name` already exists as a primary (i.e.
         // not currently mapped to anything in alias_to_primary, AND already
         // has worker sets), refuse to clobber it.
@@ -169,12 +169,13 @@ impl ModelManager {
                     "Alias collides with a registered primary model — skipping. \
                      Choose a different alias or rename the conflicting model."
                 );
-                return;
+                return false;
             }
         }
 
         let model = self.get_or_create_model(model_name);
         model.add_worker_set(namespace.to_string(), worker_set);
+        true
     }
 
     /// Record that `alias` is an alternate name for `primary`. Used to normalize metrics labels.
@@ -183,7 +184,7 @@ impl ModelManager {
     /// *different* primary. First-write-wins semantics so operators can detect
     /// alias conflicts in logs rather than discovering them by silent metric
     /// re-attribution.
-    pub fn register_alias(&self, alias: &str, primary: &str) {
+    pub fn register_alias(&self, alias: &str, primary: &str) -> bool {
         if let Some(existing) = self.alias_to_primary.get(alias) {
             if existing.value() != primary {
                 tracing::warn!(
@@ -193,18 +194,40 @@ impl ModelManager {
                     "Alias is already claimed by a different primary — refusing to overwrite. \
                      Existing claim wins."
                 );
-                return;
+                return false;
             }
             // Same alias→same primary — idempotent, no-op.
-            return;
+            return true;
+        }
+
+        if let Some(existing) = self.models.get(alias) {
+            if !existing.is_empty() {
+                tracing::warn!(
+                    alias,
+                    primary,
+                    "Alias collides with a registered primary model — refusing to register. \
+                     Choose a different alias or rename the conflicting model."
+                );
+                return false;
+            }
         }
         self.alias_to_primary
             .insert(alias.to_string(), primary.to_string());
+        true
     }
 
-    /// Remove a previously registered alias mapping.
-    pub fn unregister_alias(&self, alias: &str) {
-        self.alias_to_primary.remove(alias);
+    /// Remove a previously registered alias mapping once the alias has no WorkerSets.
+    pub fn unregister_alias_if_empty(&self, alias: &str, primary: &str) {
+        if self
+            .models
+            .get(alias)
+            .is_some_and(|model| !model.is_empty())
+        {
+            return;
+        }
+
+        self.alias_to_primary
+            .remove_if(alias, |_, existing| existing == primary);
     }
 
     /// Return the primary (canonical) model name for `model`, resolving aliases.
@@ -1145,6 +1168,51 @@ mod tests {
 
         // Model should still exist (ns1 still there)
         assert!(mm.get_model("llama").is_some());
+    }
+
+    #[test]
+    fn test_alias_resolution_maps_to_primary() {
+        let mm = ModelManager::new();
+
+        assert!(mm.register_alias("llama-alias", "llama"));
+
+        assert_eq!(mm.resolve_canonical_name("llama-alias"), "llama");
+        assert_eq!(mm.resolve_canonical_name("llama"), "llama");
+    }
+
+    #[test]
+    fn test_register_alias_rejects_primary_collision() {
+        let mm = ModelManager::new();
+        mm.add_worker_set("llama-alias", "ns1", make_worker_set("ns1", "abc"));
+
+        assert!(!mm.register_alias("llama-alias", "llama"));
+
+        assert_eq!(mm.resolve_canonical_name("llama-alias"), "llama-alias");
+    }
+
+    #[test]
+    fn test_unregister_alias_if_empty_keeps_mapping_with_remaining_worker_sets() {
+        let mm = ModelManager::new();
+        assert!(mm.register_alias("llama-alias", "llama"));
+
+        assert!(mm.add_worker_set_arc(
+            "llama-alias",
+            "ns1",
+            Arc::new(make_worker_set("ns1", "abc")),
+        ));
+        assert!(mm.add_worker_set_arc(
+            "llama-alias",
+            "ns2",
+            Arc::new(make_worker_set("ns2", "abc")),
+        ));
+
+        mm.remove_worker_set("llama-alias", "ns1");
+        mm.unregister_alias_if_empty("llama-alias", "llama");
+        assert_eq!(mm.resolve_canonical_name("llama-alias"), "llama");
+
+        mm.remove_worker_set("llama-alias", "ns2");
+        mm.unregister_alias_if_empty("llama-alias", "llama");
+        assert_eq!(mm.resolve_canonical_name("llama-alias"), "llama-alias");
     }
 
     #[test]

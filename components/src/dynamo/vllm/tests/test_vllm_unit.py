@@ -159,6 +159,28 @@ def test_model_express_url_none_for_default_load_format(mock_vllm_cli):
     assert config.model_express_url is None
 
 
+def test_multiple_served_model_names_register_primary_and_aliases(mock_vllm_cli):
+    """vLLM accepts multiple served names; Dynamo registers first as primary."""
+    mock_vllm_cli(
+        "--model",
+        "Qwen/Qwen3-0.6B",
+        "--served-model-name",
+        "primary",
+        "alias-one",
+        "alias-two",
+    )
+
+    config = parse_args()
+
+    assert config.served_model_name == "primary"
+    assert config.served_model_aliases == ["alias-one", "alias-two"]
+    assert config.engine_args.served_model_name == [
+        "primary",
+        "alias-one",
+        "alias-two",
+    ]
+
+
 # --endpoint flag tests
 
 

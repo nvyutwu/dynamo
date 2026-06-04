@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Dict, Optional, Sequence
 
@@ -111,6 +112,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
         config.override_engine_args = json.dumps(dynamic_overrides)
 
     config.validate()
+    _normalize_served_model_name(config)
 
     # TODO: move this to common configuration.
     if config.custom_jinja_template:
@@ -138,6 +140,41 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     config.endpoint = parsed_endpoint_name
 
     return config
+
+
+def _split_served_model_names(served_model_name: Any) -> list[str]:
+    if served_model_name is None:
+        return []
+
+    if isinstance(served_model_name, str):
+        raw_names = [served_model_name]
+    else:
+        raw_names = [str(name) for name in served_model_name]
+
+    names: list[str] = []
+    for raw_name in raw_names:
+        names.extend(
+            name for name in re.split(r"[\s,]+", raw_name.strip()) if name
+        )
+    return names
+
+
+def _normalize_served_model_name(config: Config) -> None:
+    """TRT-LLM only accepts one served model name; keep the first if many are set."""
+    names = _split_served_model_names(config.served_model_name)
+    if not names:
+        config.served_model_name = None
+        return
+
+    primary, *aliases = names
+    config.served_model_name = primary
+    if aliases:
+        logging.warning(
+            "TRT-LLM does not support multiple served model names; using first "
+            "served model name %r and ignoring aliases: %s",
+            primary,
+            aliases,
+        )
 
 
 def _default_endpoint(

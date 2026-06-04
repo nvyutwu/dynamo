@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 from typing import Any, Dict, Optional
 
@@ -48,6 +49,7 @@ class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     # mirror vLLM
     model: str
     served_model_name: Optional[str] = None
+    served_model_aliases: list[str] = []
 
     # rest vLLM args
     engine_args: AsyncEngineArgs
@@ -146,12 +148,24 @@ def update_dynamo_config_with_engine(
     """Update dynamo_config fields from engine_config and worker flags."""
 
     if getattr(engine_config, "served_model_name", None) is not None:
-        served = engine_config.served_model_name
-        if len(served) > 1:
-            raise ValueError("We do not support multiple model names.")
-        dynamo_config.served_model_name = served[0]
+        served_names = _split_served_model_names(engine_config.served_model_name)
+        if served_names:
+            primary, *aliases = served_names
+            dynamo_config.served_model_name = primary
+            dynamo_config.served_model_aliases = aliases
+            engine_config.served_model_name = served_names
+            if aliases:
+                logger.info(
+                    "Multi-name registration: primary=%r, aliases=%s",
+                    primary,
+                    aliases,
+                )
+        else:
+            dynamo_config.served_model_name = None
+            dynamo_config.served_model_aliases = []
     else:
         dynamo_config.served_model_name = None
+        dynamo_config.served_model_aliases = []
 
     # Capture user-provided --endpoint before defaults overwrite it
     user_endpoint = dynamo_config.endpoint
@@ -216,6 +230,24 @@ def update_dynamo_config_with_engine(
                 f"--model-express-url or MODEL_EXPRESS_URL env var is required "
                 f"when using --load-format={engine_config.load_format}"
             )
+
+
+def _split_served_model_names(served_model_name: Any) -> list[str]:
+    """Return primary + aliases from vLLM's served_model_name representation."""
+    if served_model_name is None:
+        return []
+
+    if isinstance(served_model_name, str):
+        raw_names = [served_model_name]
+    else:
+        raw_names = [str(name) for name in served_model_name]
+
+    names: list[str] = []
+    for raw_name in raw_names:
+        names.extend(
+            name for name in re.split(r"[\s,]+", raw_name.strip()) if name
+        )
+    return names
 
 
 def update_engine_config_with_dynamo(

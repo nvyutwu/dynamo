@@ -91,6 +91,7 @@ async def init_omni(
         config.model,
         config.served_model_name,
         kv_cache_block_size=config.engine_args.block_size,
+        model_aliases=config.served_model_aliases or None,
     )
 
     if dummy_tokenizer_paths:
@@ -132,7 +133,8 @@ async def worker():
     dump_config(config.dump_config_to, config)
 
     if not config.served_model_name:
-        config.served_model_name = config.engine_args.served_model_name = config.model
+        config.served_model_name = config.model
+        config.engine_args.served_model_name = [config.model]
 
     if not os.path.exists(config.model):
         await fetch_model(config.model)

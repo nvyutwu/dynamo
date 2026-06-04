@@ -102,6 +102,27 @@ def test_parse_args_returns_config_with_expected_attrs(monkeypatch):
     assert config.endpoint == "generate"
 
 
+def test_multiple_served_model_names_use_first_with_warning(caplog):
+    """TRT-LLM is scalar-only; packed names should not regress startup."""
+    with caplog.at_level("WARNING"):
+        config = parse_args(
+            [
+                "--model",
+                "fake-model",
+                "--served-model-name",
+                "primary,alias-one alias-two",
+            ]
+        )
+
+    assert config.served_model_name == "primary"
+    assert any(
+        "TRT-LLM does not support multiple served model names" in r.message
+        and "alias-one" in r.message
+        and "alias-two" in r.message
+        for r in caplog.records
+    )
+
+
 def test_config_use_kv_events_derived_from_publish_events(monkeypatch):
     """Config.validate sets use_kv_events from publish_events_and_metrics."""
     monkeypatch.delenv("DYN_TRTLLM_PUBLISH_EVENTS", raising=False)

@@ -129,8 +129,7 @@ class DynamoSGLangConfig(ConfigBase):
     # Additional names this model responds to (aliases). Populated by
     # parse_args when --served-model-name is given as a whitespace- or
     # comma-separated string of multiple names; the first becomes the
-    # primary and the rest land here. Same semantics as the TRT-LLM
-    # backend (commit 8911a6eb0b). Plumbed to register_model() so the
+    # primary and the rest land here. Plumbed to register_model() so the
     # Rust ModelManager registers the same WorkerSet under each alias.
     served_model_aliases: List[str] = []
 

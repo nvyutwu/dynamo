@@ -13,6 +13,7 @@ try:
         OmniConfig,
         OmniDiffusionKwargs,
         OmniParallelKwargs,
+        _split_served_model_names,
     )
 except ImportError:
     pytest.skip("vLLM omni dependencies not available", allow_module_level=True)
@@ -63,6 +64,7 @@ def _make_omni_config(**overrides) -> OmniConfig:
         "media_output_http_url": None,
         "model": "test-model",
         "served_model_name": None,
+        "served_model_aliases": [],
         "engine_args": SimpleNamespace(),
         "stage_configs_path": None,
         "default_video_fps": 16,
@@ -87,6 +89,14 @@ def _make_omni_config(**overrides) -> OmniConfig:
 def test_omni_config_valid_defaults():
     config = _make_omni_config()
     config.validate()
+
+
+def test_split_served_model_names_flattens_vllm_list():
+    assert _split_served_model_names(["primary", "alias-one,alias-two"]) == [
+        "primary",
+        "alias-one",
+        "alias-two",
+    ]
 
 
 @pytest.mark.parametrize("fps", [0, -1, -100])

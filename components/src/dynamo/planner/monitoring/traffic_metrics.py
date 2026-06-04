@@ -161,7 +161,8 @@ class PrometheusAPIClient:
                 metrics_containers = parse_frontend_metric_containers(result)
                 values = []
                 for container in metrics_containers:
-                    # Frontend lowercases model names for Prometheus labels so we need to do case-insensitive comparison
+                    # Compare case-insensitively so planner handles both
+                    # current exact-case labels and older lowercased labels.
                     if (
                         container.metric.model
                         and container.metric.model.lower() == model_name.lower()
@@ -262,7 +263,8 @@ class PrometheusAPIClient:
             metrics_containers = parse_frontend_metric_containers(raw_res)
             total_count = 0.0
             for container in metrics_containers:
-                # Frontend lowercases model names for Prometheus labels so we need to do case-insensitive comparison
+                # Compare case-insensitively so planner handles both
+                # current exact-case labels and older lowercased labels.
                 if (
                     container.metric.model
                     and container.metric.model.lower() == model_name.lower()

@@ -118,7 +118,8 @@ async def worker() -> None:
     # Name the model. Use either the full path (vllm and sglang do the same),
     # or the HF name (e.g. "Qwen/Qwen3-0.6B"), depending on cmd line params.
     if not config.served_model_name:
-        config.served_model_name = config.engine_args.served_model_name = config.model
+        config.served_model_name = config.model
+        config.engine_args.served_model_name = [config.model]
 
     # Download the model if necessary using modelexpress.
     # We want it on disk before we start vllm to avoid downloading from HuggingFace.
@@ -699,6 +700,7 @@ async def register_vllm_model(
         custom_template_path=config.custom_jinja_template,
         media_decoder=media_decoder,
         media_fetcher=media_fetcher,
+        model_aliases=config.served_model_aliases or None,
     )
 
 

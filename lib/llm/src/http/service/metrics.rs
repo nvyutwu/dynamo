@@ -1018,7 +1018,7 @@ impl Metrics {
 
         InflightGuard::new(
             self.clone(),
-            model.to_string().to_lowercase(),
+            model.to_string(),
             endpoint,
             request_type,
             request_id.to_string(),
@@ -1027,7 +1027,7 @@ impl Metrics {
 
     /// Create a new [`ResponseMetricCollector`] for collecting per-response metrics (i.e., TTFT, ITL)
     pub fn create_response_collector(self: Arc<Self>, model: &str) -> ResponseMetricCollector {
-        ResponseMetricCollector::new(self, model.to_string().to_lowercase())
+        ResponseMetricCollector::new(self, model.to_string())
     }
 
     /// Create a new [`HttpQueueGuard`] for tracking HTTP processing queue
@@ -1035,7 +1035,7 @@ impl Metrics {
     /// This guard tracks requests from HTTP handler start until first token generation,
     /// providing visibility into HTTP processing queue time before actual LLM processing begins.
     pub fn create_http_queue_guard(self: Arc<Self>, model: &str) -> HttpQueueGuard {
-        HttpQueueGuard::new(self, model.to_string().to_lowercase())
+        HttpQueueGuard::new(self, model.to_string())
     }
 }
 
@@ -2450,6 +2450,76 @@ mod tests {
             metrics
                 .active_requests_gauge
                 .with_label_values(&[model])
+                .get(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_frontend_metrics_preserve_model_name_case() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let model = "nvidia/GLM-5.1";
+        let lower_model = "nvidia/glm-5.1";
+
+        {
+            let _http_queue_guard = metrics.clone().create_http_queue_guard(model);
+            assert_eq!(metrics.http_queue_gauge.with_label_values(&[model]).get(), 1);
+            assert_eq!(
+                metrics
+                    .http_queue_gauge
+                    .with_label_values(&[lower_model])
+                    .get(),
+                0
+            );
+        }
+
+        {
+            let mut inflight_guard =
+                metrics
+                    .clone()
+                    .create_inflight_guard(model, Endpoint::ChatCompletions, false, "req-1");
+            inflight_guard.mark_ok();
+        }
+        assert_eq!(
+            metrics
+                .request_counter
+                .with_label_values(&[
+                    model,
+                    Endpoint::ChatCompletions.as_str(),
+                    RequestType::Unary.as_str(),
+                    Status::Success.as_str(),
+                    ErrorType::None.as_str(),
+                ])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .request_counter
+                .with_label_values(&[
+                    lower_model,
+                    Endpoint::ChatCompletions.as_str(),
+                    RequestType::Unary.as_str(),
+                    Status::Success.as_str(),
+                    ErrorType::None.as_str(),
+                ])
+                .get(),
+            0
+        );
+
+        let mut collector = metrics.clone().create_response_collector(model);
+        collector.observe_response(10, 3);
+        assert_eq!(
+            metrics.output_tokens_counter.with_label_values(&[model]).get(),
+            3
+        );
+        assert_eq!(
+            metrics
+                .output_tokens_counter
+                .with_label_values(&[lower_model])
                 .get(),
             0
         );

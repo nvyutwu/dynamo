@@ -204,6 +204,7 @@ async def init_omni_stage_router(
         generate_endpoint,
         config.model,
         config.served_model_name,
+        model_aliases=config.served_model_aliases or None,
     )
     logger.info("OmniStageRouter registered at '%s'", generate_endpoint)
 
