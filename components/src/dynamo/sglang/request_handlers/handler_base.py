@@ -819,7 +819,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         # is None when SGLang runs with skip_tokenizer_init=True (Dynamo's
         # default token-id wire format), so we fall back to loading from
         # server_args.model_path.
-        self._reasoning_tokenizer = self._acquire_reasoning_tokenizer()
+        self.__reasoning_tokenizer_cache = None  # lazy-initialized on first use
         self._quiesce_controller = (
             SGLangEngineQuiesceController(engine) if engine is not None else None
         )
@@ -1145,6 +1145,15 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         return {
             "prompt" if isinstance(request_input, str) else "input_ids": request_input
         }
+
+    @property
+    def _reasoning_tokenizer(self):
+        """Lazy-init: engine.tokenizer_manager is None at __init__ time (SGLang sets it
+        lazily after full initialization), so we defer acquisition until the first request.
+        """
+        if self.__reasoning_tokenizer_cache is None:
+            self.__reasoning_tokenizer_cache = self._acquire_reasoning_tokenizer()
+        return self.__reasoning_tokenizer_cache
 
     def _has_reasoning_parser(self) -> bool:
         server_args = self.config.server_args
