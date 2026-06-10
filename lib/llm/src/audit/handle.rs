@@ -4,17 +4,36 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
+
 use super::{bus, config};
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
 
+pub const OTEL_HTTP_HEADERS_CONTEXT_KEY: &str = "audit.otel.http.request.headers";
+
+#[derive(Clone)]
+pub struct AuditHttpRequestHeaders {
+    headers: Arc<HeaderMap>,
+}
+
+impl AuditHttpRequestHeaders {
+    pub fn new(headers: Arc<HeaderMap>) -> Self {
+        Self { headers }
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        self.headers.as_ref()
+    }
+}
+
 /// Distinguishes the two record types emitted per chat completion.
 ///
 /// Request and response are published as separate `AuditRecord`s sharing the same
-/// `request_id`. Downstream consumers correlate by `request_id`; the request record
-/// is emitted before the worker dispatches, the response record is emitted after the
-/// response stream completes successfully. On client cancel mid-stream (or
+/// `request_id`. Downstream consumers correlate by `request_id`; the request emit
+/// is scheduled before the worker dispatches, the response record is emitted after
+/// the response stream completes successfully. On client cancel mid-stream (or
 /// aggregation failure) only the request record is emitted.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -34,12 +53,16 @@ pub struct AuditRecord {
     pub request: Option<Arc<NvCreateChatCompletionRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Arc<NvCreateChatCompletionResponse>>,
+    #[serde(skip)]
+    pub otel_http_headers: Option<Arc<AuditHttpRequestHeaders>>,
 }
 
+#[derive(Clone)]
 pub struct AuditHandle {
     requested_streaming: bool,
     request_id: String,
     model: String,
+    otel_http_headers: Option<Arc<AuditHttpRequestHeaders>>,
 }
 
 impl AuditHandle {
@@ -51,9 +74,10 @@ impl AuditHandle {
         &self.request_id
     }
 
-    /// Publish a `Request` event record on the audit bus. Call once, as soon as the
-    /// request is captured and before worker dispatch — this lets downstream
-    /// observers see hung / canceled requests that never produce a response record.
+    /// Publish a `Request` event record on the audit bus. Call once after the
+    /// request is captured. The preprocessor schedules this before worker
+    /// dispatch so downstream observers can see hung / canceled requests that
+    /// never produce a response record.
     pub fn emit_request(&self, request: Arc<NvCreateChatCompletionRequest>) {
         let rec = AuditRecord {
             schema_version: 1,
@@ -63,6 +87,7 @@ impl AuditHandle {
             model: self.model.clone(),
             request: Some(request),
             response: None,
+            otel_http_headers: self.otel_http_headers.clone(),
         };
         bus::publish(rec);
     }
@@ -79,12 +104,17 @@ impl AuditHandle {
             model: self.model,
             request: None,
             response: Some(response),
+            otel_http_headers: None,
         };
         bus::publish(rec);
     }
 }
 
-pub fn create_handle(req: &NvCreateChatCompletionRequest, request_id: &str) -> Option<AuditHandle> {
+pub fn create_handle(
+    req: &NvCreateChatCompletionRequest,
+    request_id: &str,
+    otel_http_headers: Option<Arc<AuditHttpRequestHeaders>>,
+) -> Option<AuditHandle> {
     let policy = config::policy();
     if !config::capture_enabled() {
         return None;
@@ -100,6 +130,7 @@ pub fn create_handle(req: &NvCreateChatCompletionRequest, request_id: &str) -> O
         requested_streaming,
         request_id: request_id.to_string(),
         model,
+        otel_http_headers,
     })
 }
 
@@ -153,9 +184,18 @@ mod tests {
         serde_json::from_value(json).expect("Failed to create test response")
     }
 
+    struct AuditPolicyResetGuard;
+
+    impl Drop for AuditPolicyResetGuard {
+        fn drop(&mut self) {
+            crate::audit::config::clear_policy_override_for_test();
+        }
+    }
+
     /// Test that DYN_AUDIT_FORCE_LOGGING=true bypasses store=false
     /// When force logging is enabled, audit handle should be created even when store=false
     #[test]
+    #[serial_test::serial]
     fn test_force_logging_bypasses_store() {
         with_vars(
             [
@@ -163,13 +203,12 @@ mod tests {
                 ("DYN_AUDIT_FORCE_LOGGING", Some("true")),
             ],
             || {
-                // `capture_enabled()` now requires `CAPTURE_ACTIVE`; mimic the
-                // audit init lifecycle (`init_from_env_with_shutdown`) instead of
-                // relying on the old "uninitialized counts as enabled" semantics.
+                crate::audit::config::override_policy_from_env_for_test();
                 crate::audit::config::mark_capture_active();
+                let _reset_guard = AuditPolicyResetGuard;
 
                 let request = create_test_request("test-model", false);
-                let handle = create_handle(&request, "test-id");
+                let handle = create_handle(&request, "test-id", None);
 
                 assert!(
                     handle.is_some(),
@@ -189,6 +228,7 @@ mod tests {
             model: "test-model".to_string(),
             request: Some(Arc::new(create_test_request_with_agent_context())),
             response: None,
+            otel_http_headers: None,
         };
 
         let value = serde_json::to_value(&record).unwrap();
@@ -212,6 +252,7 @@ mod tests {
             model: "test-model".to_string(),
             request: None,
             response: Some(Arc::new(create_test_response("final answer"))),
+            otel_http_headers: None,
         };
 
         let value = serde_json::to_value(&record).unwrap();
@@ -233,6 +274,7 @@ mod tests {
                 requested_streaming: streaming,
                 request_id: request_id.to_string(),
                 model: model.to_string(),
+                otel_http_headers: None,
             }
         }
     }

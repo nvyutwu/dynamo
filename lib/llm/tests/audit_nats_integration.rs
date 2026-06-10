@@ -158,14 +158,13 @@ mod tests {
                 // mark_capture_active) so `create_handle` succeeds — direct
                 // `bus::init` + `spawn_workers_from_env` calls no longer mark
                 // capture active after the capture_enabled() tightening.
-                init_from_env_with_shutdown(tokio_util::sync::CancellationToken::new())
-                    .await
-                    .unwrap();
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                init_from_env_with_shutdown(shutdown.clone()).await.unwrap();
                 time::sleep(Duration::from_millis(100)).await;
 
                 // Emit a request + response pair as two separate records.
                 let request = create_test_request("nemotron", true);
-                let handle = handle::create_handle(&request, "test-req-1")
+                let handle = handle::create_handle(&request, "test-req-1", None)
                     .expect("Failed to create audit handle");
                 handle.emit_request(Arc::new(request.clone()));
                 handle.emit_response(Arc::new(create_test_response("nemotron", "test response")));
@@ -182,7 +181,11 @@ mod tests {
                 )
                 .await;
 
-                assert_eq!(messages.len(), 2, "Should receive request + response records");
+                assert_eq!(
+                    messages.len(),
+                    2,
+                    "Should receive request + response records"
+                );
                 let req_record = messages
                     .iter()
                     .find(|m| m["event_type"] == "request")
@@ -203,6 +206,7 @@ mod tests {
                 assert!(resp_record.get("request").is_none());
 
                 client.jetstream().delete_stream(&stream_name).await.ok();
+                shutdown.cancel();
             },
         )
         .await;
@@ -229,21 +233,20 @@ mod tests {
                 // mark_capture_active) so `create_handle` succeeds — direct
                 // `bus::init` + `spawn_workers_from_env` calls no longer mark
                 // capture active after the capture_enabled() tightening.
-                init_from_env_with_shutdown(tokio_util::sync::CancellationToken::new())
-                    .await
-                    .unwrap();
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                init_from_env_with_shutdown(shutdown.clone()).await.unwrap();
                 time::sleep(Duration::from_millis(100)).await;
 
                 // Request with store=true (should be audited)
                 let request_true = create_test_request("nemotron", true);
-                if let Some(handle) = handle::create_handle(&request_true, "store-true") {
+                if let Some(handle) = handle::create_handle(&request_true, "store-true", None) {
                     handle.emit_request(Arc::new(request_true.clone()));
                 }
 
                 // Request with store=false (should NOT be audited)
                 let request_false = create_test_request("nemotron", false);
                 assert!(
-                    handle::create_handle(&request_false, "store-false").is_none(),
+                    handle::create_handle(&request_false, "store-false", None).is_none(),
                     "Should not create handle when store=false"
                 );
 
@@ -266,6 +269,7 @@ mod tests {
                 assert_eq!(messages[0]["event_type"], "request");
 
                 client.jetstream().delete_stream(&stream_name).await.ok();
+                shutdown.cancel();
             },
         )
         .await;

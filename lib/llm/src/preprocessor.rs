@@ -1489,7 +1489,17 @@ impl
         // Build audit handle (None if no DYN_AUDIT_SINKS). Publish the request
         // record immediately, before worker dispatch — this lets downstream
         // observers see hung or canceled requests that never produce a response.
-        let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
+        let audit_http_headers = if crate::audit::config::otel_sink_capture_enabled() {
+            context
+                .get::<crate::audit::handle::AuditHttpRequestHeaders>(
+                    crate::audit::handle::OTEL_HTTP_HEADERS_CONTEXT_KEY,
+                )
+                .ok()
+        } else {
+            None
+        };
+        let audit_handle =
+            crate::audit::handle::create_handle(&request, &request_id, audit_http_headers);
 
         if let Some(ref h) = audit_handle {
             h.emit_request(std::sync::Arc::new(request.clone()));

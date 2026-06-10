@@ -48,6 +48,10 @@ pub mod logging {
         /// Enable OTLP export for traces and logs (set to "1" to enable)
         pub const OTEL_EXPORT_ENABLED: &str = "OTEL_EXPORT_ENABLED";
 
+        /// Generic OTLP exporter endpoint URL
+        /// Spec: <https://opentelemetry.io/docs/specs/otel/protocol/exporter/>
+        pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
         /// OTLP exporter endpoint URL for traces
         /// Spec: https://opentelemetry.io/docs/specs/otel/protocol/exporter/
         pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
@@ -355,6 +359,11 @@ pub mod llm {
         /// Maximum serialized OTEL audit payload bytes. Oversized records emit
         /// an incomplete marker payload instead of the full request/response.
         pub const DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES: &str = "DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES";
+
+        /// Comma-separated HTTP header names whose values are redacted in the
+        /// OTEL audit payload. Defaults always redact common credential headers.
+        pub const DYN_AUDIT_OTEL_HTTP_HEADER_REDACT_LIST: &str =
+            "DYN_AUDIT_OTEL_HTTP_HEADER_REDACT_LIST";
     }
 
     /// Agent trace configuration
@@ -551,6 +560,7 @@ mod tests {
             logging::DYN_LOG_USE_LOCAL_TZ,
             logging::DYN_LOGGING_SPAN_EVENTS,
             logging::otlp::OTEL_EXPORT_ENABLED,
+            logging::otlp::OTEL_EXPORTER_OTLP_ENDPOINT,
             logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
             logging::otlp::OTEL_SERVICE_NAME,
             logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
@@ -617,6 +627,7 @@ mod tests {
             llm::audit::DYN_AUDIT_JSONL_GZ_ROLL_BYTES,
             llm::audit::DYN_AUDIT_JSONL_GZ_ROLL_LINES,
             llm::audit::DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES,
+            llm::audit::DYN_AUDIT_OTEL_HTTP_HEADER_REDACT_LIST,
             llm::agent_trace::DYN_AGENT_TRACE_SINKS,
             llm::agent_trace::DYN_AGENT_TRACE_OUTPUT_PATH,
             llm::agent_trace::DYN_AGENT_TRACE_CAPACITY,

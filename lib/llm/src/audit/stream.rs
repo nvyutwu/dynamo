@@ -60,6 +60,11 @@ where
                 if let Some(tx) = self.done_tx.take() {
                     // Aggregate all collected chunks
                     let chunks = std::mem::take(&mut self.chunks);
+                    if chunks.is_empty() {
+                        tracing::debug!("audit: empty response stream produced no response record");
+                        drop(tx);
+                        return Poll::Ready(None);
+                    }
                     let chunks_stream = futures::stream::iter(chunks);
                     let parsing_options = ParsingOptions::default();
 
@@ -219,7 +224,6 @@ pub fn final_response_to_one_chunk_stream(
             index: idx as u32,
             delta,
             finish_reason: ch.finish_reason,
-            stop_reason: ch.stop_reason.clone(),
             logprobs: ch.logprobs.clone(),
         };
         choices.push(choice);
@@ -254,7 +258,7 @@ mod tests {
     use super::*;
     use dynamo_protocols::types::{
         ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionStreamResponseDelta,
-        FinishReason, Role,
+        FinishReason, FunctionCallStream, FunctionType, Role,
     };
     use futures::StreamExt;
     use futures::stream;
@@ -276,7 +280,6 @@ mod tests {
                 reasoning_content: None,
             },
             finish_reason: None,
-            stop_reason: None,
             logprobs: None,
         };
 
@@ -317,7 +320,90 @@ mod tests {
                 reasoning_content: None,
             },
             finish_reason: Some(FinishReason::Stop),
-            stop_reason: None,
+            logprobs: None,
+        };
+
+        let response = NvCreateChatCompletionStreamResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                id: "test-id".to_string(),
+                choices: vec![choice],
+                created: 1234567890,
+                model: "test-model".to_string(),
+                system_fingerprint: Some("test-fingerprint".to_string()),
+                object: "chat.completion.chunk".to_string(),
+                usage: None,
+                service_tier: None,
+            },
+            nvext: None,
+        };
+
+        Annotated {
+            data: Some(response),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    fn create_reasoning_chunk(
+        reasoning_content: String,
+        index: u32,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        #[allow(deprecated)]
+        let choice = ChatChoiceStream {
+            index,
+            delta: ChatCompletionStreamResponseDelta {
+                role: Some(Role::Assistant),
+                content: None,
+                tool_calls: None,
+                function_call: None,
+                refusal: None,
+                reasoning_content: Some(reasoning_content),
+            },
+            finish_reason: None,
+            logprobs: None,
+        };
+
+        let response = NvCreateChatCompletionStreamResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                id: "test-id".to_string(),
+                choices: vec![choice],
+                created: 1234567890,
+                model: "test-model".to_string(),
+                system_fingerprint: Some("test-fingerprint".to_string()),
+                object: "chat.completion.chunk".to_string(),
+                usage: None,
+                service_tier: None,
+            },
+            nvext: None,
+        };
+
+        Annotated {
+            data: Some(response),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    fn create_tool_call_chunk(
+        tool_chunk: dynamo_protocols::types::ChatCompletionMessageToolCallChunk,
+        finish_reason: Option<FinishReason>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        #[allow(deprecated)]
+        let choice = ChatChoiceStream {
+            index: 0,
+            delta: ChatCompletionStreamResponseDelta {
+                role: None,
+                content: None,
+                tool_calls: Some(vec![tool_chunk]),
+                function_call: None,
+                refusal: None,
+                reasoning_content: None,
+            },
+            finish_reason,
             logprobs: None,
         };
 
@@ -402,6 +488,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_passthrough_aggregates_reasoning_content_and_tool_calls() {
+        let name_chunk = dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: Some("call_weather".to_string()),
+            r#type: Some(FunctionType::Function),
+            function: Some(FunctionCallStream {
+                name: Some("get_weather".to_string()),
+                arguments: None,
+            }),
+        };
+        let args_chunk = dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: None,
+            r#type: None,
+            function: Some(FunctionCallStream {
+                name: None,
+                arguments: Some("{\"city\":\"Tokyo\"}".to_string()),
+            }),
+        };
+        let chunks = vec![
+            create_reasoning_chunk("I should inspect the weather. ".to_string(), 0),
+            create_mock_chunk("The weather is clear.".to_string(), 0),
+            create_tool_call_chunk(name_chunk, None),
+            create_tool_call_chunk(args_chunk, Some(FinishReason::ToolCalls)),
+        ];
+
+        let input_stream = stream::iter(chunks.clone());
+        let (passthrough, future) = scan_aggregate_with_future(input_stream);
+        let results: Vec<_> = passthrough.collect().await;
+        let final_resp = future.await.expect("aggregation should produce a record");
+
+        assert_eq!(results.len(), chunks.len());
+        assert_eq!(
+            final_resp.inner.choices[0]
+                .message
+                .reasoning_content
+                .as_deref(),
+            Some("I should inspect the weather. ")
+        );
+        assert_eq!(
+            final_resp.inner.choices[0]
+                .message
+                .content
+                .as_ref()
+                .unwrap(),
+            &ChatCompletionMessageContent::Text("The weather is clear.".to_string())
+        );
+        let tool_call = &final_resp.inner.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should aggregate")[0];
+        assert_eq!(tool_call.id, "call_weather");
+        assert_eq!(tool_call.function.name, "get_weather");
+        assert_eq!(tool_call.function.arguments, "{\"city\":\"Tokyo\"}");
+    }
+
+    #[tokio::test]
+    async fn test_final_response_to_one_chunk_preserves_reasoning_and_tool_calls() {
+        let response: NvCreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The weather is clear.",
+                    "reasoning_content": "I should inspect the weather.",
+                    "tool_calls": [{
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Tokyo\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("response parses");
+
+        let chunks: Vec<_> = final_response_to_one_chunk_stream(response).collect().await;
+        assert_eq!(chunks.len(), 1);
+        let delta = &chunks[0].data.as_ref().unwrap().inner.choices[0].delta;
+
+        assert_eq!(
+            delta.content.as_ref().unwrap(),
+            &ChatCompletionMessageContent::Text("The weather is clear.".to_string())
+        );
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("I should inspect the weather.")
+        );
+        let tool_call = &delta.tool_calls.as_ref().expect("tool calls preserved")[0];
+        assert_eq!(tool_call.id.as_deref(), Some("call_weather"));
+        assert_eq!(tool_call.r#type, Some(FunctionType::Function));
+        let function = tool_call.function.as_ref().expect("function preserved");
+        assert_eq!(function.name.as_deref(), Some("get_weather"));
+        assert_eq!(function.arguments.as_deref(), Some("{\"city\":\"Tokyo\"}"));
+    }
+
+    #[tokio::test]
     async fn test_empty_stream_handling() {
         // Empty stream is treated the same as a client-cancel mid-stream: the
         // aggregator has nothing to apply, tx drops without sending, and the
@@ -462,7 +653,6 @@ mod tests {
                                 reasoning_content: None,
                             },
                             finish_reason: None,
-                            stop_reason: None,
                             logprobs: None,
                         }
                     }],
