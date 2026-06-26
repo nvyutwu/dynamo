@@ -146,6 +146,8 @@ pub struct WorkerConfig {
     pub tool_call_parser: Option<String>,
     /// Optional reasoning parser name written to model runtime metadata.
     pub reasoning_parser: Option<String>,
+    /// Deployment-level default thinking mode written to runtime metadata.
+    pub default_thinking_mode: Option<String>,
     /// Whether templates should omit tools when `tool_choice` is `none`.
     pub exclude_tools_when_tool_choice_none: bool,
     /// Whether this worker should keep an in-process KV indexer.
@@ -218,6 +220,7 @@ impl Default for WorkerConfig {
             custom_jinja_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            default_thinking_mode: None,
             exclude_tools_when_tool_choice_none: true,
             enable_local_indexer: true,
             enable_kv_routing: true,
@@ -1649,6 +1652,14 @@ async fn build_local_model(
         _ => None,
     };
 
+    let mut runtime_data = engine_config.runtime_data.clone();
+    if let Some(default_thinking_mode) = config.default_thinking_mode.as_deref() {
+        runtime_data.insert(
+            "default_thinking_mode".to_string(),
+            serde_json::json!(default_thinking_mode),
+        );
+    }
+
     let rt_cfg = ModelRuntimeConfig {
         context_length: llm.context_length,
         total_kv_blocks: llm.total_kv_blocks,
@@ -1665,7 +1676,7 @@ async fn build_local_model(
         enable_local_indexer,
         kv_state_endpoint: config.kv_state_endpoint.clone(),
         disaggregated_endpoint,
-        runtime_data: engine_config.runtime_data.clone(),
+        runtime_data,
         ..ModelRuntimeConfig::default()
     };
 
@@ -1932,6 +1943,7 @@ mod tests {
         let config = WorkerConfig {
             tool_call_parser: Some("kimi_k2".to_string()),
             reasoning_parser: Some("kimi_k25".to_string()),
+            default_thinking_mode: Some("disabled".to_string()),
             exclude_tools_when_tool_choice_none: false,
             enable_local_indexer: false,
             kv_state_endpoint: Some(EndpointId::from("dynamo/kv-state/events")),
@@ -1965,6 +1977,13 @@ mod tests {
         assert_eq!(runtime_config.max_num_batched_tokens, Some(8192));
         assert_eq!(runtime_config.tool_call_parser.as_deref(), Some("kimi_k2"));
         assert_eq!(runtime_config.reasoning_parser.as_deref(), Some("kimi_k25"));
+        assert_eq!(
+            runtime_config
+                .runtime_data
+                .get("default_thinking_mode")
+                .and_then(|value| value.as_str()),
+            Some("disabled")
+        );
         assert!(!runtime_config.exclude_tools_when_tool_choice_none);
         assert!(!runtime_config.enable_local_indexer);
         assert_eq!(
