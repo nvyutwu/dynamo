@@ -208,6 +208,7 @@ fn marker_payload(rec: &AuditRecord, reason: String) -> Option<(String, bool, Op
         event_time: rec.event_time,
         request: None,
         response: None,
+        http_request_headers: None,
         audit_complete: false,
         audit_drop_reason: Some(reason.clone()),
     };
@@ -308,6 +309,7 @@ mod tests {
             event_time: SystemTime::now(),
             request: None,
             response: None,
+            http_request_headers: None,
             audit_complete: true,
             audit_drop_reason: None,
         }
@@ -367,6 +369,7 @@ mod tests {
             event_time: SystemTime::now(),
             request: Some(Arc::new(request)),
             response: None,
+            http_request_headers: None,
             audit_complete: true,
             audit_drop_reason: None,
         }
@@ -411,6 +414,7 @@ mod tests {
             event_time: SystemTime::now(),
             request: None,
             response: Some(Arc::new(response)),
+            http_request_headers: None,
             audit_complete: true,
             audit_drop_reason: None,
         }
