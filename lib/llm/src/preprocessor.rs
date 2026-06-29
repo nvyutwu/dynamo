@@ -2968,7 +2968,13 @@ impl
         // The handle snapshots the pristine request and its arrival time here;
         // the single combined record is published once at stream completion
         // (or with an empty response on cancel/timeout), off the request path.
-        let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
+        let audit_http_headers = context
+            .get::<std::collections::BTreeMap<String, String>>(
+                crate::audit::handle::AUDIT_HTTP_HEADERS_CONTEXT_KEY,
+            )
+            .ok();
+        let audit_handle =
+            crate::audit::handle::create_handle(&request, &request_id, audit_http_headers);
 
         // For non-streaming requests (stream=false), enable usage by default
         // This ensures compliance with OpenAI API spec where non-streaming responses

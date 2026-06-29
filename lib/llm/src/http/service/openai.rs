@@ -1187,7 +1187,10 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let mut request = context_from_headers(request, request_id, &headers)?;
+    if let Some(captured) = crate::audit::handle::capture_http_headers(&headers) {
+        request.insert(crate::audit::handle::AUDIT_HTTP_HEADERS_CONTEXT_KEY, captured);
+    }
     let context = request.context();
 
     // create the connection handles

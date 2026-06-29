@@ -35,6 +35,9 @@ pub struct AuditPolicy {
     /// Max serialized bytes the OTLP sink exports before substituting an
     /// incomplete-record marker. otel-only — other sinks have no cap (DEP #9461).
     pub otel_max_payload_bytes: usize,
+    /// Lowercased allowlist of HTTP request header names to capture into the
+    /// audit record. Empty = capture none. Applies to every sink.
+    pub header_capture_list: Vec<String>,
 }
 
 static POLICY: OnceLock<AuditPolicy> = OnceLock::new();
@@ -80,6 +83,15 @@ fn load_from_env() -> AuditPolicy {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_OTEL_MAX_PAYLOAD_BYTES);
+    let header_capture_list = std::env::var(env_audit::DYN_AUDIT_HTTP_HEADER_CAPTURE_LIST)
+        .ok()
+        .map(|raw| {
+            raw.split(|c: char| c == ',' || c.is_whitespace())
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     AuditPolicy {
         enabled: !sinks.is_empty(),
@@ -95,6 +107,7 @@ fn load_from_env() -> AuditPolicy {
         jsonl_gz_roll_bytes,
         jsonl_gz_roll_lines,
         otel_max_payload_bytes,
+        header_capture_list,
     }
 }
 
