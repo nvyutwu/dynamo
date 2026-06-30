@@ -24,6 +24,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
+from .thinking import apply_default_thinking_mode_to_template_kwargs
 from .utils import random_call_id
 
 logger = logging.getLogger(__name__)
@@ -499,6 +500,7 @@ def preprocess_chat_request(
     reasoning_parser_name: str | None,
     exclude_tools_when_tool_choice_none: bool = True,
     template_force_reasoning: bool = False,
+    default_thinking_mode: str | None = None,
 ) -> SglangPreprocessResult:
     """Preprocess a chat request using SGLang tokenizer and parser APIs.
 
@@ -507,8 +509,30 @@ def preprocess_chat_request(
     the effective per-request value combines it with client knobs
     (``separate_reasoning``, ``chat_template_kwargs.enable_thinking``).
 
+    ``default_thinking_mode`` is the deployment-level thinking default (#11047);
+    when set and the request carries no thinking control of its own, the matching
+    chat-template flags are injected into ``chat_template_kwargs`` BEFORE reasoning
+    gating and rendering, so both observe the same thinking state.
+
     Synchronous -- suitable for both main-process and worker-process execution.
     """
+    # Apply the deployment-level thinking default first so the injected flags
+    # flow into both resolve_request_force_reasoning() and chat-template
+    # rendering below. Request-level thinking control wins (the helper no-ops
+    # when the request already sets thinking/enable_thinking/thinking_mode or a
+    # root-level "thinking" field).
+    if default_thinking_mode is not None:
+        merged_thinking_kwargs = apply_default_thinking_mode_to_template_kwargs(
+            dict(
+                request.get("chat_template_kwargs")
+                or request.get("chat_template_args")
+                or {}
+            ),
+            default_thinking_mode,
+            request_has_root_thinking="thinking" in request,
+        )
+        request = {**request, "chat_template_kwargs": merged_thinking_kwargs}
+
     messages = _materialize_messages(request.get("messages", []))
 
     # Per-request client escape hatch: skip reasoning parsing entirely when

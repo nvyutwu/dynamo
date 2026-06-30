@@ -114,6 +114,8 @@ pub struct WorkerConfig {
     pub tool_call_parser: Option<String>,
     /// Optional reasoning parser name written to model runtime metadata.
     pub reasoning_parser: Option<String>,
+    /// Deployment-level default thinking mode written to runtime metadata.
+    pub default_thinking_mode: Option<String>,
     /// Whether templates should omit tools when `tool_choice` is `none`.
     pub exclude_tools_when_tool_choice_none: bool,
     /// Whether this worker should keep an in-process KV indexer.
@@ -139,6 +141,7 @@ impl Default for WorkerConfig {
             custom_jinja_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            default_thinking_mode: None,
             exclude_tools_when_tool_choice_none: true,
             enable_local_indexer: true,
             metrics_labels: Vec::new(),
@@ -674,6 +677,17 @@ async fn build_local_model(
         .or_else(|| Some(engine_config.model.clone()))
         .filter(|s| !s.is_empty());
 
+    // Deployment-level default thinking mode (#11047) rides through runtime
+    // metadata so the frontend preprocessor can inject the matching
+    // chat-template thinking flags when a request doesn't set them itself.
+    let mut runtime_data = std::collections::HashMap::new();
+    if let Some(default_thinking_mode) = config.default_thinking_mode.as_deref() {
+        runtime_data.insert(
+            "default_thinking_mode".to_string(),
+            serde_json::json!(default_thinking_mode),
+        );
+    }
+
     let rt_cfg = ModelRuntimeConfig {
         total_kv_blocks: engine_config.total_kv_blocks,
         max_num_seqs: engine_config.max_num_seqs,
@@ -682,6 +696,7 @@ async fn build_local_model(
         reasoning_parser: config.reasoning_parser.clone(),
         exclude_tools_when_tool_choice_none: config.exclude_tools_when_tool_choice_none,
         enable_local_indexer: config.enable_local_indexer,
+        runtime_data,
         ..ModelRuntimeConfig::default()
     };
 
@@ -801,6 +816,7 @@ mod tests {
         let config = WorkerConfig {
             tool_call_parser: Some("kimi_k2".to_string()),
             reasoning_parser: Some("kimi_k25".to_string()),
+            default_thinking_mode: Some("disabled".to_string()),
             exclude_tools_when_tool_choice_none: false,
             enable_local_indexer: false,
             ..WorkerConfig::default()
@@ -821,6 +837,13 @@ mod tests {
         assert_eq!(runtime_config.max_num_batched_tokens, Some(8192));
         assert_eq!(runtime_config.tool_call_parser.as_deref(), Some("kimi_k2"));
         assert_eq!(runtime_config.reasoning_parser.as_deref(), Some("kimi_k25"));
+        assert_eq!(
+            runtime_config
+                .runtime_data
+                .get("default_thinking_mode")
+                .and_then(|value| value.as_str()),
+            Some("disabled")
+        );
         assert!(!runtime_config.exclude_tools_when_tool_choice_none);
         assert!(!runtime_config.enable_local_indexer);
     }

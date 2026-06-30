@@ -103,6 +103,7 @@ def test_worker_config_accepts_parser_runtime_settings():
         namespace="dynamo",
         tool_call_parser="kimi_k2",
         reasoning_parser="kimi_k25",
+        default_thinking_mode="disabled",
         exclude_tools_when_tool_choice_none=False,
         enable_local_indexer=False,
     )
@@ -124,6 +125,7 @@ def test_python_worker_config_from_runtime_config_copies_parser_settings():
     runtime_cfg.custom_jinja_template = None
     runtime_cfg.dyn_tool_call_parser = "kimi_k2"
     runtime_cfg.dyn_reasoning_parser = "kimi_k25"
+    runtime_cfg.dyn_default_thinking_mode = "disabled"
     runtime_cfg.exclude_tools_when_tool_choice_none = False
     runtime_cfg.enable_local_indexer = False
 
@@ -131,6 +133,7 @@ def test_python_worker_config_from_runtime_config_copies_parser_settings():
 
     assert config.tool_call_parser == "kimi_k2"
     assert config.reasoning_parser == "kimi_k25"
+    assert config.default_thinking_mode == "disabled"
     assert config.exclude_tools_when_tool_choice_none is False
     assert config.enable_local_indexer is False
 
@@ -152,6 +155,7 @@ def test_python_worker_config_from_runtime_config_applies_defaults_when_fields_a
     assert cfg.endpoint_types == "chat,completions"
     assert cfg.use_kv_events is False
     assert cfg.custom_jinja_template is None
+    assert cfg.default_thinking_mode is None
 
 
 @pytest.mark.unified

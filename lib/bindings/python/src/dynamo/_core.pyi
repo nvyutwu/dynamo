@@ -2339,6 +2339,7 @@ class backend:
             custom_jinja_template: Optional[str] = None,
             tool_call_parser: Optional[str] = None,
             reasoning_parser: Optional[str] = None,
+            default_thinking_mode: Optional[str] = None,
             exclude_tools_when_tool_choice_none: bool = ...,
             enable_local_indexer: bool = ...,
             metrics_labels: List[Tuple[str, str]] = ...,
