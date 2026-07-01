@@ -103,10 +103,32 @@ def _preprocess_for_encode_config(
 
 
 def _validate_parser_flags(
-    sglang_val: Optional[str], dynamo_val: Optional[str], name: str
+    sglang_val: Optional[str],
+    dynamo_val: Optional[str],
+    name: str,
+    *,
+    allow_coexist: bool = False,
 ) -> None:
-    """Validate that --{name} (SGLang) and --dyn-{name} (Dynamo) are not both set."""
+    """Validate the SGLang ``--{name}`` and Dynamo ``--dyn-{name}`` flag pair.
+
+    Mutually exclusive by default. ``allow_coexist=True`` permits both — used
+    for reasoning-parser: SGLang's ``--reasoning-parser`` only drives the
+    kernel-side ReasonerGrammarBackend (defer the grammar mask until after
+    ``</think>``), while Dynamo's ``--dyn-reasoning-parser`` drives the
+    response-side reasoning_content split. Different stages; both are required
+    together for thinking-on guided decoding (Dynamo calls Engine.async_generate
+    directly, so SGLang never formats the response — no double reasoning parse).
+    tool-call parsers stay exclusive: those DO double-consume the output stream.
+    """
     if sglang_val and dynamo_val:
+        if allow_coexist:
+            logging.info(
+                "Both --%s and --dyn-%s are set; allowed to coexist "
+                "(SGLang backend gating + Dynamo response split).",
+                name,
+                name,
+            )
+            return
         logging.error(f"Cannot use both --{name} and --dyn-{name}.")
         sys.exit(1)
 
@@ -443,6 +465,7 @@ async def parse_args(args: list[str]) -> Config:
         parsed_args.reasoning_parser,
         dynamo_config.dyn_reasoning_parser,
         "reasoning-parser",
+        allow_coexist=True,
     )
 
     if dynamo_config.custom_jinja_template and dynamo_config.use_sglang_tokenizer:

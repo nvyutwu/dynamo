@@ -43,6 +43,7 @@ from dynamo.llm import (
 )
 from dynamo.llm.exceptions import EngineShutdown
 from dynamo.runtime import DistributedRuntime
+from dynamo.sglang._compat import filter_supported_async_generate_kwargs
 from dynamo.sglang.args import Config
 from dynamo.sglang.pause import SGLangEnginePauseController
 from dynamo.sglang.publisher import DynamoSglangPublisher
@@ -702,13 +703,18 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         #
         # SGLang >=0.5.14 exposes require_reasoning on the Engine API
         # (GenerateReqInput.require_reasoning); on older builds the kwarg is
-        # absent so we never send it. Probe once at init (mirrors the priority
-        # check above) and only acquire the detection tokenizer when relevant.
+        # absent so we never send it. Use the _compat filter (not a raw
+        # inspect.signature membership check): on the nightly/overlay stack
+        # async_generate takes **kwargs and bridges require_reasoning into the
+        # io_struct, so it is NOT an explicit named parameter — a raw signature
+        # check would miss it and silently stop sending the flag.
         self._require_reasoning_supported: bool = (
             engine is not None
             and self._has_reasoning_parser()
             and "require_reasoning"
-            in inspect.signature(engine.async_generate).parameters
+            in filter_supported_async_generate_kwargs(
+                engine, {"require_reasoning": True}
+            )
         )
         self._reasoning_tokenizer: Any = (
             self._acquire_reasoning_tokenizer()
@@ -730,17 +736,17 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         return {}
 
     def _has_reasoning_parser(self) -> bool:
-        """Whether this worker advertises a reasoning parser.
+        """Whether SGLang's ReasonerGrammarBackend can be active.
 
-        `--reasoning-parser` (SGLang side) and/or `--dyn-reasoning-parser`
-        (Dynamo response-layer split) both count. When neither is set, the
-        require_reasoning path is a no-op.
+        Gate on SGLang's ``--reasoning-parser`` ONLY: it is what makes
+        create_grammar_backend wrap the base grammar backend in a
+        ReasonerGrammarBackend, which is the only thing require_reasoning=True
+        acts on. Dynamo's ``--dyn-reasoning-parser`` drives the response-side
+        reasoning_content split and does NOT create the backend, so it must not
+        gate the require_reasoning path (doing so would send a no-op flag and,
+        worse, imply deferral that never happens when SGLang's parser is unset).
         """
-        server_args = self.config.server_args
-        return bool(
-            getattr(server_args, "reasoning_parser", None)
-            or getattr(self.config.dynamo_args, "dyn_reasoning_parser", None)
-        )
+        return bool(getattr(self.config.server_args, "reasoning_parser", None))
 
     def _acquire_reasoning_tokenizer(self) -> Any:
         """Resolve a tokenizer for reasoning-suffix (`<think>`) detection.
