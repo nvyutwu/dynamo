@@ -363,7 +363,7 @@ Audit-specific variables:
 | `DYN_AUDIT_SINKS` | Comma-separated sinks: `stderr`, `nats`, `jsonl`, `jsonl_gz`, `otel`. Audit is enabled when non-empty. Leave **unset** to disable (do not use an empty string). | unset (disabled) |
 | `DYN_AUDIT_FORCE_LOGGING` | Audit every request regardless of the OpenAI `store` flag. Without it, only `store=true` requests are audited. | `false` |
 | `DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES` | Max serialized OTLP payload size. Oversized records emit a marker with `audit_complete=false` and `audit_drop_reason` instead of being silently dropped. | `4194304` (4 MiB) |
-| `DYN_AUDIT_HTTP_HEADER_CAPTURE_LIST` | Comma/whitespace-separated allowlist of request header names to record in the audit payload (`http_request_headers`), case-insensitive. Only listed headers are captured; unset/empty captures none. Applies to every sink. | unset (none) |
+| `DYN_AUDIT_HTTP_HEADER_EXCLUDE_LIST` | Comma/whitespace-separated denylist of request header names to EXCLUDE from the audit payload (`http_request_headers`), case-insensitive. By default all request headers are recorded; listed names are dropped. Set this to strip sensitive headers (e.g. `authorization`, `cookie`). Applies to every sink. | unset (capture all) |
 
 The `otel` sink ships over OTLP using the **standard** `OTEL_EXPORTER_OTLP_*` variables — the same ones the runtime log/trace exporter uses, resolved identically:
 

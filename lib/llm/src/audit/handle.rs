@@ -13,32 +13,35 @@ use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
 
-/// Context key under which the HTTP layer stashes the allowlisted request
-/// headers for the preprocessor to attach to the audit record.
+/// Context key under which the HTTP layer stashes the captured request headers
+/// for the preprocessor to attach to the audit record.
 pub const AUDIT_HTTP_HEADERS_CONTEXT_KEY: &str = "audit.http.request.headers";
 
-/// Collect the allowlisted request headers (case-insensitive, comma-joined on
-/// repeats) for the audit record. Returns `None` when audit capture is inactive
-/// or the allowlist is empty, so nothing is captured unless explicitly opted in
-/// via `DYN_AUDIT_HTTP_HEADER_CAPTURE_LIST`.
+/// Collect request headers (case-insensitive names, comma-joined on repeats)
+/// for the audit record. By default every header is captured; names listed in
+/// `DYN_AUDIT_HTTP_HEADER_EXCLUDE_LIST` are dropped. Returns `None` when audit
+/// capture is inactive or no headers survive the denylist.
 pub fn capture_http_headers(headers: &HeaderMap) -> Option<BTreeMap<String, String>> {
     if !config::capture_enabled() {
         return None;
     }
     let policy = config::policy();
-    if policy.header_capture_list.is_empty() {
-        return None;
-    }
     let mut out = BTreeMap::new();
-    for name in &policy.header_capture_list {
+    for name in headers.keys() {
+        // HeaderName is already lowercase-canonical; the denylist is lowercased
+        // at parse time, so a direct membership check is case-insensitive.
+        let name = name.as_str();
+        if policy.header_exclude_list.iter().any(|n| n == name) {
+            continue;
+        }
         let joined = headers
-            .get_all(name.as_str())
+            .get_all(name)
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect::<Vec<_>>()
             .join(", ");
         if !joined.is_empty() {
-            out.insert(name.clone(), joined);
+            out.insert(name.to_string(), joined);
         }
     }
     (!out.is_empty()).then_some(out)
@@ -62,8 +65,9 @@ pub struct AuditRecord {
     pub request: Option<Arc<NvCreateChatCompletionRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Arc<NvCreateChatCompletionResponse>>,
-    /// Allowlisted HTTP request headers (`DYN_AUDIT_HTTP_HEADER_CAPTURE_LIST`).
-    /// Omitted when nothing was captured; serialized by every sink.
+    /// Captured HTTP request headers (all except
+    /// `DYN_AUDIT_HTTP_HEADER_EXCLUDE_LIST`). Omitted when nothing was captured;
+    /// serialized by every sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_request_headers: Option<Arc<BTreeMap<String, String>>>,
     /// `true` on a complete record. Today only `OtelSink` can set it `false`, on
@@ -244,17 +248,17 @@ mod tests {
         );
     }
 
-    /// Only allowlisted headers are recorded (case-insensitive); everything else
-    /// — including sensitive headers — is never captured.
+    /// By default every header is recorded (case-insensitive); only names in
+    /// `DYN_AUDIT_HTTP_HEADER_EXCLUDE_LIST` are dropped.
     #[test]
     #[serial_test::serial]
-    fn capture_http_headers_records_only_allowlisted() {
+    fn capture_http_headers_drops_only_denylisted() {
         temp_env::with_vars(
             [
                 ("DYN_AUDIT_SINKS", Some("stderr")),
                 (
-                    "DYN_AUDIT_HTTP_HEADER_CAPTURE_LIST",
-                    Some("x-request-id, NVCF-Function-Id"),
+                    "DYN_AUDIT_HTTP_HEADER_EXCLUDE_LIST",
+                    Some("authorization, Cookie"),
                 ),
             ],
             || {
@@ -266,17 +270,24 @@ mod tests {
                 headers.insert("x-request-id", "abc-123".parse().unwrap());
                 headers.insert("nvcf-function-id", "fn-9".parse().unwrap());
                 headers.insert("authorization", "Bearer secret".parse().unwrap());
+                headers.insert("cookie", "sid=xyz".parse().unwrap());
 
+                // Unlisted headers are captured (default = capture all)...
                 let captured =
-                    capture_http_headers(&headers).expect("allowlisted headers are captured");
+                    capture_http_headers(&headers).expect("non-excluded headers are captured");
                 assert_eq!(captured.get("x-request-id").map(String::as_str), Some("abc-123"));
                 assert_eq!(
                     captured.get("nvcf-function-id").map(String::as_str),
                     Some("fn-9")
                 );
+                // ...while denylisted headers (case-insensitive) are dropped.
                 assert!(
                     !captured.contains_key("authorization"),
-                    "non-allowlisted header must never be captured"
+                    "denylisted header must be dropped"
+                );
+                assert!(
+                    !captured.contains_key("cookie"),
+                    "denylisted header (case-insensitive) must be dropped"
                 );
             },
         );
