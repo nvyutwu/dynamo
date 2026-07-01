@@ -692,6 +692,30 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         )
         self._pause_lock = asyncio.Lock()
 
+        # Thinking-on guided decoding: when a reasoning parser is configured and
+        # the prompt is in the reasoning phase (chat template injected
+        # `<think>`), pass require_reasoning=True to async_generate so SGLang's
+        # ReasonerGrammarBackend defers the grammar/JSON-schema mask until after
+        # `</think>`. Without it, the schema mask fires from token 0, the model
+        # can't escape to emit `</think>`, and the whole constrained output is
+        # captured as reasoning_content with empty content.
+        #
+        # SGLang >=0.5.14 exposes require_reasoning on the Engine API
+        # (GenerateReqInput.require_reasoning); on older builds the kwarg is
+        # absent so we never send it. Probe once at init (mirrors the priority
+        # check above) and only acquire the detection tokenizer when relevant.
+        self._require_reasoning_supported: bool = (
+            engine is not None
+            and self._has_reasoning_parser()
+            and "require_reasoning"
+            in inspect.signature(engine.async_generate).parameters
+        )
+        self._reasoning_tokenizer: Any = (
+            self._acquire_reasoning_tokenizer()
+            if self._require_reasoning_supported
+            else None
+        )
+
         # LoRA tracking (via LoraMixin)
         self._init_lora_tracking()
 
@@ -703,6 +727,139 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             ):
                 normalized = -normalized
             return {"priority": normalized}
+        return {}
+
+    def _has_reasoning_parser(self) -> bool:
+        """Whether this worker advertises a reasoning parser.
+
+        `--reasoning-parser` (SGLang side) and/or `--dyn-reasoning-parser`
+        (Dynamo response-layer split) both count. When neither is set, the
+        require_reasoning path is a no-op.
+        """
+        server_args = self.config.server_args
+        return bool(
+            getattr(server_args, "reasoning_parser", None)
+            or getattr(self.config.dynamo_args, "dyn_reasoning_parser", None)
+        )
+
+    def _acquire_reasoning_tokenizer(self) -> Any:
+        """Resolve a tokenizer for reasoning-suffix (`<think>`) detection.
+
+        Only used for token-input requests (the default Dynamo path, where the
+        frontend tokenizes and SGLang runs with skip_tokenizer_init=True, so
+        engine.tokenizer_manager.tokenizer is None). Text-input requests detect
+        `<think>` on the prompt string directly and need no tokenizer.
+
+        Resolution order:
+          1. engine.tokenizer_manager.tokenizer (present when
+             use_sglang_tokenizer / skip_tokenizer_init=False).
+          2. AutoTokenizer.from_pretrained(model_path, local_files_only=True) —
+             SGLang already populated the HF cache during engine init, so the
+             local path should hit; retries once with network before giving up.
+
+        Returns None (with a single warning) if neither succeeds; token-input
+        requests then fall back to require_reasoning=False.
+        """
+        engine_tok = None
+        tm = getattr(self.engine, "tokenizer_manager", None) if self.engine else None
+        if tm is not None:
+            engine_tok = getattr(tm, "tokenizer", None)
+        if engine_tok is not None:
+            return engine_tok
+
+        server_args = self.config.server_args
+        model_path = getattr(server_args, "model_path", None) or getattr(
+            server_args, "tokenizer_path", None
+        )
+        if not model_path:
+            logging.warning(
+                "Reasoning parser is configured but no tokenizer is available "
+                "(engine tokenizer is None and server_args.model_path is unset). "
+                "Token-input requests will not activate ReasonerGrammarBackend; "
+                "thinking-on guided decoding may misbehave."
+            )
+            return None
+
+        from transformers import AutoTokenizer
+
+        for local_only in (True, False):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    local_files_only=local_only,
+                )
+                logging.info(
+                    "Loaded fallback tokenizer for reasoning detection from %s "
+                    "(local_files_only=%s)",
+                    model_path,
+                    local_only,
+                )
+                return tokenizer
+            except Exception as exc:  # noqa: BLE001 - best-effort acquisition
+                logging.debug(
+                    "AutoTokenizer load (local_files_only=%s) failed for %s: %s",
+                    local_only,
+                    model_path,
+                    exc,
+                )
+
+        logging.warning(
+            "Failed to load a tokenizer from %s for reasoning detection. "
+            "Token-input requests will NOT activate ReasonerGrammarBackend; "
+            "thinking-on guided decoding will silently fall back to "
+            "non-reasoner masking and may emit schema-constrained output "
+            "before </think>. Pre-cache the tokenizer or run with "
+            "skip_tokenizer_init=False to fix.",
+            model_path,
+        )
+        return None
+
+    def _resolve_require_reasoning(self, input_param: Dict[str, Any]) -> bool:
+        """Whether the request's prompt is in the reasoning phase.
+
+        True when the chat template injected a reasoning-start token
+        (`<think>`) at the end of the prompt, mirroring the Rust-side
+        `prompt_injected_reasoning` heuristic in lib/llm/src/preprocessor.rs.
+        Setting require_reasoning=True only when thinking is actually on is
+        required: with it on but the prompt NOT in thinking, SGLang would wait
+        for a `</think>` that never comes and the grammar mask would never
+        apply.
+        """
+        if "prompt" in input_param:
+            prompt = input_param["prompt"]
+            return isinstance(prompt, str) and prompt.rstrip().endswith("<think>")
+
+        input_ids = input_param.get("input_ids")
+        if not input_ids:
+            return False
+        tokenizer = self._reasoning_tokenizer
+        if tokenizer is None:
+            return False
+
+        # Decode the trailing window — `<think>` may span 1+ tokens depending on
+        # the tokenizer. 8 covers current GLM/Qwen/DeepSeek without a full decode.
+        first = input_ids[0]
+        is_flat = isinstance(first, int) and not isinstance(first, bool)
+        suffix_ids = input_ids[-8:] if is_flat else input_ids[-1][-8:]
+        try:
+            suffix_text = tokenizer.decode(list(suffix_ids), skip_special_tokens=False)
+        except Exception:  # noqa: BLE001 - tokenizer access best-effort
+            return False
+        return suffix_text.rstrip().endswith("<think>")
+
+    def _require_reasoning_kwargs(self, input_param: Dict[str, Any]) -> Dict[str, Any]:
+        """`{"require_reasoning": True}` when this request is thinking-on and the
+        engine supports the kwarg; `{}` otherwise.
+
+        Replaces the pre-0.5.14 monkeypatch of tokenizer_manager.generate_request
+        with a direct Engine kwarg (SGLang >=0.5.14). Spread into async_generate
+        by the decode/prefill handlers.
+        """
+        if self._require_reasoning_supported and self._resolve_require_reasoning(
+            input_param
+        ):
+            return {"require_reasoning": True}
         return {}
 
     async def release_memory_occupation(self, body: dict) -> dict:

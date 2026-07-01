@@ -133,6 +133,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         }
 
         input_param = self._get_input_param(inner_request)
+        # Thinking-on guided decoding: mirror the decode side so a disagg
+        # request whose prompt is mid-reasoning defers the grammar mask until
+        # after </think> (grammar state is shared with decode).
+        require_reasoning_kwargs = self._require_reasoning_kwargs(input_param)
 
         # Prefill encodes the media so the KV it transfers carries the vision
         # context; decode extracts the same URLs to match the token layout.
@@ -160,6 +164,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             **mm_kwargs,
             sampling_params=sampling_params,
             stream=True,
+            **require_reasoning_kwargs,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,

@@ -341,6 +341,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         trace_id = context.trace_id
         sampling_params = self._build_sampling_params(request)
         input_param = self._get_input_param(request)
+        # Thinking-on guided decoding: defer the grammar mask until after
+        # </think> when the prompt is mid-reasoning (no-op unless a reasoning
+        # parser is configured and the engine supports the kwarg).
+        require_reasoning_kwargs = self._require_reasoning_kwargs(input_param)
         priority = (request.get("routing") or {}).get("priority")
         logprob_kwargs = self._build_logprob_kwargs(request)
         metadata_uploader = self._metadata_uploader_from_request(request)
@@ -389,6 +393,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 sampling_params=sampling_params,
                 stream=True,
                 **self._routed_experts_kwargs,
+                **require_reasoning_kwargs,
                 bootstrap_host=bootstrap_info["bootstrap_host"],
                 bootstrap_port=bootstrap_info["bootstrap_port"],
                 bootstrap_room=bootstrap_info["bootstrap_room"],
@@ -459,6 +464,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 sampling_params=sampling_params,
                 stream=True,
                 **self._routed_experts_kwargs,
+                **require_reasoning_kwargs,
                 **mm_hashes_kwargs,
                 external_trace_header=trace_header,
                 rid=trace_id,
