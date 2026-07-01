@@ -747,7 +747,6 @@ async fn completions_single(
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
@@ -762,7 +761,6 @@ async fn completions_single(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -910,7 +908,6 @@ async fn completions_batch(
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     let (engine, parsing_options) = state
         .manager()
@@ -924,7 +921,6 @@ async fn completions_batch(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1144,7 +1140,6 @@ async fn embeddings(
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
 
     // todo - error handling should be more robust
     let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
@@ -1156,7 +1151,6 @@ async fn embeddings(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
-    let mut response_collector = state.metrics_clone().create_response_collector(model);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -1689,7 +1683,6 @@ async fn chat_completions(
     // Create inflight_guard early to ensure all errors (including validation) are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
         &metric_model,
-        &model,
         Endpoint::ChatCompletions,
         streaming,
         &request_id,
@@ -1757,7 +1750,6 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     let annotations = request.annotations();
 
@@ -2136,15 +2128,11 @@ async fn responses(
     // pollute Prometheus label cardinality.
     let metric_model = state.manager().metric_model_for(&model).to_string();
     let streaming = request.inner.stream.unwrap_or(false);
-    let metric_model = state.manager().metric_model_for(&state.manager().resolve_canonical_name(&model)).to_string();
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
         &metric_model,
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
-    let mut inflight_guard = state.metrics_clone().create_inflight_guard(
-        &model,
         Endpoint::Responses,
         streaming,
         request.id(),
@@ -2251,7 +2239,6 @@ async fn responses(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     tracing::trace!("Issuing generate call for responses");
 
