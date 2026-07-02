@@ -49,7 +49,9 @@ class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     # mirror vLLM
     model: str
     served_model_name: Optional[str] = None
-    served_model_aliases: list[str] = []
+    # Default is None (not []) because ConfigBase copies class defaults by
+    # reference onto every instance — a shared [] would leak across configs.
+    served_model_aliases: Optional[list[str]] = None
 
     # rest vLLM args
     engine_args: AsyncEngineArgs
@@ -178,10 +180,10 @@ def update_dynamo_config_with_engine(
                 )
         else:
             dynamo_config.served_model_name = None
-            dynamo_config.served_model_aliases = []
+            dynamo_config.served_model_aliases = None
     else:
         dynamo_config.served_model_name = None
-        dynamo_config.served_model_aliases = []
+        dynamo_config.served_model_aliases = None
 
     # Capture user-provided --endpoint before defaults overwrite it
     user_endpoint = dynamo_config.endpoint

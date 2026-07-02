@@ -340,7 +340,9 @@ class OmniConfig(DynamoRuntimeConfig):
 
     model: str
     served_model_name: Optional[str] = None
-    served_model_aliases: list[str] = []
+    # Default is None (not []) because ConfigBase copies class defaults by
+    # reference onto every instance — a shared [] would leak across configs.
+    served_model_aliases: Optional[list[str]] = None
     engine_args: OmniEngineArgs
 
     stage_configs_path: Optional[str] = None

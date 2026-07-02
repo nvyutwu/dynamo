@@ -192,18 +192,28 @@ def _split_served_model_names(served_model_name: Any) -> list[str]:
 
 
 def _normalize_served_model_name(config: Config) -> None:
-    """TRT-LLM only accepts one served model name; keep the first if many are set."""
+    """Split a packed ``--served-model-name`` into the primary served name plus
+    aliases.
+
+    The first name is the primary (what the TRT-LLM engine and the OpenAI
+    ``response.model`` use); any remaining names are registered as frontend
+    aliases in the Rust ``ModelManager``. Aliasing lives entirely in the
+    frontend — the TRT-LLM engine itself only ever sees the single primary
+    name — so multiple served names are supported here just as they are for
+    vLLM and SGLang.
+    """
     names = _split_served_model_names(config.served_model_name)
     if not names:
         config.served_model_name = None
+        config.served_model_aliases = None
         return
 
     primary, *aliases = names
     config.served_model_name = primary
+    config.served_model_aliases = aliases or None
     if aliases:
-        logging.warning(
-            "TRT-LLM does not support multiple served model names; using first "
-            "served model name %r and ignoring aliases: %s",
+        logging.info(
+            "Multi-name registration (TRT-LLM): primary=%r, aliases=%s",
             primary,
             aliases,
         )

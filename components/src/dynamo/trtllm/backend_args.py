@@ -8,7 +8,7 @@
 import argparse
 import logging
 import warnings
-from typing import Optional
+from typing import List, Optional
 
 from tensorrt_llm.llmapi import BuildConfig
 
@@ -466,6 +466,14 @@ class DynamoTrtllmConfig(ConfigBase):
 
     model: str
     served_model_name: Optional[str] = None
+
+    # Additional names this model responds to (aliases). Populated by
+    # parse_args when --served-model-name packs several whitespace-/comma-
+    # separated names; the first becomes the primary and the rest land here.
+    # Plumbed to register_model() so the Rust ModelManager registers the same
+    # WorkerSet under each alias. Default is None (not []) because ConfigBase
+    # copies class defaults by reference onto every instance.
+    served_model_aliases: Optional[List[str]] = None
 
     tensor_parallel_size: int
     pipeline_parallel_size: int

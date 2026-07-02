@@ -104,8 +104,14 @@ def test_parse_args_returns_config_with_expected_attrs(monkeypatch):
     assert config.endpoint == "generate"
 
 
-def test_multiple_served_model_names_use_first_with_warning(caplog):
-    """TRT-LLM is scalar-only; packed names should not regress startup."""
+def test_multiple_served_model_names_split_primary_and_aliases(caplog):
+    """Packed --served-model-name splits into primary + Dynamo aliases.
+
+    Aliasing lives in the Rust frontend (the TRT-LLM engine only ever sees the
+    single primary), so multiple served names are supported here just as for
+    vLLM and SGLang — the extra names become frontend aliases rather than being
+    dropped.
+    """
     with caplog.at_level("WARNING"):
         config = parse_args(
             [
@@ -117,10 +123,11 @@ def test_multiple_served_model_names_use_first_with_warning(caplog):
         )
 
     assert config.served_model_name == "primary"
-    assert any(
-        "TRT-LLM does not support multiple served model names" in r.message
-        and "alias-one" in r.message
-        and "alias-two" in r.message
+    assert config.served_model_aliases == ["alias-one", "alias-two"]
+    # The old "TRT-LLM does not support multiple served model names" warning
+    # must no longer be emitted — aliases are now honored.
+    assert not any(
+        "does not support multiple served model names" in r.message
         for r in caplog.records
     )
 

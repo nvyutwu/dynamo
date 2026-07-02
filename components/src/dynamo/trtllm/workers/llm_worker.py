@@ -737,6 +737,7 @@ async def init_llm_worker(
             media_fetcher=media_fetcher,
             worker_type=worker_type,
             needs=needs,
+            model_aliases=config.served_model_aliases or None,
         )
 
         health_check_payload = TrtllmHealthCheckPayload(
