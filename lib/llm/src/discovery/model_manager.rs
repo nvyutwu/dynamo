@@ -183,6 +183,20 @@ impl ModelManager {
 
     /// Add a WorkerSet to a Model. Creates the Model if it doesn't exist.
     pub fn add_worker_set(&self, model_name: &str, namespace: &str, worker_set: WorkerSet) {
+        // Refuse to register a primary model under a name already claimed as an
+        // alias for a *different* model. `alias_to_primary` only ever holds
+        // alias→primary pairs where the key differs from the primary, so any
+        // hit here is a genuine collision: without this guard HTTP would
+        // canonicalize this name back to the other model while its WorkerSets
+        // live here. First claim wins.
+        if self.alias_to_primary.contains_key(model_name) {
+            tracing::warn!(
+                model_name,
+                "Name is already claimed as an alias for another model — skipping primary \
+                 registration. Rename the conflicting model or its alias."
+            );
+            return;
+        }
         let model = self.get_or_create_model(model_name);
         model.add_worker_set(namespace.to_string(), Arc::new(worker_set));
     }
@@ -228,35 +242,44 @@ impl ModelManager {
     /// alias conflicts in logs rather than discovering them by silent metric
     /// re-attribution.
     pub fn register_alias(&self, alias: &str, primary: &str) -> bool {
-        if let Some(existing) = self.alias_to_primary.get(alias) {
-            if existing.value() != primary {
-                tracing::warn!(
-                    alias,
-                    new_primary = primary,
-                    existing_primary = existing.value().as_str(),
-                    "Alias is already claimed by a different primary — refusing to overwrite. \
-                     Existing claim wins."
-                );
-                return false;
-            }
-            // Same alias→same primary — idempotent, no-op.
-            return true;
+        // Reject if a *real* primary model already owns this name (and it isn't
+        // already an alias). Checked before taking the alias entry so we never
+        // hold the alias-map shard lock across a models-map access.
+        if !self.alias_to_primary.contains_key(alias)
+            && self.models.get(alias).is_some_and(|model| !model.is_empty())
+        {
+            tracing::warn!(
+                alias,
+                primary,
+                "Alias collides with a registered primary model — refusing to register. \
+                 Choose a different alias or rename the conflicting model."
+            );
+            return false;
         }
 
-        if let Some(existing) = self.models.get(alias) {
-            if !existing.is_empty() {
-                tracing::warn!(
-                    alias,
-                    primary,
-                    "Alias collides with a registered primary model — refusing to register. \
-                     Choose a different alias or rename the conflicting model."
-                );
-                return false;
+        // Atomic claim via the entry API: two concurrent registrations for the
+        // same alias can't both win — the loser observes the existing claim
+        // instead of silently overwriting it.
+        match self.alias_to_primary.entry(alias.to_string()) {
+            Entry::Occupied(existing) => {
+                if existing.get() != primary {
+                    tracing::warn!(
+                        alias,
+                        new_primary = primary,
+                        existing_primary = existing.get().as_str(),
+                        "Alias is already claimed by a different primary — refusing to overwrite. \
+                         Existing claim wins."
+                    );
+                    return false;
+                }
+                // Same alias→same primary — idempotent, no-op.
+                true
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(primary.to_string());
+                true
             }
         }
-        self.alias_to_primary
-            .insert(alias.to_string(), primary.to_string());
-        true
     }
 
     /// Remove a previously registered alias mapping once the alias has no WorkerSets.
@@ -1720,6 +1743,22 @@ mod tests {
         assert!(!mm.register_alias("llama-alias", "llama"));
 
         assert_eq!(mm.resolve_canonical_name("llama-alias"), "llama-alias");
+    }
+
+    #[test]
+    fn test_add_worker_set_rejects_name_claimed_as_alias() {
+        // Reverse-order collision: model A claims alias "b", then model B tries
+        // to register "b" as its own primary. The primary registration must be
+        // rejected so requests for "b" keep canonicalizing to A rather than
+        // silently merging B's WorkerSet under the aliased name.
+        let mm = ModelManager::new();
+        assert!(mm.register_alias("b", "a"));
+
+        mm.add_worker_set("b", "ns1", make_worker_set("ns1", "abc"));
+
+        // "b" still resolves to A, and no primary WorkerSet was created for it.
+        assert_eq!(mm.resolve_canonical_name("b"), "a");
+        assert!(mm.get_model("b").map(|m| m.is_empty()).unwrap_or(true));
     }
 
     #[test]

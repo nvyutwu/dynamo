@@ -159,8 +159,11 @@ async fn handler_anthropic_messages(
     let request_id = get_or_create_request_id(&headers);
     let streaming = request.stream;
     let resolved_model = resolve_request_model(&request.model, template.as_ref());
+    // Canonicalize alias → primary for the metric label (see
+    // openai::chat_completions).
+    let canonical_model = state.manager().resolve_canonical_name(resolved_model);
     let cancellation_labels = CancellationLabels {
-        model: state.manager().metric_model_for(resolved_model).to_string(),
+        model: state.manager().metric_model_for(&canonical_model).to_string(),
         endpoint: Endpoint::AnthropicMessages.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
@@ -233,6 +236,14 @@ async fn anthropic_messages(
     // Strip Claude Code billing preamble from system prompt if enabled
     if state.strip_anthropic_preamble_enabled() {
         strip_billing_preamble(&mut request.system);
+    }
+
+    // Resolve an alias to its primary served name and rewrite the request so
+    // engine routing, metrics, and the response model all use the canonical
+    // primary (matching vLLM; see openai::chat_completions).
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical;
     }
 
     let model = request.model.clone();
@@ -595,12 +606,22 @@ fn model_env_overrides() -> (Option<u64>, Option<u64>) {
 }
 
 /// Resolve context_window for a model: env override takes precedence over MDC.
+///
+/// Alias entries have no card of their own (cards are keyed by the primary's
+/// display_name), so fall back to the primary's card so an alias reports the
+/// same context window as its primary.
 fn resolve_context_window(
+    state: &service_v2::State,
     model_name: &str,
     card_map: &std::collections::HashMap<String, u32>,
     env_override: Option<u64>,
 ) -> Option<u64> {
-    env_override.or_else(|| card_map.get(model_name).map(|&cl| cl as u64))
+    env_override.or_else(|| {
+        card_map
+            .get(model_name)
+            .or_else(|| card_map.get(&state.manager().resolve_canonical_name(model_name)))
+            .map(|&cl| cl as u64)
+    })
 }
 
 /// List all models. Returns Anthropic format when `anthropic-version` header
@@ -636,7 +657,7 @@ async fn list_models(
                     "type": "model",
                     "created_at": created_at,
                 });
-                if let Some(cw) = resolve_context_window(name, &card_map, cw_override) {
+                if let Some(cw) = resolve_context_window(&state, name, &card_map, cw_override) {
                     obj["max_input_tokens"] = serde_json::json!(cw);
                 }
                 if let Some(mot) = mot_override {
@@ -668,7 +689,7 @@ async fn list_models(
                 "created": created,
                 "owned_by": "nvidia",
             });
-            if let Some(cw) = resolve_context_window(name, &card_map, cw_override) {
+            if let Some(cw) = resolve_context_window(&state, name, &card_map, cw_override) {
                 obj["context_window"] = serde_json::json!(cw);
             }
             if let Some(mot) = mot_override {
@@ -714,7 +735,7 @@ async fn get_model(
         .as_secs();
     let card_map = build_model_context_map(&state);
     let (cw_override, mot_override) = model_env_overrides();
-    let context_window = resolve_context_window(model_id, &card_map, cw_override);
+    let context_window = resolve_context_window(&state, model_id, &card_map, cw_override);
 
     if headers.contains_key("anthropic-version") {
         let created_at = chrono::DateTime::from_timestamp(created as i64, 0)

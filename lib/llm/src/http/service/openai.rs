@@ -2528,7 +2528,14 @@ async fn list_models_openai(
     // is hidden until a peer joins.
     let models: HashSet<String> = state.manager().serving_ready_display_names();
     for model_name in models {
-        let context_window = cw_override.or_else(|| card_map.get(&model_name).map(|&cl| cl as u64));
+        // Alias entries have no card of their own (keyed by the primary's
+        // display_name); fall back to the primary's context length.
+        let context_window = cw_override.or_else(|| {
+            card_map
+                .get(&model_name)
+                .or_else(|| card_map.get(&state.manager().resolve_canonical_name(&model_name)))
+                .map(|&cl| cl as u64)
+        });
         data.push(ModelListing {
             id: model_name.clone(),
             object: "model",
@@ -2696,9 +2703,13 @@ fn get_model_retrieve(
         .as_secs();
 
     let cards = state.manager().get_model_cards();
+    // Alias entries have no card of their own (cards are keyed by the primary's
+    // display_name); fall back to the primary's card so GET /v1/models/{alias}
+    // reports the same context_window as the list endpoint.
+    let canonical = state.manager().resolve_canonical_name(model_id);
     let context_length = cards
         .iter()
-        .find(|c| c.display_name == model_id)
+        .find(|c| c.display_name == model_id || c.display_name == canonical)
         .map(|c| c.effective_context_length() as u64);
     let context_window: Option<u64> = std::env::var("DYN_CONTEXT_WINDOW")
         .ok()
@@ -2782,6 +2793,10 @@ async fn images(
             dynamo_protocols::types::ImageModel::Other(s) => s.clone(),
         })
         .unwrap_or_else(|| "diffusion".to_string());
+
+    // Canonicalize alias → primary so readiness, engine routing, and metrics
+    // all use the primary served name (matching vLLM; see completions_single).
+    let model = state.manager().resolve_canonical_name(&model);
 
     // Per-model serving readiness gate (now that we have a resolved model
     // name string).
@@ -2893,10 +2908,16 @@ pub fn images_router(
 async fn videos(
     State(state): State<Arc<service_v2::State>>,
     headers: HeaderMap,
-    Json(request): Json<NvCreateVideoRequest>,
+    Json(mut request): Json<NvCreateVideoRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service or model is not ready
     check_ready(&state)?;
+    // Canonicalize alias → primary (see completions_single) so readiness,
+    // engine routing, metrics, and the response model all use the primary.
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical;
+    }
     check_model_serving_ready(&state, &request.model)?;
 
     let request_id = get_or_create_request_id(&headers);
@@ -3015,9 +3036,15 @@ async fn videos(
 async fn video_stream(
     State(state): State<Arc<service_v2::State>>,
     headers: HeaderMap,
-    Json(request): Json<NvCreateVideoRequest>,
+    Json(mut request): Json<NvCreateVideoRequest>,
 ) -> Result<Response, ErrorResponse> {
     check_ready(&state)?;
+    // Canonicalize alias → primary (see completions_single) so readiness,
+    // engine routing, metrics, and the response model all use the primary.
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical;
+    }
     check_model_serving_ready(&state, &request.model)?;
 
     let request_id = get_or_create_request_id(&headers);
@@ -3182,7 +3209,7 @@ pub fn videos_router(
 async fn audio_speech(
     State(state): State<Arc<service_v2::State>>,
     headers: HeaderMap,
-    Json(request): Json<NvCreateAudioSpeechRequest>,
+    Json(mut request): Json<NvCreateAudioSpeechRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     // (per-model readiness check is deferred until after we resolve the
@@ -3207,6 +3234,13 @@ async fn audio_speech(
             .next()
             .unwrap_or_default()
     });
+    // Canonicalize alias → primary (see completions_single) so engine routing,
+    // metrics, and the response model all use the primary. Preserve a None
+    // request model (the implicit-default path) as-is.
+    let model = state.manager().resolve_canonical_name(&model);
+    if request.model.is_some() {
+        request.model = Some(model.clone());
+    }
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
     // Per-model serving readiness gate (now that we have a resolved model
