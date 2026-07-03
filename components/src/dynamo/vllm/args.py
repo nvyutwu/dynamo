@@ -6,7 +6,6 @@ import ipaddress
 import json
 import logging
 import os
-import re
 import socket
 from typing import Any, Dict, Optional
 
@@ -23,6 +22,7 @@ from dynamo.common.configuration.groups.runtime_args import (
     DynamoRuntimeArgGroup,
     DynamoRuntimeConfig,
 )
+from dynamo.common.configuration.utils import split_served_model_names
 from dynamo.common.utils.runtime import parse_endpoint
 from dynamo.vllm.backend_args import DynamoVllmArgGroup, DynamoVllmConfig
 from dynamo.vllm.constants import DisaggregationMode
@@ -166,7 +166,7 @@ def update_dynamo_config_with_engine(
     """Update dynamo_config fields from engine_config and worker flags."""
 
     if getattr(engine_config, "served_model_name", None) is not None:
-        served_names = _split_served_model_names(engine_config.served_model_name)
+        served_names = split_served_model_names(engine_config.served_model_name)
         if served_names:
             primary, *aliases = served_names
             dynamo_config.served_model_name = primary
@@ -240,24 +240,6 @@ def update_dynamo_config_with_engine(
 
     # Clear connector list (no longer used for vLLM)
     dynamo_config.connector = []  # type: ignore[assignment]
-
-
-def _split_served_model_names(served_model_name: Any) -> list[str]:
-    """Return primary + aliases from vLLM's served_model_name representation."""
-    if served_model_name is None:
-        return []
-
-    if isinstance(served_model_name, str):
-        raw_names = [served_model_name]
-    else:
-        raw_names = [str(name) for name in served_model_name]
-
-    names: list[str] = []
-    for raw_name in raw_names:
-        names.extend(
-            name for name in re.split(r"[\s,]+", raw_name.strip()) if name
-        )
-    return names
 
 
 def update_engine_config_with_dynamo(

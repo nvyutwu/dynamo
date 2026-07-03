@@ -7,7 +7,6 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
 from typing import Any, Dict, Optional, Sequence
 
@@ -16,6 +15,7 @@ from dynamo.common.configuration.groups.runtime_args import (
     DynamoRuntimeArgGroup,
     DynamoRuntimeConfig,
 )
+from dynamo.common.configuration.utils import split_served_model_names
 from dynamo.common.utils.runtime import parse_endpoint
 from dynamo.trtllm.backend_args import DynamoTrtllmArgGroup, DynamoTrtllmConfig
 from dynamo.trtllm.constants import DisaggregationMode, Modality
@@ -174,23 +174,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     return config
 
 
-def _split_served_model_names(served_model_name: Any) -> list[str]:
-    if served_model_name is None:
-        return []
-
-    if isinstance(served_model_name, str):
-        raw_names = [served_model_name]
-    else:
-        raw_names = [str(name) for name in served_model_name]
-
-    names: list[str] = []
-    for raw_name in raw_names:
-        names.extend(
-            name for name in re.split(r"[\s,]+", raw_name.strip()) if name
-        )
-    return names
-
-
 def _normalize_served_model_name(config: Config) -> None:
     """Split a packed ``--served-model-name`` into the primary served name plus
     aliases.
@@ -202,7 +185,7 @@ def _normalize_served_model_name(config: Config) -> None:
     name — so multiple served names are supported here just as they are for
     vLLM and SGLang.
     """
-    names = _split_served_model_names(config.served_model_name)
+    names = split_served_model_names(config.served_model_name)
     if not names:
         config.served_model_name = None
         config.served_model_aliases = None

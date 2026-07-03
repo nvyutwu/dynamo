@@ -7,8 +7,7 @@ import argparse
 import dataclasses
 import logging
 import os
-import re
-from typing import Any, Optional
+from typing import Optional
 
 import huggingface_hub
 from vllm.transformers_utils.repo_utils import get_model_path
@@ -24,7 +23,11 @@ from dynamo.common.configuration.groups.runtime_args import (
     DynamoRuntimeArgGroup,
     DynamoRuntimeConfig,
 )
-from dynamo.common.configuration.utils import add_argument, add_negatable_bool_argument
+from dynamo.common.configuration.utils import (
+    add_argument,
+    add_negatable_bool_argument,
+    split_served_model_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -476,7 +479,7 @@ def parse_omni_args() -> OmniConfig:
     engine_args = OmniEngineArgs.from_cli_args(vllm_args)
 
     if getattr(engine_args, "served_model_name", None) is not None:
-        served_names = _split_served_model_names(engine_args.served_model_name)
+        served_names = split_served_model_names(engine_args.served_model_name)
         if served_names:
             primary, *aliases = served_names
             config.served_model_name = primary
@@ -492,20 +495,3 @@ def parse_omni_args() -> OmniConfig:
     config.engine_args = engine_args
     config.validate()
     return config
-
-
-def _split_served_model_names(served_model_name: Any) -> list[str]:
-    if served_model_name is None:
-        return []
-
-    if isinstance(served_model_name, str):
-        raw_names = [served_model_name]
-    else:
-        raw_names = [str(name) for name in served_model_name]
-
-    names: list[str] = []
-    for raw_name in raw_names:
-        names.extend(
-            name for name in re.split(r"[\s,]+", raw_name.strip()) if name
-        )
-    return names

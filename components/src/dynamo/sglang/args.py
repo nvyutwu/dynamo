@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 import os
-import re
 import socket
 import sys
 import tempfile
@@ -21,6 +20,7 @@ from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from dynamo.common.config_dump import register_encoder
 from dynamo.common.configuration.groups import DynamoRuntimeConfig
 from dynamo.common.configuration.groups.runtime_args import DynamoRuntimeArgGroup
+from dynamo.common.configuration.utils import split_served_model_names
 from dynamo.common.constants import DisaggregationMode
 from dynamo.common.model_fetch import fetch_model
 from dynamo.common.snapshot.lifecycle import (
@@ -148,15 +148,7 @@ def _split_served_model_names(
 
     No-op when only one name is given. Empty list when no names parse out.
     """
-    raw = parsed_args.served_model_name
-    if isinstance(raw, (list, tuple)):
-        # SGLang doesn't pass a list today, but be defensive.
-        names = [str(n).strip() for n in raw if str(n).strip()]
-    elif isinstance(raw, str):
-        names = [n for n in re.split(r"[\s,]+", raw.strip()) if n]
-    else:
-        names = []
-
+    names = split_served_model_names(parsed_args.served_model_name)
     if not names:
         return []
 
