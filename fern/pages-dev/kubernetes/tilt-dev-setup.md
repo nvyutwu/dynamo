@@ -33,7 +33,7 @@ workloads — while iterating on controller logic with sub-second feedback.
 |------|---------|---------|
 | [Tilt](https://docs.tilt.dev/install.html) | v0.33+ | Development orchestration |
 | [Helm](https://helm.sh/docs/intro/install/) | v3 | Chart rendering |
-| [Go](https://go.dev/dl/) | 1.25+ | Compiling the operator |
+| [Go](https://go.dev/dl/) | 1.26.3+ | Compiling the operator |
 | [kubectl](https://kubernetes.io/docs/tasks/tools/) | — | Cluster access |
 | A Kubernetes cluster | — | kind, minikube, or remote cluster |
 
@@ -127,7 +127,7 @@ The operator image needs to be pullable by your cluster's nodes. The registry is
 1. **`REGISTRY` env var** — `REGISTRY=docker.io/myuser tilt up`
 2. **`registry` in `tilt-settings.yaml`**
 
-The image is pushed as `<registry>/controller:tilt-dev`.
+The image is pushed as `{registry}/controller:tilt-dev`.
 
 <Warning>
 If no registry is configured, the image is only available locally. This works
