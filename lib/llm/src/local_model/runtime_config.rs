@@ -10,7 +10,12 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use validator::{Validate, ValidationError};
 
-use dynamo_kv_router::protocols::KvTransferEnforcement;
+use dynamo_kv_router::{
+    protocols::KvTransferEnforcement,
+    router_hint::{
+        ROUTER_HINT_RUNTIME_CAPABILITY_KEY, ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY,
+    },
+};
 use dynamo_runtime::protocols::EndpointId;
 
 /// Re-export from parsers crate so that `ModelRuntimeConfig` can use it
@@ -330,6 +335,23 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
 
     fn total_kv_blocks(&self) -> Option<u64> {
         self.total_kv_blocks
+    }
+
+    fn supports_router_hints(&self) -> bool {
+        match self.runtime_data.get(ROUTER_HINT_RUNTIME_CAPABILITY_KEY) {
+            Some(serde_json::Value::Bool(true)) => true,
+            // Python ModelRuntimeConfig.set_engine_specific currently stores
+            // engine-specific values as strings.
+            Some(serde_json::Value::String(value)) => value == "true",
+            _ => false,
+        }
+    }
+
+    fn router_hint_source_control_endpoint(&self) -> Option<&str> {
+        self.runtime_data
+            .get(ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY)
+            .and_then(serde_json::Value::as_str)
+            .filter(|endpoint| !endpoint.is_empty())
     }
 
     fn native_offloading_capacity_tokens(&self) -> Option<u64> {
@@ -738,6 +760,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.native_offloading_capacity_tokens(), Some(300));
+    }
+
+    #[test]
+    fn router_hint_support_requires_explicit_true() {
+        use dynamo_kv_router::WorkerConfigLike;
+
+        let mut config = ModelRuntimeConfig::default();
+        assert!(!config.supports_router_hints());
+
+        config
+            .set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, true)
+            .unwrap();
+        assert!(config.supports_router_hints());
+
+        config
+            .set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, "true")
+            .unwrap();
+        assert!(config.supports_router_hints());
+
+        config
+            .set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, "false")
+            .unwrap();
+        assert!(!config.supports_router_hints());
+
+        assert!(config.router_hint_source_control_endpoint().is_none());
+        config
+            .set_engine_specific(
+                ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY,
+                "tcp://127.0.0.1:23280",
+            )
+            .unwrap();
+        assert_eq!(
+            config.router_hint_source_control_endpoint(),
+            Some("tcp://127.0.0.1:23280")
+        );
     }
 
     #[test]

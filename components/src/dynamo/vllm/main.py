@@ -46,6 +46,7 @@ from dynamo.llm import (
 )
 from dynamo.runtime import Endpoint
 from dynamo.runtime.logging import configure_dynamo_logging
+from dynamo.vllm.router_hints import enable_router_hint_support
 from dynamo.vllm.worker_factory import WorkerFactory
 
 from . import envs
@@ -671,6 +672,7 @@ async def register_vllm_model(
             (list of alternative AND-sets).
     """
     runtime_config = ModelRuntimeConfig()
+    enable_router_hint_support(runtime_config, config.engine_args)
     runtime_config.context_length = vllm_config.model_config.max_model_len
 
     # Get runtime configuration from vLLM engine

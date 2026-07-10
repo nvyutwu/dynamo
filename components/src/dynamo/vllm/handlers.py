@@ -83,6 +83,7 @@ from dynamo.vllm.kv_connector_protocols import (
     KvConnectorProtocol,
     make_kv_connector_protocol,
 )
+from dynamo.vllm.router_hints import enable_router_hint_support
 
 from .args import Config
 from .cache_info import get_configured_kv_event_block_size
@@ -2251,6 +2252,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             }
 
                             runtime_config = ModelRuntimeConfig()
+                            enable_router_hint_support(
+                                runtime_config, self.config.engine_args
+                            )
                             runtime_config.context_length = self.model_max_len
                             runtime_config.tool_call_parser = (
                                 self.config.dyn_tool_call_parser

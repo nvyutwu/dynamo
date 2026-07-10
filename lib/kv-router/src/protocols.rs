@@ -181,6 +181,16 @@ pub trait WorkerConfigLike {
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
 
+    /// Whether this worker can consume router_hint extra args attached by the KV router.
+    fn supports_router_hints(&self) -> bool {
+        false
+    }
+
+    /// Advertised peer-control endpoint used as a router_hint source, if available.
+    fn router_hint_source_control_endpoint(&self) -> Option<&str> {
+        None
+    }
+
     /// Tokens retained by the backend's native KV offloading tier, if available.
     fn native_offloading_capacity_tokens(&self) -> Option<u64> {
         None

@@ -7,6 +7,7 @@ use dynamo_kv_router::{
     RouterConfigOverride,
     indexer::RoutingDecisionHashes,
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
+    router_hint::RouterHint,
     scheduling::{RequestLifecycleLease, RequestProgressUpdater, RoutingEligibility},
 };
 use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
@@ -30,6 +31,7 @@ pub(super) struct WorkerSelection {
     pub(super) resident_oracle_cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
+    pub(super) router_hint: Option<RouterHint>,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +107,7 @@ impl KvPushRouter {
                 eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens,
                 routing_hashes,
+                router_hint,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,
@@ -115,6 +118,7 @@ impl KvPushRouter {
                 resident_oracle_cached_tokens,
                 routing_hashes,
                 lifecycle,
+                router_hint,
             }),
             FindBestMatchOutcome::QueueRejected { rejection } => Err(rejection.into()),
         }
