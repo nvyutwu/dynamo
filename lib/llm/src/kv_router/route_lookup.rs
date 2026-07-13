@@ -8,7 +8,7 @@ use std::{
 
 use dynamo_kv_router::{
     SharedKvCache,
-    indexer::KvRouterError,
+    indexer::{KvRouterError, LowerTierQueryOptions},
     protocols::{LocalBlockHash, SharedCacheHits},
 };
 use tracing::Instrument;
@@ -49,6 +49,7 @@ pub(super) async fn query_tiered_matches(
     block_hashes: Vec<LocalBlockHash>,
     cache_namespace: Option<&str>,
     retain_block_hashes: bool,
+    retain_router_hint_chain: bool,
 ) -> Result<TieredLookupResult, KvRouterError> {
     if retain_block_hashes {
         let (tiered_matches, shared_cache_hits, indexer_duration, shared_cache_duration) =
@@ -59,6 +60,7 @@ pub(super) async fn query_tiered_matches(
                 block_size,
                 &block_hashes,
                 cache_namespace,
+                retain_router_hint_chain,
             )
             .await?;
 
@@ -97,6 +99,7 @@ async fn query_retained(
     block_size: u32,
     block_hashes: &[LocalBlockHash],
     cache_namespace: Option<&str>,
+    retain_router_hint_chain: bool,
 ) -> Result<
     (
         TieredMatchDetails,
@@ -109,14 +112,24 @@ async fn query_retained(
     let Some(shared_cache) = shared_cache else {
         let t = Instant::now();
         let tiered = indexer
-            .find_matches_by_tier_ref(block_hashes)
+            .find_matches_by_tier_ref_with_options(
+                block_hashes,
+                LowerTierQueryOptions {
+                    retain_router_hint_chain,
+                },
+            )
             .instrument(tracing::info_span!("kv_router.find_matches"))
             .await?;
         return Ok((tiered, None, t.elapsed(), None));
     };
 
     let indexer_fut = indexer
-        .find_matches_by_tier_ref(block_hashes)
+        .find_matches_by_tier_ref_with_options(
+            block_hashes,
+            LowerTierQueryOptions {
+                retain_router_hint_chain,
+            },
+        )
         .instrument(tracing::info_span!("kv_router.find_matches"));
     join_indexer_and_shared_cache(
         indexer_fut,

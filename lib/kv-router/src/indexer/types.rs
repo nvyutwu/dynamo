@@ -229,6 +229,7 @@ impl From<WireLowerTierMatchDetails> for super::lower_tier::LowerTierMatchDetail
         Self {
             hits: w.hits.into_iter().collect(),
             next_continuations: Default::default(),
+            router_hint_root_candidates: None,
         }
     }
 }
