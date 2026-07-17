@@ -23,6 +23,8 @@ pub struct RouterHint {
     /// Root-aligned source-side KV block hashes. `block_hashes[i]`
     /// corresponds to request block `i`; the target decides which suffix to fetch.
     pub block_hashes: Vec<ExternalSequenceBlockHash>,
+    /// Router's view of the selected target's locally cached contiguous prefix.
+    pub target_cached_prefix_blocks: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub struct RouterHintRootCandidates {
 impl RouterHintRootCandidates {
     pub fn best_source<F>(
         &self,
+        prefix_blocks_to_beat: usize,
         mut is_eligible_source: F,
     ) -> Option<(WorkerWithDpRank, Vec<ExternalSequenceBlockHash>)>
     where
@@ -43,7 +46,9 @@ impl RouterHintRootCandidates {
             .owner_prefix_blocks
             .iter()
             .copied()
-            .filter(|(worker, blocks)| *blocks > 0 && is_eligible_source(*worker))
+            .filter(|(worker, blocks)| {
+                *blocks > prefix_blocks_to_beat && is_eligible_source(*worker)
+            })
             .max_by(|(left_worker, left_blocks), (right_worker, right_blocks)| {
                 left_blocks
                     .cmp(right_blocks)
@@ -72,7 +77,7 @@ mod tests {
             owner_prefix_blocks: vec![(worker_b, 2), (excluded, 3), (worker_a, 3)],
         };
 
-        let selected = candidates.best_source(|worker| worker != excluded);
+        let selected = candidates.best_source(0, |worker| worker != excluded);
 
         assert_eq!(
             selected,
@@ -94,6 +99,6 @@ mod tests {
             owner_prefix_blocks: vec![(WorkerWithDpRank::new(7, 0), 2)],
         };
 
-        assert!(candidates.best_source(|_| true).is_none());
+        assert!(candidates.best_source(0, |_| true).is_none());
     }
 }

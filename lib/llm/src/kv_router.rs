@@ -415,6 +415,7 @@ where
     fn router_hint_for_selection(
         &self,
         target: WorkerWithDpRank,
+        target_cached_prefix_blocks: u32,
         candidates: Option<&RouterHintRootCandidates>,
     ) -> Option<RouterHint> {
         if !self.kv_router_config.router_hints {
@@ -429,12 +430,18 @@ where
                 return None;
             }
 
-            let (source, block_hashes) = candidates.best_source(|worker| {
-                worker != target
-                    && configs.get(&worker.worker_id).is_some_and(|config| {
-                        config.router_hint_source_control_endpoint().is_some()
-                    })
-            })?;
+            let prefix_blocks_to_beat =
+                usize::try_from(target_cached_prefix_blocks).unwrap_or(usize::MAX);
+            let (source, block_hashes) =
+                candidates.best_source(prefix_blocks_to_beat, |worker| {
+                    worker != target
+                        && configs
+                            .get(&worker.worker_id)
+                            .is_some_and(|config| {
+                                config.supports_router_hints()
+                                    && config.router_hint_source_control_endpoint().is_some()
+                            })
+                })?;
             let source_control_endpoint = configs
                 .get(&source.worker_id)?
                 .router_hint_source_control_endpoint()?
@@ -449,6 +456,7 @@ where
         Some(RouterHint {
             source_control_endpoint,
             block_hashes,
+            target_cached_prefix_blocks,
         })
     }
 
@@ -760,8 +768,18 @@ where
             .lower_tier
             .get(&dynamo_kv_router::protocols::StorageTier::HostPinned)
             .and_then(|details| details.router_hint_root_candidates.as_ref());
-        let router_hint =
-            self.router_hint_for_selection(response.best_worker, router_hint_candidates);
+        let target_cached_prefix_blocks = tiered_matches
+            .device
+            .overlap_scores
+            .scores
+            .get(&response.best_worker)
+            .copied()
+            .unwrap_or(0);
+        let router_hint = self.router_hint_for_selection(
+            response.best_worker,
+            target_cached_prefix_blocks,
+            router_hint_candidates,
+        );
 
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);

@@ -457,6 +457,7 @@ mod tests {
         let hint = RouterHint {
             source_control_endpoint: "tcp://127.0.0.1:23280".to_string(),
             block_hashes: vec![ExternalSequenceBlockHash(11), ExternalSequenceBlockHash(22)],
+            target_cached_prefix_blocks: 0,
         };
 
         req.attach_router_hint(&hint).unwrap();
