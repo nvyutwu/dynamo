@@ -13,6 +13,8 @@ use dynamo_kv_router::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY: &str = "kv_transfer_params";
+
 use super::extensions::{AgentContext, RouterParams};
 use super::timing::RequestTracker;
 use super::{OutputOptions, SamplingOptions, StopConditions};
@@ -369,7 +371,15 @@ impl PreprocessedRequest {
     pub fn attach_router_hint(&mut self, hint: &RouterHint) -> serde_json::Result<()> {
         let hint_value = serde_json::to_value(hint)?;
         let mut map = extra_args_object(self.extra_args.take());
-        map.insert(ROUTER_HINT_EXTRA_ARGS_KEY.to_string(), hint_value);
+        let mut kv_transfer_params = match map.remove(KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY) {
+            Some(serde_json::Value::Object(params)) => params,
+            Some(_) | None => serde_json::Map::new(),
+        };
+        kv_transfer_params.insert(ROUTER_HINT_EXTRA_ARGS_KEY.to_string(), hint_value);
+        map.insert(
+            KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY.to_string(),
+            serde_json::Value::Object(kv_transfer_params),
+        );
         self.extra_args = Some(serde_json::Value::Object(map));
         Ok(())
     }
@@ -451,13 +461,16 @@ mod tests {
             .stop_conditions(StopConditions::default())
             .sampling_options(SamplingOptions::default())
             .output_options(OutputOptions::default())
-            .extra_args(Some(serde_json::json!({"caller": "kept"})))
+            .extra_args(Some(serde_json::json!({
+                "caller": "kept",
+                "kv_transfer_params": {"existing": "kept"}
+            })))
             .build()
             .unwrap();
         let hint = RouterHint {
             source_control_endpoint: "tcp://127.0.0.1:23280".to_string(),
             block_hashes: vec![ExternalSequenceBlockHash(11), ExternalSequenceBlockHash(22)],
-            target_cached_prefix_blocks: 0,
+            target_cached_prefix_blocks: 1,
         };
 
         req.attach_router_hint(&hint).unwrap();
@@ -465,13 +478,66 @@ mod tests {
         let extra_args = req.extra_args.unwrap();
         assert_eq!(extra_args["caller"], "kept");
         assert_eq!(
-            extra_args[ROUTER_HINT_EXTRA_ARGS_KEY]["source_control_endpoint"],
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY]["existing"],
+            "kept"
+        );
+        assert_eq!(
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["source_control_endpoint"],
             "tcp://127.0.0.1:23280"
         );
         assert_eq!(
-            extra_args[ROUTER_HINT_EXTRA_ARGS_KEY]["block_hashes"],
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["block_hashes"],
             serde_json::json!([11, 22])
         );
+        assert_eq!(
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["target_cached_prefix_blocks"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn attach_router_hint_replaces_non_object_kv_transfer_params() {
+        use dynamo_kv_router::{
+            protocols::ExternalSequenceBlockHash,
+            router_hint::{ROUTER_HINT_EXTRA_ARGS_KEY, RouterHint},
+        };
+
+        for invalid_params in [
+            serde_json::Value::Null,
+            serde_json::json!("invalid"),
+            serde_json::json!(["invalid"]),
+        ] {
+            let mut req = PreprocessedRequest::builder()
+                .model("t".to_string())
+                .token_ids(vec![1])
+                .stop_conditions(StopConditions::default())
+                .sampling_options(SamplingOptions::default())
+                .output_options(OutputOptions::default())
+                .extra_args(Some(serde_json::json!({
+                    "caller": "kept",
+                    "kv_transfer_params": invalid_params
+                })))
+                .build()
+                .unwrap();
+            let hint = RouterHint {
+                source_control_endpoint: "tcp://127.0.0.1:23280".to_string(),
+                block_hashes: vec![ExternalSequenceBlockHash(33)],
+                target_cached_prefix_blocks: 2,
+            };
+
+            req.attach_router_hint(&hint).unwrap();
+
+            let extra_args = req.extra_args.unwrap();
+            assert_eq!(extra_args["caller"], "kept");
+            assert_eq!(
+                extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["block_hashes"],
+                serde_json::json!([33])
+            );
+            assert_eq!(
+                extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["target_cached_prefix_blocks"],
+                serde_json::json!(2)
+            );
+        }
     }
 
     #[test]
