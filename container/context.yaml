@@ -61,7 +61,14 @@ vllm:
     base_image: nvcr.io/nvidia/cuda-dl-base
     runtime_image: vllm/vllm-openai
     base_image_tag: 25.11-cuda13.0-devel-ubuntu24.04
-    runtime_image_tag: v0.25.1-ubuntu2404
+    # Bumped v0.25.1 -> v0.26.0 for OakHaven: v0.26.0 carries vLLM PR #28787 (80b6080d,
+    # "Fix async scheduling + chunked prefill + preemption"), which fixes the
+    # gpu_model_runner._update_states KeyError that crashed the borrowed K3 dev image
+    # (vLLM 13c59a3d, stuck in the #27756..#28787 buggy window). See
+    # runs/OakHaven/serve/build_fixed_image.md + spinup_results.md.
+    # NB: -ubuntu2404 (not -cu129) keeps CUDA-13 consistency with base_image_tag above;
+    # v0.26.0-cu129 (CUDA 12.9) also exists (arm64) but would mismatch the cuda13 build base.
+    runtime_image_tag: v0.26.0-ubuntu2404
     # Baseline is vllm-openai's TRUE base, nvidia/cuda:13.0.2-base-ubuntu24.04
     # (Docker Hub), NOT a self-baseline of the third-party vllm/vllm-openai image.
     # vllm-openai is built FROM nvidia/cuda, so this attributes everything vLLM

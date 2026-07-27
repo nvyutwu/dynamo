@@ -1,0 +1,34 @@
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index bcd2576b74..bead0b701b 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -281,6 +281,11 @@ class Qwen3_5Model(Qwen3NextModel):
+ class Qwen3_5ForCausalLMBase(
+     nn.Module,
+     HasInnerState,
++    # Mark the text-only causal LM as hybrid so is_hybrid is True for a bare
++    # Qwen3_5MoeForCausalLM checkpoint; without it the model loads but the
++    # Mamba/GDN align + hybrid-cache path never triggers. The class already
++    # implements the required get_mamba_state_{shape,dtype}_from_config.
++    IsHybrid,
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsPP,
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index d28aac974b..6271a534b9 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -109,6 +109,13 @@ _TEXT_GENERATION_MODELS = {
+     "Gemma3nForCausalLM": ("gemma3n", "Gemma3nForCausalLM"),
+     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
+     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
++    # Register the text-only Qwen3.5-MoE causal LM. The class exists in qwen3_5.py
++    # but is only wired as the language_model submodule of the multimodal
++    # Qwen3_5MoeForConditionalGeneration, so a text-only checkpoint declaring
++    # architectures=["Qwen3_5MoeForCausalLM"] (model_type qwen3_5_moe_text) is
++    # otherwise unloadable. Pairs with IsHybrid on Qwen3_5ForCausalLMBase.
++    "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
++    "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
+     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
+     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
+     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),
