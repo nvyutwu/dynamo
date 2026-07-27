@@ -3,47 +3,43 @@
 # runtime, on the v0.26.0 pin in container/context.yaml), then layer this.
 #
 #   docker buildx build --platform linux/arm64 \
-#     --build-arg BASE=<acr>/dynamo:oakhaven-vllm-v0.26.0-base-arm64 \
+#     --build-arg BASE=<registry>/dynamo:oakhaven-vllm-v0.26.0-base-arm64 \
 #     -f container/Dockerfile.oakhaven \
-#     -t <acr>/dynamo:oakhaven-vllm-v0.26.0-arm64 --push container/
+#     -t <registry>/dynamo:oakhaven-vllm-v0.26.0-arm64 --push container/
 #
 # WHY: OakHaven's checkpoint is architectures=["Qwen3_5MoeForCausalLM"] / model_type
 # qwen3_5_moe_text (flat, text-only). vLLM v0.26.0 registers only the multimodal
 # Qwen3_5MoeForConditionalGeneration, so `vllm serve` fails "architecture not supported".
-# The 12-line patch registers the text arch + marks Qwen3_5ForCausalLMBase IsHybrid (so the
-# Mamba/GDN `align` + hybrid-KV path triggers). qwen3.5-397b/122b need NONE of this (native).
-# See container/patches/oakhaven/README.md and runs/OakHaven/patches/.
+# The patch registers the text arch + marks Qwen3_5ForCausalLMBase IsHybrid (so the Mamba/GDN
+# `align` + hybrid-KV path triggers). qwen3.5-397b/122b need NONE of this (native).
+#
+# METHOD: full-file copy (NOT `git apply`) — the vLLM/Dynamo runtime images ship no `git` or
+# `patch` binary (verified on vllm/vllm-openai:v0.26.0). The vendored files are cut from the
+# v0.26.0 base (registry.py + the 2-line add; qwen3_5.py unchanged v0.26.0->main), so copying
+# them over stock v0.26.0 is exact. The RUN self-verifies the arch marker, so any base drift
+# fails the build loudly. See container/patches/oakhaven/{README.md,qwen3_5-moe-text-causal-arch.patch}.
 ARG BASE
 FROM ${BASE}
 
 USER root
-COPY patches/oakhaven /tmp/oakhaven-patch
+COPY patches/oakhaven/vllm_v0.26.0/vllm/model_executor/models/qwen3_5.py  /tmp/oak/qwen3_5.py
+COPY patches/oakhaven/vllm_v0.26.0/vllm/model_executor/models/registry.py /tmp/oak/registry.py
 
-# Prefer the 12-line patch (clean, minimal); fall back to the full-file overlay if the base's
-# qwen3_5.py/registry.py drifted from the v0.26.0 cut. Then SELF-VERIFY (in-image marker):
-# fail the build loudly if the text-causal arch is not registered + hybrid.
 RUN set -eu; \
     VDIR="$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"; \
-    SITE="$(dirname "$VDIR")"; \
-    echo "vllm site-packages: $SITE"; \
-    if (cd "$SITE" && git apply -p1 --verbose /tmp/oakhaven-patch/qwen3_5-moe-text-causal-arch.patch 2>/dev/null \
-                   || patch -p1 -d "$SITE" < /tmp/oakhaven-patch/qwen3_5-moe-text-causal-arch.patch); then \
-        echo "OakHaven arch: applied via patch"; \
-    else \
-        echo "OakHaven arch: patch did not apply cleanly — falling back to full-file overlay"; \
-        install -m0644 /tmp/oakhaven-patch/vllm_v0.26.0/vllm/model_executor/models/qwen3_5.py  "$VDIR/model_executor/models/qwen3_5.py"; \
-        install -m0644 /tmp/oakhaven-patch/vllm_v0.26.0/vllm/model_executor/models/registry.py "$VDIR/model_executor/models/registry.py"; \
-    fi; \
+    echo "vllm package: $VDIR"; \
+    install -m0644 /tmp/oak/qwen3_5.py  "$VDIR/model_executor/models/qwen3_5.py"; \
+    install -m0644 /tmp/oak/registry.py "$VDIR/model_executor/models/registry.py"; \
+    rm -rf /tmp/oak; \
     python3 - <<'PY'
 from vllm.model_executor.models.registry import ModelRegistry as M
 archs = set(M.get_supported_archs())
 assert "Qwen3_5MoeForCausalLM" in archs, "OakHaven marker FAILED: Qwen3_5MoeForCausalLM not registered"
-# import the module to catch any syntax/attr breakage introduced by the overlay
 import importlib
-importlib.import_module("vllm.model_executor.models.qwen3_5")
+m = importlib.import_module("vllm.model_executor.models.qwen3_5")
+assert hasattr(m, "Qwen3_5MoeForCausalLM"), "OakHaven marker FAILED: class missing"
 print("OakHaven marker OK: Qwen3_5MoeForCausalLM registered + qwen3_5 imports")
 PY
-RUN rm -rf /tmp/oakhaven-patch
 
-# Restore the base image's user (Dynamo runtime runs as non-root `dynamo`, UID 1000).
+# Restore the base image's non-root user (Dynamo runtime runs as `dynamo`, UID 1000).
 USER 1000
