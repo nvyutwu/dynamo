@@ -573,6 +573,16 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // Cross-field validation
         validate::validate_n_with_temperature(self.inner.n, self.inner.temperature)?;
 
+        // Kimi K3: reject non-default values for the pinned sampling params (400).
+        // No-op unless DYN_KIMI_K3_IMMUTABLE_PARAMS is set on the K3 deployment.
+        validate::validate_kimi_k3_immutable_params(
+            self.inner.temperature,
+            self.inner.top_p,
+            self.inner.presence_penalty,
+            self.inner.frequency_penalty,
+            self.inner.n,
+        )?;
+
         Ok(())
     }
 }

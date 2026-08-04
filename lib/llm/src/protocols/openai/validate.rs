@@ -113,6 +113,13 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy(DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS));
 
+/// True when this frontend serves Kimi K3, which pins several sampling params
+/// to fixed values (Moonshot Kimi-Vendor-Verifier `tests/params`). Set on the
+/// K3 deployment only; the Dynamo frontend is deployed per-model so this cannot
+/// affect other models' frontends.
+static KIMI_K3_IMMUTABLE_PARAMS: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_IMMUTABLE_PARAMS"));
+
 /// Validates that no unsupported fields are present in the request.
 ///
 /// Fields in `PASSTHROUGH_EXTRA_FIELDS` are validated by downstream handlers.
@@ -392,6 +399,58 @@ pub fn validate_n_with_temperature(
     Ok(())
 }
 
+/// Enforces the Kimi K3 immutable-parameter contract.
+///
+/// K3 pins several sampling parameters; a request that overrides any of them
+/// must be rejected with HTTP 400 (the error names the offending parameter).
+/// Only enforced when `DYN_KIMI_K3_IMMUTABLE_PARAMS` is truthy, so other models
+/// served by a different frontend deployment are unaffected.
+///
+/// Accepted values are derived from the vendor verifier's `tests/params`:
+/// - `temperature` is accepted in `[0.0, 1.0]` (the verifier accepts 0.0/0.6/1.0
+///   across thinking/non-thinking modes and rejects 1.1 / 2.0 / -0.1); it is a
+///   range rather than an exact 0.6 match for that reason.
+/// - `top_p` must be `0.95`.
+/// - `presence_penalty` and `frequency_penalty` must be `0`.
+/// - `n` must be `1`.
+pub fn validate_kimi_k3_immutable_params(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    n: Option<u8>,
+) -> Result<(), anyhow::Error> {
+    if !*KIMI_K3_IMMUTABLE_PARAMS {
+        return Ok(());
+    }
+    if let Some(t) = temperature
+        && !(0.0..=1.0).contains(&t)
+    {
+        anyhow::bail!("`temperature` must be between 0.0 and 1.0 for this model, got {}", t);
+    }
+    if let Some(p) = top_p
+        && p != 0.95
+    {
+        anyhow::bail!("`top_p` is immutable for this model and must be 0.95, got {}", p);
+    }
+    if let Some(v) = presence_penalty
+        && v != 0.0
+    {
+        anyhow::bail!("`presence_penalty` is immutable for this model and must be 0, got {}", v);
+    }
+    if let Some(v) = frequency_penalty
+        && v != 0.0
+    {
+        anyhow::bail!("`frequency_penalty` is immutable for this model and must be 0, got {}", v);
+    }
+    if let Some(v) = n
+        && v != 1
+    {
+        anyhow::bail!("`n` is immutable for this model and must be 1, got {}", v);
+    }
+    Ok(())
+}
+
 /// Validates model parameter
 pub fn validate_model(model: &str) -> Result<(), anyhow::Error> {
     if model.trim().is_empty() {
@@ -479,6 +538,14 @@ pub fn validate_messages(
                     ),
                 )?;
             }
+        }
+        // A `tool` role message must carry a non-empty `tool_call_id` binding it
+        // to a prior assistant tool call. A missing key already fails
+        // deserialization (400); this additionally rejects an empty-string id.
+        if let dynamo_protocols::types::ChatCompletionRequestMessage::Tool(tool) = message
+            && tool.tool_call_id.trim().is_empty()
+        {
+            anyhow::bail!("`messages[{message_index}].tool_call_id` is required for a tool message");
         }
     }
     Ok(())

@@ -1250,6 +1250,11 @@ async fn handler_chat_completions(
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
+    // Kimi K3 "dynamically loaded tools": hoist any `messages[].tools` (a Moonshot
+    // extension not part of the OpenAI message schema, silently dropped by typed
+    // parse) into the top-level `tools` array BEFORE deserialization. No-op when
+    // no message carries `tools`.
+    let body = hoist_dynamic_message_tools(&body)?;
     let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
 
     // return a 503 if the service is not ready (process-level + per-model
@@ -1361,6 +1366,135 @@ where
         "Accepted request after replacing invalid UTF-8 and escaping unescaped control characters in JSON strings"
     );
     Ok(request)
+}
+
+/// Builds a 400 Bad Request error response with the given message, using the
+/// same `HttpError` path as the rest of request validation.
+fn bad_request(message: impl Into<String>) -> ErrorResponse {
+    ErrorMessage::from_http_error(HttpError {
+        code: 400,
+        message: message.into(),
+    })
+}
+
+/// Kimi K3 "dynamically loaded tools" (Moonshot Kimi-Vendor-Verifier
+/// `tests/k3_features/test_dynamic_tools.py`).
+///
+/// Tools may be declared inside a `system` message
+/// (`{"role":"system","content":"","tools":[<tool>]}`). This is not part of the
+/// standard OpenAI message schema, so the typed message struct drops it. K3's
+/// `apply_chat_template(..., tools=...)` renders the top-level `tools` list, so
+/// this hoists every `messages[].tools` up into the top-level `tools` array
+/// (order-preserving, de-duplicated by function name across dynamic + global)
+/// before the request is deserialized. Once hoisted, name/charset/length and
+/// parameters-object validation are handled by the standard `validate_tools`.
+///
+/// Enforces the K3 negative matrix directly (all → HTTP 400):
+/// - dynamic `tools` only allowed on a `system` message,
+/// - a `system` message with dynamic tools must have empty content,
+/// - `tools` must be an array of objects,
+/// - each tool must have `type == "function"` and a `function.name`,
+/// - no duplicate function names (within a message, across messages, or against
+///   a global/request-level tool).
+///
+/// Returns the (possibly rewritten) body, or the original bytes unchanged when
+/// no message carries `tools`.
+fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
+    let mut root: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        // Not valid JSON, or not an object at the top level: leave it for the
+        // typed parser to reject with its standard error.
+        Err(_) => return Ok(body.clone()),
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(body.clone());
+    };
+
+    // Seed the dedup set with any existing top-level (global) tool names.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
+        for tool in tools {
+            if let Some(name) = tool
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+            {
+                seen.insert(name.to_string());
+            }
+        }
+    }
+
+    let mut hoisted: Vec<serde_json::Value> = Vec::new();
+    if let Some(messages) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        for message in messages.iter_mut() {
+            let Some(map) = message.as_object_mut() else {
+                continue;
+            };
+            let Some(tools_val) = map.remove("tools") else {
+                continue; // no dynamic tools on this message
+            };
+
+            // Only the system role may declare dynamic tools.
+            if map.get("role").and_then(|v| v.as_str()) != Some("system") {
+                return Err(bad_request(
+                    "dynamic `tools` are only allowed in a system message",
+                ));
+            }
+            // Content must be absent/null/empty when dynamic tools are present.
+            let content_nonempty = match map.get("content") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(s)) => !s.is_empty(),
+                Some(_) => true,
+            };
+            if content_nonempty {
+                return Err(bad_request(
+                    "a system message with dynamic `tools` must have empty content",
+                ));
+            }
+            // `tools` must be an array.
+            let Some(arr) = tools_val.as_array() else {
+                return Err(bad_request("message `tools` must be an array"));
+            };
+            for tool in arr {
+                // Each item must be an object.
+                let Some(t) = tool.as_object() else {
+                    return Err(bad_request("each dynamic tool must be an object"));
+                };
+                // Must be a function tool.
+                if t.get("type").and_then(|v| v.as_str()) != Some("function") {
+                    return Err(bad_request("dynamic tool `type` must be \"function\""));
+                }
+                // Must carry a function name.
+                let name = tool
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| bad_request("dynamic tool missing `function.name`"))?;
+                // Reject duplicates (against global tools and earlier dynamic tools).
+                if !seen.insert(name.to_string()) {
+                    return Err(bad_request(format!("duplicate tool name: {name}")));
+                }
+                hoisted.push(tool.clone());
+            }
+        }
+    }
+
+    if hoisted.is_empty() {
+        // Nothing to change; return the original bytes untouched.
+        return Ok(body.clone());
+    }
+
+    let tools_entry = obj
+        .entry("tools")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    match tools_entry.as_array_mut() {
+        Some(arr) => arr.extend(hoisted),
+        // A non-array top-level `tools` is malformed; surface a 400 rather than
+        // silently discarding the hoisted dynamic tools.
+        None => return Err(bad_request("`tools` must be an array")),
+    }
+
+    let bytes = serde_json::to_vec(&root)
+        .map_err(|e| bad_request(format!("failed to rebuild request body: {e}")))?;
+    Ok(Bytes::from(bytes))
 }
 
 fn json_deserialize_error(error: serde_json::Error) -> ErrorResponse {
