@@ -2215,9 +2215,15 @@ impl OpenAIPreprocessor {
     /// Kimi K3 reports token usage on streaming responses by default, matching
     /// Moonshot's public API: the vendor `prompt_tokens` suite sends
     /// `stream=true` WITHOUT `stream_options.include_usage`, yet still expects
-    /// the terminal chunk to carry `usage.prompt_tokens`. Force `include_usage`
-    /// on for streaming K3 requests so the usage-only chunk is emitted to the
-    /// client. Non-streaming requests already force usage via
+    /// the terminal chunk to carry `usage.prompt_tokens`. Default `include_usage`
+    /// ON for streaming K3 requests so the usage-only chunk is emitted to the
+    /// client — UNLESS the client explicitly disabled it.
+    ///
+    /// `ChatCompletionStreamOptions::include_usage` is a required `bool` (no
+    /// serde default), so `stream_options == Some(_)` means the client set
+    /// `include_usage` explicitly (true or false); we leave that untouched and
+    /// only inject the default when `stream_options` was omitted entirely.
+    /// Non-streaming requests already force usage via
     /// `enable_usage_for_nonstreaming`, so this only touches streaming.
     fn force_kimi_k3_stream_usage(
         request: &mut NvCreateChatCompletionRequest,
@@ -2233,14 +2239,14 @@ impl OpenAIPreprocessor {
         if !uses_kimi_k3 {
             return;
         }
-        request
-            .inner
-            .stream_options
-            .get_or_insert_with(|| dynamo_protocols::types::ChatCompletionStreamOptions {
-                include_usage: true,
-                continuous_usage_stats: false,
-            })
-            .include_usage = true;
+        // Respect an explicit client choice; default ON only when unspecified.
+        if request.inner.stream_options.is_none() {
+            request.inner.stream_options =
+                Some(dynamo_protocols::types::ChatCompletionStreamOptions {
+                    include_usage: true,
+                    continuous_usage_stats: false,
+                });
+        }
     }
 
     fn mistral_reasoning_enabled(
