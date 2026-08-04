@@ -2212,6 +2212,37 @@ impl OpenAIPreprocessor {
         );
     }
 
+    /// Kimi K3 reports token usage on streaming responses by default, matching
+    /// Moonshot's public API: the vendor `prompt_tokens` suite sends
+    /// `stream=true` WITHOUT `stream_options.include_usage`, yet still expects
+    /// the terminal chunk to carry `usage.prompt_tokens`. Force `include_usage`
+    /// on for streaming K3 requests so the usage-only chunk is emitted to the
+    /// client. Non-streaming requests already force usage via
+    /// `enable_usage_for_nonstreaming`, so this only touches streaming.
+    fn force_kimi_k3_stream_usage(
+        request: &mut NvCreateChatCompletionRequest,
+        original_stream_flag: bool,
+        reasoning_parser: Option<&str>,
+        tool_call_parser: Option<&str>,
+    ) {
+        if !original_stream_flag {
+            return;
+        }
+        let uses_kimi_k3 = matches!(reasoning_parser, Some("kimi_k3" | "kimi-k3"))
+            || matches!(tool_call_parser, Some("kimi_k3" | "kimi-k3"));
+        if !uses_kimi_k3 {
+            return;
+        }
+        request
+            .inner
+            .stream_options
+            .get_or_insert_with(|| dynamo_protocols::types::ChatCompletionStreamOptions {
+                include_usage: true,
+                continuous_usage_stats: false,
+            })
+            .include_usage = true;
+    }
+
     fn mistral_reasoning_enabled(
         chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> bool {
@@ -6953,6 +6984,13 @@ impl
             thinking_control_from_client,
         );
         Self::normalize_kimi_k3_named_tool_choice(&mut request, self.tool_call_parser.as_deref());
+        // Kimi K3: emit stream usage by default (vendor prompt_tokens parity).
+        Self::force_kimi_k3_stream_usage(
+            &mut request,
+            original_stream_flag,
+            self.runtime_config.reasoning_parser.as_deref(),
+            self.tool_call_parser.as_deref(),
+        );
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
