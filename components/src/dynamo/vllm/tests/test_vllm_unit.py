@@ -1465,6 +1465,63 @@ def test_build_sampling_params_maps_guided_decoding(constraint_name, constraint_
 
 
 @pytest.mark.parametrize(
+    "guided_decoding",
+    [
+        pytest.param({}, id="empty"),
+        pytest.param(
+            {
+                "json": None,
+                "regex": None,
+                "choice": None,
+                "grammar": None,
+                "structural_tag": None,
+            },
+            id="all-none",
+        ),
+        pytest.param(
+            {"json": None, "whitespace_pattern": r"[\n ]*"},
+            id="whitespace-pattern-only",
+        ),
+    ],
+)
+def test_build_sampling_params_skips_empty_guided_decoding(guided_decoding):
+    """A forced tool_choice plus response_format clears `json` on the frontend and
+    can forward a guided_decoding dict with no constraint left; vLLM rejects an
+    all-None StructuredOutputsParams, so the worker must not build one."""
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {"guided_decoding": guided_decoding},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert sp.structured_outputs is None
+
+
+def test_build_sampling_params_maps_native_json_object():
+    from vllm.sampling_params import StructuredOutputsParams
+
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {"guided_decoding": {"json_object": True}},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert isinstance(sp.structured_outputs, StructuredOutputsParams)
+    assert sp.structured_outputs.json_object is True
+    assert sp.structured_outputs.json is None
+
+
+@pytest.mark.parametrize(
     "schema",
     [
         {"$ref": "#"},
