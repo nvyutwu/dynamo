@@ -1492,16 +1492,29 @@ fn resolve_asset_id(
     asset_root: &Path,
     allowed: &HashSet<String>,
 ) -> Option<String> {
-    if asset_id.is_empty() || !allowed.contains(asset_id) {
+    if asset_id.is_empty() {
         return None;
     }
-    let resolved = std::fs::canonicalize(asset_root.join(asset_id)).ok()?;
+    if !allowed.contains(asset_id) {
+        tracing::warn!(asset_id, "NVCF asset id not in the request allow-list (nvcf-input-asset-references)");
+        return None;
+    }
+    let candidate = asset_root.join(asset_id);
+    let resolved = match std::fs::canonicalize(&candidate) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(asset_id, path = %candidate.display(), error = %e, "NVCF asset not found under asset root");
+            return None;
+        }
+    };
     // Path-traversal guard: the resolved file must sit directly under the asset root.
     if resolved.parent() != Some(asset_root) || !resolved.is_file() {
+        tracing::warn!(asset_id, path = %resolved.display(), "NVCF asset escaped the asset root or is not a regular file");
         return None;
     }
     // Size guard before reading the whole file into memory.
     if std::fs::metadata(&resolved).ok()?.len() > MAX_INLINE_ASSET_BYTES {
+        tracing::warn!(asset_id, "NVCF asset exceeds the inline size cap");
         return None;
     }
     // Inline the bytes as a base64 data URI: the dynamo worker's ImageLoader decodes
@@ -1598,10 +1611,15 @@ fn materialize_nvcf_asset_refs(body: &Bytes, headers: &HeaderMap) -> Bytes {
         return body.clone();
     };
     let asset_dir = nvcf_asset_dir(headers);
-    let Ok(asset_root) = std::fs::canonicalize(&asset_dir) else {
-        return body.clone();
+    let asset_root = match std::fs::canonicalize(&asset_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(asset_dir = %asset_dir, error = %e, "NVCF asset path engaged (ids header present) but the asset dir does not exist; set DYN_NVCF_ASSET_DIR on the frontend if NVCF mounts assets elsewhere");
+            return body.clone();
+        }
     };
     if !asset_root.is_dir() {
+        tracing::warn!(asset_dir = %asset_root.display(), "NVCF asset dir is not a directory");
         return body.clone();
     }
     let allowed: HashSet<String> = ids_hdr
@@ -1618,8 +1636,10 @@ fn materialize_nvcf_asset_refs(body: &Bytes, headers: &HeaderMap) -> Bytes {
     let mut changed = false;
     visit_nvcf_asset_strings(&mut payload, &asset_root, &allowed, &mut changed);
     if !changed {
+        tracing::warn!(asset_root = %asset_root.display(), ids = %ids_hdr, "NVCF asset path engaged but resolved 0 asset refs");
         return body.clone();
     }
+    tracing::debug!(asset_root = %asset_root.display(), "NVCF asset refs inlined as base64");
     serde_json::to_vec(&payload).map(Bytes::from).unwrap_or_else(|_| body.clone())
 }
 
