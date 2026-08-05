@@ -24,7 +24,6 @@ use axum::{
 use base64::Engine as _;
 use bytes::Bytes;
 use std::path::Path;
-use url::Url;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
@@ -1425,8 +1424,9 @@ fn is_valid_dynamic_tool_name(name: &str) -> bool {
 // URIs. vLLM's OpenAI server resolves these, but the dynamo path runs vLLM headless
 // (api_server_count=0), so that hook never fires — this frontend HTTP handler is the only
 // place with both the raw body and the NVCF headers. We resolve each allow-listed asset id
-// to a `file://` URI so the worker's media loader (run with `--allowed-local-media-path`
-// over the asset dir) can read it. Header-gated: no-op / byte-identical unless the NVCF
+// by reading the mounted file and inlining its bytes as a `data:<mime>;base64,...` URI,
+// which the dynamo worker decodes directly (it rejects `file://`). Header-gated: no-op /
+// byte-identical unless the NVCF
 // asset headers are present, so non-NVCF and non-asset requests are unaffected.
 const NVCF_ASSET_DIR_HEADERS: [&str; 2] = ["nvcf-input-asset-dir", "nvcf-asset-dir"];
 const NVCF_ASSET_IDS_HEADERS: [&str; 2] =
@@ -1464,7 +1464,17 @@ fn normalize_asset_id(value: &str) -> String {
     s.to_string()
 }
 
-fn resolve_asset_id(asset_id: &str, asset_root: &Path, allowed: &HashSet<String>) -> Option<String> {
+// Max asset we will inline as base64 into the request body — guards the HTTP handler
+// against a huge/hostile asset (the NVCF gateway already bounds upload size). Over this,
+// the ref is left unresolved (the worker then 4xx's, rather than us OOMing the frontend).
+const MAX_INLINE_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+
+fn resolve_asset_id(
+    asset_id: &str,
+    mime: &str,
+    asset_root: &Path,
+    allowed: &HashSet<String>,
+) -> Option<String> {
     if asset_id.is_empty() || !allowed.contains(asset_id) {
         return None;
     }
@@ -1473,7 +1483,16 @@ fn resolve_asset_id(asset_id: &str, asset_root: &Path, allowed: &HashSet<String>
     if resolved.parent() != Some(asset_root) || !resolved.is_file() {
         return None;
     }
-    Url::from_file_path(&resolved).ok().map(|u| u.to_string())
+    // Size guard before reading the whole file into memory.
+    if std::fs::metadata(&resolved).ok()?.len() > MAX_INLINE_ASSET_BYTES {
+        return None;
+    }
+    // Inline the bytes as a base64 data URI: the dynamo worker's ImageLoader decodes
+    // `data:<mime>;base64,...` directly but rejects `file://`. This == the validated
+    // base64-client path and needs no asset mount on the worker pod.
+    let bytes = std::fs::read(&resolved).ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{mime};base64,{b64}"))
 }
 
 /// Rewrite every `data:<image|video|audio>/<subtype>;asset_id,<id>` span in `s` to a
@@ -1502,7 +1521,7 @@ fn rewrite_asset_refs(s: &str, asset_root: &Path, allowed: &HashSet<String>) -> 
                 let id_end =
                     id_start + s[id_start..].find(is_asset_delim).unwrap_or(s.len() - id_start);
                 let asset_id = normalize_asset_id(&s[id_start..id_end]);
-                if let Some(uri) = resolve_asset_id(&asset_id, asset_root, allowed) {
+                if let Some(uri) = resolve_asset_id(&asset_id, mime, asset_root, allowed) {
                     out.push_str(&s[cursor..start]);
                     out.push_str(&uri);
                     cursor = id_end;
@@ -1548,11 +1567,12 @@ fn visit_nvcf_asset_strings(
     }
 }
 
-/// Resolve NVCF `asset_id` multimodal refs in the raw request body into local `file://`
+/// Inline NVCF `asset_id` multimodal refs in the raw request body as `data:<mime>;base64,...`
 /// URIs, using the gateway asset dir + allow-list headers. No-op (byte-identical) unless the
 /// NVCF asset headers are present and resolve; runs on the raw bytes before typed parse,
-/// mirroring `hoist_dynamic_message_tools`. The worker must run with `--allowed-local-media-path`
-/// covering the asset dir so its media loader can read the resulting `file://` URIs.
+/// mirroring `hoist_dynamic_message_tools`. Inlining (not `file://`) is required: the dynamo
+/// worker decodes `data:` but rejects local paths, and the frontend is the pod NVCF mounts
+/// the assets into — so no worker-side asset mount is needed.
 fn materialize_nvcf_asset_refs(body: &Bytes, headers: &HeaderMap) -> Bytes {
     if !has_nvcf_asset_headers(headers) {
         return body.clone();
@@ -1611,7 +1631,8 @@ mod nvcf_asset_tests {
         ));
         let out = materialize_nvcf_asset_refs(&body, &headers);
         let out = String::from_utf8(out.to_vec()).unwrap();
-        let expected = Url::from_file_path(root.join(asset)).unwrap().to_string();
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(b"PNGDATA");
+        let expected = format!("data:image/png;base64,{expected_b64}");
         assert!(out.contains(&expected), "expected {expected} in {out}");
         assert!(!out.contains("asset_id,"), "asset_id should be resolved: {out}");
 
