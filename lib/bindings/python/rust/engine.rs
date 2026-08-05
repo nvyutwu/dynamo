@@ -406,6 +406,37 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
                 .build();
         }
 
+        // vLLM raises `*ValidationError` (e.g. `VLLMValidationError: At most 8
+        // image(s) may be provided in one prompt.` from `--limit-mm-per-prompt`) for
+        // invalid client input. These are not ValueError/TypeError and carry no
+        // `.code`/`.status`, so without this they fall through to Unknown -> 500 and
+        // the reason is sanitized away. Emit a JSON-shaped 400 (like the http-like
+        // branch above) so the frontend forwards 400 + the message verbatim — see
+        // http::service::error::SanitizedError::for_backend_status (4xx is forwarded
+        // as-is, 5xx is sanitized).
+        let type_name = error
+            .get_type(py)
+            .getattr("__name__")
+            .ok()
+            .and_then(|n| n.extract::<String>().ok())
+            .unwrap_or_default();
+        if type_name.ends_with("ValidationError") {
+            let message = error
+                .value(py)
+                .str()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let json_msg = serde_json::json!({
+                "message": message,
+                "code": 400,
+            })
+            .to_string();
+            return DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                .message(json_msg)
+                .build();
+        }
+
         if error.is_instance_of::<pyo3::exceptions::PyGeneratorExit>(py) {
             return DynamoError::builder()
                 .error_type(ErrorType::Backend(BackendError::EngineShutdown))
@@ -742,5 +773,30 @@ impl AsyncEngine<ManyIn<PythonPayload>, ManyOut<PythonResponseItem>, Error>
 
         let response_stream = unbuffered_python_response_stream(stream, ctx.clone(), request_id);
         Ok(ResponseStream::new(response_stream, ctx))
+    }
+}
+
+#[cfg(test)]
+mod validation_error_tests {
+    use super::*;
+
+    pyo3::create_exception!(
+        validation_error_tests,
+        VLLMValidationError,
+        pyo3::exceptions::PyException
+    );
+
+    #[test]
+    fn worker_validation_error_maps_to_400_with_message() {
+        pyo3::prepare_freethreaded_python();
+        let error = VLLMValidationError::new_err("At most 8 images may be provided");
+        let mapped = map_python_exception(error);
+        assert!(matches!(
+            mapped.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        ));
+        let payload: serde_json::Value = serde_json::from_str(mapped.message()).unwrap();
+        assert_eq!(payload["code"], 400);
+        assert_eq!(payload["message"], "At most 8 images may be provided");
     }
 }
