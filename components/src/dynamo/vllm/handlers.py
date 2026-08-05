@@ -708,16 +708,32 @@ def build_sampling_params(
             sampling_options.update(passthrough_sampling_options)
     guided_decoding = sampling_options.get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
-        sampling_params.structured_outputs = StructuredOutputsParams(
+        # Constraint fields mirror vLLM StructuredOutputsParams.__post_init__:
+        # exactly one must be non-None. `whitespace_pattern` is a modifier, not a
+        # constraint, so it is excluded from the empty-case guard below.
+        structured_constraints = dict(
             json=guided_decoding.get("json"),
             regex=guided_decoding.get("regex"),
             choice=guided_decoding.get("choice"),
             grammar=guided_decoding.get("grammar"),
-            whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+            # response_format:json_object currently reaches the worker as `json`
+            # (a {"type": "object"} schema) from the dynamo frontend; also map the
+            # vLLM-native `json_object` key so a frontend that emits it directly
+            # is honored.
+            json_object=guided_decoding.get("json_object"),
             structural_tag=serialize_structural_tag(
                 guided_decoding.get("structural_tag")
             ),
         )
+        # Only build StructuredOutputsParams when at least one constraint is set.
+        # An all-None guided_decoding dict (seen with response_format:json_object
+        # + tool_choice:required) would otherwise trip vLLM's "none specified"
+        # __post_init__ check and 500.
+        if any(value is not None for value in structured_constraints.values()):
+            sampling_params.structured_outputs = StructuredOutputsParams(
+                whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+                **structured_constraints,
+            )
 
     # Apply remaining sampling_options
     for key, value in sampling_options.items():
