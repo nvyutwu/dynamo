@@ -205,6 +205,15 @@ pub fn validate_response_format(
                     "`response_format.json_schema.schema` is required when `response_format.type` is `json_schema`"
                 );
             }
+            // A present schema must be a JSON Schema object; a scalar/array
+            // (e.g. `"schema": "x"`) is rejected here with 400 so it never
+            // reaches the engine (which 500s) and so the streaming and
+            // non-streaming paths fail identically.
+            if !json_schema.schema.is_object() {
+                anyhow::bail!(
+                    "`response_format.json_schema.schema` must be a JSON Schema object"
+                );
+            }
             Ok(())
         }
     }
@@ -426,7 +435,7 @@ pub fn validate_kimi_k3_immutable_params(
     if let Some(t) = temperature
         && !(0.0..=1.0).contains(&t)
     {
-        anyhow::bail!("`temperature` must be between 0.0 and 1.0 for this model, got {}", t);
+        anyhow::bail!("`temperature` is immutable for this model and must be between 0.0 and 1.0, got {}", t);
     }
     if let Some(p) = top_p
         && p != 0.95

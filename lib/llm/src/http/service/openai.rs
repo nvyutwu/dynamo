@@ -1377,6 +1377,21 @@ fn bad_request(message: impl Into<String>) -> ErrorResponse {
     })
 }
 
+/// Moonshot's dynamic-tool name rule: the name must start with an ASCII letter
+/// or underscore, then contain only ASCII letters, digits, underscores, or
+/// dashes. This is stricter than dynamo's stock `validate_tools`, which permits
+/// a leading digit (e.g. `1bad_name`); Moonshot rejects that. Applied only to
+/// hoisted dynamic tools so top-level tool validation (and the 40/40 passing
+/// tool_call_json_schema suite) is unchanged.
+fn is_valid_dynamic_tool_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Kimi K3 "dynamically loaded tools" (Moonshot Kimi-Vendor-Verifier
 /// `tests/k3_features/test_dynamic_tools.py`).
 ///
@@ -1450,6 +1465,16 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
                     "a system message with dynamic `tools` must have empty content",
                 ));
             }
+            // Once `tools` is removed, this system message is deserialized like
+            // any other, and a system message requires `content`. The vendor
+            // omits `content` entirely (or sends null) alongside dynamic tools,
+            // so normalize it to an empty string here to keep it valid.
+            if !matches!(map.get("content"), Some(serde_json::Value::String(_))) {
+                map.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
             // `tools` must be an array.
             let Some(arr) = tools_val.as_array() else {
                 return Err(bad_request("message `tools` must be an array"));
@@ -1468,6 +1493,14 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
                     .pointer("/function/name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| bad_request("dynamic tool missing `function.name`"))?;
+                // Enforce Moonshot's dynamic-tool name rule (stricter than the
+                // stock charset check, which allows a leading digit).
+                if !is_valid_dynamic_tool_name(name) {
+                    return Err(bad_request(format!(
+                        "dynamic tool name \"{name}\" is invalid: must start with a letter or \
+                         underscore and contain only letters, digits, underscores, or dashes"
+                    )));
+                }
                 // Reject duplicates (against global tools and earlier dynamic tools).
                 if !seen.insert(name.to_string()) {
                     return Err(bad_request(format!("duplicate tool name: {name}")));
