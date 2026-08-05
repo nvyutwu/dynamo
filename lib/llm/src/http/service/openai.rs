@@ -1432,6 +1432,12 @@ const NVCF_ASSET_DIR_HEADERS: [&str; 2] = ["nvcf-input-asset-dir", "nvcf-asset-d
 const NVCF_ASSET_IDS_HEADERS: [&str; 2] =
     ["nvcf-input-asset-references", "nvcf-function-asset-ids"];
 const ASSET_ID_MARKER: &str = ";asset_id,";
+// NVCF does NOT reliably inject a `nvcf-input-asset-dir` request header, and clients cannot
+// set it (the gateway strips inbound `nvcf-*` headers). So resolve the asset mount dir from:
+// the header if present, else the operator-set env var, else the fixed NVCF convention path
+// (the same dir pure-vLLM reads via `--allowed-local-media-path /var/inf/inputAssets`).
+const ENV_NVCF_ASSET_DIR: &str = "DYN_NVCF_ASSET_DIR";
+const DEFAULT_NVCF_ASSET_DIR: &str = "/var/inf/inputAssets";
 
 fn is_asset_delim(c: char) -> bool {
     c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ',')
@@ -1447,8 +1453,19 @@ fn nvcf_header<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
     })
 }
 
-fn has_nvcf_asset_headers(headers: &HeaderMap) -> bool {
-    NVCF_ASSET_DIR_HEADERS.iter().any(|n| headers.contains_key(*n))
+// Engage the asset path when NVCF advertises input-asset ids for this request — the ids
+// header is what NVCF actually forwards (the dir header is not reliably injected).
+fn has_nvcf_asset_ids(headers: &HeaderMap) -> bool {
+    NVCF_ASSET_IDS_HEADERS.iter().any(|n| headers.contains_key(*n))
+}
+
+// Asset mount dir: gateway-provided header if present, else the operator env var, else the
+// fixed NVCF convention path.
+fn nvcf_asset_dir(headers: &HeaderMap) -> String {
+    if let Some(dir) = nvcf_header(headers, &NVCF_ASSET_DIR_HEADERS) {
+        return dir.to_string();
+    }
+    std::env::var(ENV_NVCF_ASSET_DIR).unwrap_or_else(|_| DEFAULT_NVCF_ASSET_DIR.to_string())
 }
 
 fn normalize_asset_id(value: &str) -> String {
@@ -1574,16 +1591,14 @@ fn visit_nvcf_asset_strings(
 /// worker decodes `data:` but rejects local paths, and the frontend is the pod NVCF mounts
 /// the assets into — so no worker-side asset mount is needed.
 fn materialize_nvcf_asset_refs(body: &Bytes, headers: &HeaderMap) -> Bytes {
-    if !has_nvcf_asset_headers(headers) {
+    if !has_nvcf_asset_ids(headers) {
         return body.clone();
     }
-    let (Some(asset_dir), Some(ids_hdr)) = (
-        nvcf_header(headers, &NVCF_ASSET_DIR_HEADERS),
-        nvcf_header(headers, &NVCF_ASSET_IDS_HEADERS),
-    ) else {
+    let Some(ids_hdr) = nvcf_header(headers, &NVCF_ASSET_IDS_HEADERS) else {
         return body.clone();
     };
-    let Ok(asset_root) = std::fs::canonicalize(asset_dir) else {
+    let asset_dir = nvcf_asset_dir(headers);
+    let Ok(asset_root) = std::fs::canonicalize(&asset_dir) else {
         return body.clone();
     };
     if !asset_root.is_dir() {
