@@ -911,8 +911,10 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
     ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
-        self.preprocess_request_with_options(request, tracker, PreprocessRequestOptions::default())
-            .await
+        let (preprocessed, annotations, prompt_injected_reasoning, _reported_prompt_tokens) = self
+            .preprocess_request_with_options(request, tracker, PreprocessRequestOptions::default())
+            .await?;
+        Ok((preprocessed, annotations, prompt_injected_reasoning))
     }
 
     async fn preprocess_request_with_options<
@@ -928,7 +930,12 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
         options: PreprocessRequestOptions,
-    ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
+    ) -> Result<(
+        PreprocessedRequest,
+        HashMap<String, String>,
+        bool,
+        Option<u32>,
+    )> {
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
         let preprocess_start = Instant::now();
         let mut builder = self.builder(request)?;
@@ -968,6 +975,14 @@ impl OpenAIPreprocessor {
                 .with_context(|| "Failed to gather tokens")?
         };
         TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
+
+        // Kimi K3 parity: the reported `prompt_tokens` excludes the trailing
+        // generation-prompt stub. Compute it here while the rendered prompt is
+        // in scope; `None` for every other model leaves the ISL unchanged.
+        let reported_prompt_tokens = self.kimi_k3_reported_prompt_tokens(
+            formatted_prompt.as_ref().map(RenderedPrompt::as_str),
+            token_ids.len(),
+        );
 
         let _mm_image_entries = self
             .gather_multi_modal_data(
@@ -1042,7 +1057,12 @@ impl OpenAIPreprocessor {
             preprocessed.stop_conditions.max_tokens = Some(max_tokens);
         }
 
-        Ok((preprocessed, annotations, prompt_injected_reasoning))
+        Ok((
+            preprocessed,
+            annotations,
+            prompt_injected_reasoning,
+            reported_prompt_tokens,
+        ))
     }
 
     pub fn builder<
@@ -3210,6 +3230,71 @@ impl OpenAIPreprocessor {
         }
     }
 
+    /// Kimi K3 reports `usage.prompt_tokens` as Moonshot tokenism's
+    /// `total_tokens - pending_tokens`: the trailing generation-prompt channel
+    /// stub the renderer appends (`<|open|>think<|sep|>` in thinking mode,
+    /// `<|open|>response<|sep|>` otherwise) is *pending*, not prompt. Dynamo's
+    /// rendered `token_ids` include that stub, so the value surfaced in
+    /// `usage.prompt_tokens` must exclude exactly the stub's tokens.
+    ///
+    /// This adjusts only the *reported* input length — the worker still receives
+    /// the full `token_ids`, so KV/prefix-cache, routing, and scheduling are
+    /// untouched. The stub length is measured from the actual rendered tail
+    /// (mirroring [`Self::prompt_injected_reasoning_start`]) and tokenized the
+    /// same way it entered `token_ids` (the markers are special tokens, the
+    /// channel name ordinary text), so it stays correct across thinking-on/off
+    /// rather than being a hardcoded constant. Returns `None` for non-K3 models
+    /// or when no generation-prompt stub is present (e.g.
+    /// `add_generation_prompt=false`), leaving the ISL unchanged.
+    fn kimi_k3_reported_prompt_tokens(
+        &self,
+        formatted_prompt: Option<&str>,
+        token_ids_len: usize,
+    ) -> Option<u32> {
+        if !matches!(
+            self.runtime_config.reasoning_parser.as_deref(),
+            Some("kimi_k3" | "kimi-k3")
+        ) {
+            return None;
+        }
+        let prompt = formatted_prompt.map(str::trim_end)?;
+
+        const OPEN: &str = "<|open|>";
+        const SEP: &str = "<|sep|>";
+        // The add_generation_prompt tail is the last segment emitted by
+        // dynamo_renderer's kimi_k3 `build_chat_segments`.
+        let channel = ["think", "response"]
+            .into_iter()
+            .find(|ch| prompt.ends_with(&format!("{OPEN}{ch}{SEP}")))?;
+
+        // Tokenize the stub exactly as it entered `token_ids`: OPEN and SEP are
+        // control (special) segments; the channel name is ordinary text. The
+        // measured length therefore equals the stub's contribution to the
+        // rendered token count.
+        let segments = [
+            crate::tokenizers::EncodeSegment {
+                text: OPEN.to_string(),
+                allow_special: true,
+            },
+            crate::tokenizers::EncodeSegment {
+                text: channel.to_string(),
+                allow_special: false,
+            },
+            crate::tokenizers::EncodeSegment {
+                text: SEP.to_string(),
+                allow_special: true,
+            },
+        ];
+        let stub_len = self
+            .tokenizer
+            .encode_segments(&segments)
+            .ok()?
+            .token_ids()
+            .len();
+
+        Some((token_ids_len as u32).saturating_sub(stub_len as u32))
+    }
+
     /// Check if reasoning parsing should be disabled based on per-request parameters.
     /// For kimi_k25/K3: disabled when chat_template_args contains "thinking": false.
     /// For Nemotron force-reasoning aliases: disabled when chat_template_args
@@ -3616,8 +3701,12 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning) = self
-            .preprocess_request_with_options(&request, tracker.as_deref(), preprocess_options)
+        let (mut common_request, annotations, prompt_injected_reasoning, reported_prompt_tokens) =
+            self.preprocess_request_with_options(
+                &request,
+                tracker.as_deref(),
+                preprocess_options,
+            )
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
@@ -3648,8 +3737,20 @@ impl
 
         // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
         if common_request.prompt_embeds.is_none() {
-            let isl = common_request.token_ids.len() as u32;
-            response_generator.update_isl(isl);
+            match reported_prompt_tokens {
+                // Kimi K3: report the tokenism-parity prompt length (full render
+                // minus the generation-prompt stub) and pin it so the worker's
+                // terminal `completion_usage` (which carries the full length)
+                // does not overwrite it.
+                Some(reported) => {
+                    response_generator.update_isl(reported);
+                    response_generator.set_authoritative_prompt_tokens(reported);
+                }
+                None => {
+                    let isl = common_request.token_ids.len() as u32;
+                    response_generator.update_isl(isl);
+                }
+            }
         }
 
         // repack the common completion request

@@ -52,6 +52,13 @@ pub struct DeltaGenerator {
     service_tier: Option<dynamo_protocols::types::ServiceTierResponse>,
     /// Tracks token usage for the completion request.
     usage: dynamo_protocols::types::CompletionUsage,
+    /// Frontend-authoritative prompt-token count that must survive the worker's
+    /// terminal `completion_usage` override. Set only when the frontend computes
+    /// a model-specific parity value (Kimi K3: Moonshot tokenism reports
+    /// `prompt_tokens` as `total - pending`, excluding the generation-prompt
+    /// stub). `None` preserves the default behavior of trusting the worker's
+    /// `completion_usage.prompt_tokens`.
+    authoritative_prompt_tokens: Option<u32>,
     /// Counter tracking the number of messages issued.
     msg_counter: u64,
     /// Configuration options for response generation.
@@ -71,6 +78,7 @@ impl DeltaGenerator {
             system_fingerprint: None,
             service_tier: None,
             usage,
+            authoritative_prompt_tokens: None,
             msg_counter: 0,
             options,
             tracker,
@@ -88,6 +96,14 @@ impl DeltaGenerator {
     /// * `isl` - Input Sequence Length. The number of prompt tokens used.
     pub fn update_isl(&mut self, isl: u32) {
         self.usage.prompt_tokens = isl;
+    }
+
+    /// Pin the reported prompt-token count so the worker's terminal
+    /// `completion_usage` does not overwrite a frontend-computed parity value.
+    /// Used by Kimi K3, whose reported `prompt_tokens` excludes the trailing
+    /// generation-prompt stub. See [`Self::authoritative_prompt_tokens`].
+    pub fn set_authoritative_prompt_tokens(&mut self, prompt_tokens: u32) {
+        self.authoritative_prompt_tokens = Some(prompt_tokens);
     }
 
     pub fn create_logprobs(
@@ -262,8 +278,13 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         // This is critical for prompt embeddings where prompt_tokens comes from
         // the embedding sequence length computed by the worker
         if let Some(completion_usage) = delta.completion_usage.as_ref() {
-            // Update prompt_tokens from worker if provided (e.g., for embeddings)
-            self.usage.prompt_tokens = completion_usage.prompt_tokens;
+            // Update prompt_tokens from worker if provided (e.g., for embeddings),
+            // unless the frontend pinned an authoritative model-parity value
+            // (Kimi K3 excludes the generation-prompt stub); the worker reports
+            // the full prompt length and would otherwise clobber it.
+            self.usage.prompt_tokens = self
+                .authoritative_prompt_tokens
+                .unwrap_or(completion_usage.prompt_tokens);
 
             // Propagate prompt token details if provided
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
