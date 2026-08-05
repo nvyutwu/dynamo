@@ -14,6 +14,8 @@
 //!
 //! Everything else imports from `dynamo_renderer` directly.
 
+use std::sync::LazyLock;
+
 use anyhow::{Context, Result};
 use minijinja::value::Value;
 
@@ -22,6 +24,18 @@ use dynamo_renderer::{
     PromptInput, RenderedPrompt, RenderedSegment, TextInput, TokenInput, deepseek_formatter_for,
     kimi_k3_formatter_for, may_be_fix_tool_schema,
 };
+use dynamo_runtime::config::env_is_truthy;
+
+/// Kimi K3 vendor-parity opt-in: when truthy, strip an empty/null tool
+/// `description` from the tool declaration. The upstream `may_be_fix_tool_schema`
+/// backfills `"description": ""` for tools declared without one (other chat
+/// templates concatenate it unconditionally and would fail on a null), but
+/// Moonshot's K3 reference omits an absent description — emitting `""` adds
+/// tokens and breaks `usage.prompt_tokens` parity. The flag is the K3 signal
+/// (this runs in the shared `tools()` path), so it is off by default and every
+/// other model is byte-identical to today.
+static STRIP_EMPTY_TOOL_DESCRIPTION: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_STRIP_EMPTY_TOOL_DESCRIPTION"));
 
 use crate::model_card::{ModelDeploymentCard, PromptFormatterArtifact};
 use crate::protocols::openai::{
@@ -233,6 +247,54 @@ pub(crate) fn normalize_tool_call_arguments(
     Ok(())
 }
 
+/// Post-`may_be_fix_tool_schema` policy: when `strip` is true, drop empty/null
+/// tool descriptions (K3 vendor parity); otherwise return the fixed tools Value
+/// untouched (the default for every model). `may_be_fix_tool_schema` yields a
+/// minijinja Value, so this round-trips through serde_json to edit the
+/// post-backfill data. Pure (flag passed in) so it is unit-testable without the
+/// process-global env read.
+fn apply_k3_tool_description_policy(fixed: Value, strip: bool) -> Value {
+    if !strip {
+        return fixed;
+    }
+    let Ok(mut fixed_json) = serde_json::to_value(&fixed) else {
+        return fixed;
+    };
+    strip_empty_tool_descriptions(&mut fixed_json);
+    Value::from_serialize(&fixed_json)
+}
+
+/// Remove a tool `description` that is empty (`""`) or null from each tool in a
+/// tools array, in place. Real, non-empty descriptions are kept verbatim and no
+/// other field is touched, so upstream key ordering is preserved. Handles both
+/// the Chat Completions shape (`description` under `function`) and the Responses
+/// tool shape (top-level `description`). See [`STRIP_EMPTY_TOOL_DESCRIPTION`].
+fn strip_empty_tool_descriptions(tools: &mut serde_json::Value) {
+    let Some(array) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in array {
+        if let Some(function) = tool
+            .get_mut("function")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            remove_empty_description(function);
+        }
+        if let Some(object) = tool.as_object_mut() {
+            remove_empty_description(object);
+        }
+    }
+}
+
+fn remove_empty_description(object: &mut serde_json::Map<String, serde_json::Value>) {
+    let is_empty = object
+        .get("description")
+        .is_some_and(|value| value.is_null() || value.as_str() == Some(""));
+    if is_empty {
+        object.remove("description");
+    }
+}
+
 impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
     fn model(&self) -> String {
         self.inner.model.clone()
@@ -249,13 +311,15 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
 
     fn tools(&self) -> Option<Value> {
         if self.inner.tools.is_none() {
-            None
-        } else {
-            // Try to fix the tool schema if it is missing type and properties
-            Some(may_be_fix_tool_schema(
-                serde_json::to_value(&self.inner.tools).unwrap(),
-            )?)
+            return None;
         }
+        // Try to fix the tool schema if it is missing type and properties. This
+        // also backfills `description: ""` for tools declared without one.
+        let fixed = may_be_fix_tool_schema(serde_json::to_value(&self.inner.tools).unwrap())?;
+        Some(apply_k3_tool_description_policy(
+            fixed,
+            *STRIP_EMPTY_TOOL_DESCRIPTION,
+        ))
     }
 
     fn tool_choice(&self) -> Option<Value> {
@@ -913,5 +977,101 @@ mod tests {
         assert!(segments[0].allow_special);
         assert_eq!(segments[1].text, "hello world");
         assert!(!segments[1].allow_special);
+    }
+}
+
+#[cfg(test)]
+mod k3_description_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn as_json(value: Value) -> serde_json::Value {
+        serde_json::to_value(&value).unwrap()
+    }
+
+    /// Shape as produced by `may_be_fix_tool_schema`: a tool declared without a
+    /// description has `"description": ""` backfilled.
+    fn backfilled_tools() -> serde_json::Value {
+        json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_desc",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "null_desc",
+                    "description": null,
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }
+        ])
+    }
+
+    // (a) flag on -> empty/null descriptions dropped; name/parameters/type kept.
+    #[test]
+    fn policy_on_strips_empty_and_null_descriptions_keeping_other_fields() {
+        let fixed = Value::from_serialize(&backfilled_tools());
+        let out = as_json(apply_k3_tool_description_policy(fixed, true));
+        let arr = out.as_array().unwrap();
+        for tool in arr {
+            let function = tool.get("function").unwrap();
+            assert!(
+                function.get("description").is_none(),
+                "empty/null description must be dropped: {tool}"
+            );
+            assert!(function.get("name").is_some(), "name retained");
+            assert!(function.get("parameters").is_some(), "parameters retained");
+            assert_eq!(tool.get("type").unwrap(), "function");
+        }
+        assert_eq!(arr[0]["function"]["name"], "no_desc");
+        assert_eq!(arr[1]["function"]["name"], "null_desc");
+    }
+
+    // (b) flag on -> a real description is kept verbatim.
+    #[test]
+    fn policy_on_keeps_real_description() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]);
+        let out = as_json(apply_k3_tool_description_policy(
+            Value::from_serialize(&tools),
+            true,
+        ));
+        assert_eq!(out[0]["function"]["description"], "Get weather");
+    }
+
+    // (c) flag off -> byte-identical to today; the backfilled empty description
+    // is preserved (no stripping).
+    #[test]
+    fn policy_off_preserves_empty_description() {
+        let out = as_json(apply_k3_tool_description_policy(
+            Value::from_serialize(&backfilled_tools()),
+            false,
+        ));
+        assert_eq!(out[0]["function"]["description"], "");
+    }
+
+    // Direct strip: null description dropped, top-level (Responses shape) covered.
+    #[test]
+    fn strip_drops_null_and_top_level_description() {
+        let mut tools = json!([
+            {"type": "function", "function": {"name": "a", "description": null, "parameters": {}}},
+            {"type": "function", "name": "b", "description": "", "parameters": {}}
+        ]);
+        strip_empty_tool_descriptions(&mut tools);
+        assert!(tools[0]["function"].get("description").is_none());
+        assert_eq!(tools[0]["function"]["name"], "a");
+        assert!(tools[1].get("description").is_none(), "top-level empty description dropped");
+        assert_eq!(tools[1]["name"], "b");
     }
 }
