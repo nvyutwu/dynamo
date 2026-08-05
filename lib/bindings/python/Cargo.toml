@@ -125,7 +125,7 @@ strip = false
 # needs its own copy of the root Cargo.toml patch. maturin builds from here,
 # so without it the wheel would link the crates.io versions instead.
 [patch.crates-io]
-dynamo-parsers = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
-dynamo-protocols = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
-dynamo-renderer = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
-dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
+dynamo-parsers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "34df761e5c48793e5f09aa7d5d26da53d6fd4c92" }
+dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "34df761e5c48793e5f09aa7d5d26da53d6fd4c92" }
+dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "34df761e5c48793e5f09aa7d5d26da53d6fd4c92" }
+dynamo-tokenizers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "34df761e5c48793e5f09aa7d5d26da53d6fd4c92" }
