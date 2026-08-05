@@ -3735,21 +3735,18 @@ impl
 
         let mut response_generator = Box::new(response_generator);
 
-        // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
+        // Update ISL only for text prompts (embeddings get sequence length from tensor shape).
+        // ISL stays the FULL token count for every internal/metric consumer
+        // (get_isl, trace input_tokens, Prometheus, KV/routing/scheduling).
         if common_request.prompt_embeds.is_none() {
-            match reported_prompt_tokens {
-                // Kimi K3: report the tokenism-parity prompt length (full render
-                // minus the generation-prompt stub) and pin it so the worker's
-                // terminal `completion_usage` (which carries the full length)
-                // does not overwrite it.
-                Some(reported) => {
-                    response_generator.update_isl(reported);
-                    response_generator.set_authoritative_prompt_tokens(reported);
-                }
-                None => {
-                    let isl = common_request.token_ids.len() as u32;
-                    response_generator.update_isl(isl);
-                }
+            let isl = common_request.token_ids.len() as u32;
+            response_generator.update_isl(isl);
+            // Kimi K3 only: the CLIENT-facing usage.prompt_tokens is the
+            // tokenism-parity value (full render minus the generation-prompt
+            // stub). This is applied solely at client serialization; it does not
+            // change the ISL above or any metric.
+            if let Some(client_prompt_tokens) = reported_prompt_tokens {
+                response_generator.set_client_prompt_tokens(client_prompt_tokens);
             }
         }
 

@@ -50,15 +50,18 @@ pub struct DeltaGenerator {
     system_fingerprint: Option<String>,
     /// Optional service tier information for the response.
     service_tier: Option<dynamo_protocols::types::ServiceTierResponse>,
-    /// Tracks token usage for the completion request.
+    /// Tracks token usage for the completion request. Always the FULL token
+    /// count — this is what every internal/metric consumer reads (`get_isl`,
+    /// trace `input_tokens`, Prometheus). It is never reduced.
     usage: dynamo_protocols::types::CompletionUsage,
-    /// Frontend-authoritative prompt-token count that must survive the worker's
-    /// terminal `completion_usage` override. Set only when the frontend computes
-    /// a model-specific parity value (Kimi K3: Moonshot tokenism reports
-    /// `prompt_tokens` as `total - pending`, excluding the generation-prompt
-    /// stub). `None` preserves the default behavior of trusting the worker's
-    /// `completion_usage.prompt_tokens`.
-    authoritative_prompt_tokens: Option<u32>,
+    /// CLIENT-ONLY override for the serialized `usage.prompt_tokens`. Set when
+    /// the frontend computes a model-specific parity value (Kimi K3: Moonshot
+    /// tokenism reports `prompt_tokens` as `total - pending`, excluding the
+    /// generation-prompt stub). Applied *only* where the OpenAI usage object is
+    /// emitted to the client (`client_usage` → `create_usage_chunk` /
+    /// continuous-usage `create_choice`); it never touches `self.usage`, so no
+    /// metric/trace/ISL consumer sees it. `None` = report the full count.
+    client_prompt_tokens: Option<u32>,
     /// Counter tracking the number of messages issued.
     msg_counter: u64,
     /// Configuration options for response generation.
@@ -78,7 +81,7 @@ impl DeltaGenerator {
             system_fingerprint: None,
             service_tier: None,
             usage,
-            authoritative_prompt_tokens: None,
+            client_prompt_tokens: None,
             msg_counter: 0,
             options,
             tracker,
@@ -98,12 +101,13 @@ impl DeltaGenerator {
         self.usage.prompt_tokens = isl;
     }
 
-    /// Pin the reported prompt-token count so the worker's terminal
-    /// `completion_usage` does not overwrite a frontend-computed parity value.
-    /// Used by Kimi K3, whose reported `prompt_tokens` excludes the trailing
-    /// generation-prompt stub. See [`Self::authoritative_prompt_tokens`].
-    pub fn set_authoritative_prompt_tokens(&mut self, prompt_tokens: u32) {
-        self.authoritative_prompt_tokens = Some(prompt_tokens);
+    /// Set the CLIENT-facing `usage.prompt_tokens` value (Kimi K3 tokenism
+    /// parity: full render minus the generation-prompt stub). This is applied
+    /// only when the OpenAI usage object is serialized to the client; the
+    /// internal `usage.prompt_tokens` / ISL / metrics keep the full count.
+    /// See [`Self::client_prompt_tokens`].
+    pub fn set_client_prompt_tokens(&mut self, prompt_tokens: u32) {
+        self.client_prompt_tokens = Some(prompt_tokens);
     }
 
     pub fn create_logprobs(
@@ -199,7 +203,7 @@ impl DeltaGenerator {
                 system_fingerprint: self.system_fingerprint.clone(),
                 choices,
                 usage: if self.options.enable_usage && self.options.continuous_usage_stats {
-                    Some(self.get_usage())
+                    Some(self.client_usage())
                 } else {
                     None
                 },
@@ -216,7 +220,7 @@ impl DeltaGenerator {
     /// # Returns
     /// * A [`CreateChatCompletionStreamResponse`] with empty choices and usage stats.
     pub fn create_usage_chunk(&self) -> NvCreateChatCompletionStreamResponse {
-        let usage = self.get_usage();
+        let usage = self.client_usage();
 
         NvCreateChatCompletionStreamResponse {
             inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
@@ -244,9 +248,27 @@ impl DeltaGenerator {
         self.options.continuous_usage_stats
     }
 
+    /// Internal usage snapshot — always the FULL prompt-token count. Read by the
+    /// metric/trace path (`LLMMetricAnnotation`, `record_llm_metric_tokens`) and
+    /// the completions endpoint. Never reduced.
     pub fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage {
         let mut usage = self.usage.clone();
         usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        usage
+    }
+
+    /// CLIENT-facing usage object: [`Self::get_usage`] with the K3 tokenism
+    /// parity override applied to `prompt_tokens` (and `total_tokens`) when set.
+    /// Used only by the client-emission paths (`create_usage_chunk`,
+    /// continuous-usage `create_choice`); the non-streaming aggregator reads
+    /// these emitted chunks, so both streaming and non-streaming clients see the
+    /// reduced value while every internal consumer keeps the full count.
+    fn client_usage(&self) -> dynamo_protocols::types::CompletionUsage {
+        let mut usage = self.get_usage();
+        if let Some(client_prompt_tokens) = self.client_prompt_tokens {
+            usage.prompt_tokens = client_prompt_tokens;
+            usage.total_tokens = client_prompt_tokens.saturating_add(usage.completion_tokens);
+        }
         usage
     }
 }
@@ -278,13 +300,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         // This is critical for prompt embeddings where prompt_tokens comes from
         // the embedding sequence length computed by the worker
         if let Some(completion_usage) = delta.completion_usage.as_ref() {
-            // Update prompt_tokens from worker if provided (e.g., for embeddings),
-            // unless the frontend pinned an authoritative model-parity value
-            // (Kimi K3 excludes the generation-prompt stub); the worker reports
-            // the full prompt length and would otherwise clobber it.
-            self.usage.prompt_tokens = self
-                .authoritative_prompt_tokens
-                .unwrap_or(completion_usage.prompt_tokens);
+            // Update prompt_tokens from worker if provided (e.g., for embeddings).
+            // This is the FULL count and stays authoritative for all internal /
+            // metric consumers; the Kimi K3 client-parity value is applied
+            // separately in `client_usage`, never here.
+            self.usage.prompt_tokens = completion_usage.prompt_tokens;
 
             // Propagate prompt token details if provided
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
