@@ -129,6 +129,35 @@ pub struct NvCreateChatCompletionRequest {
 }
 
 impl NvCreateChatCompletionRequest {
+    /// Read-only union of the tools this request effectively declares: top-level
+    /// `tools` first, then every `messages[].tools` (Kimi K3 dynamic tools on
+    /// `system`/`developer` messages) in message order.
+    ///
+    /// This mirrors what v6's HTTP-layer hoist produced (dynamic tools appended
+    /// to the top-level list) and is used ONLY for validation, tool-jail gating,
+    /// and guided-decode `tool_definitions`. It is NEVER written back to
+    /// `inner.tools`: the Kimi K3 renderer must keep reading dynamic tools solely
+    /// in place from the messages, or they would be declared twice and break the
+    /// `prompt_tokens` byte-parity with `encoding_k3.py`.
+    pub(crate) fn effective_tools(&self) -> Vec<dynamo_protocols::types::ChatCompletionTool> {
+        use dynamo_protocols::types::ChatCompletionRequestMessage as Msg;
+        let mut out: Vec<dynamo_protocols::types::ChatCompletionTool> = Vec::new();
+        if let Some(tools) = self.inner.tools.as_ref() {
+            out.extend(tools.iter().cloned());
+        }
+        for message in &self.inner.messages {
+            let message_tools = match message {
+                Msg::System(m) => m.tools.as_ref(),
+                Msg::Developer(m) => m.tools.as_ref(),
+                _ => None,
+            };
+            if let Some(tools) = message_tools {
+                out.extend(tools.iter().cloned());
+            }
+        }
+        out
+    }
+
     /// Normalize OpenAI-style DS-V4 reasoning controls into the template kwargs
     /// consumed by the SGLang/DeepSeek-V4 prompt formatter.
     pub fn normalize_reasoning_template_args(&mut self) -> anyhow::Result<()> {
@@ -662,8 +691,16 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for stream_options
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
-        validate::validate_tools(&self.inner.tools.as_deref())?;
-        validate::validate_tool_choice(&self.inner.tool_choice, self.inner.tools.as_deref())?;
+        // Validate against the effective tool set (top-level ∪ Kimi K3 dynamic
+        // `messages[].tools`) so dynamic-only requests get the same shape/name
+        // checks and `tool_choice=required`/named emptiness resolution v6's hoist
+        // gave them. `effective_tools` is a read-only view — `inner.tools` is not
+        // mutated, so the renderer still declares dynamic tools only in place.
+        let effective_tools = self.effective_tools();
+        let effective_tools_ref: Option<&[dynamo_protocols::types::ChatCompletionTool]> =
+            (!effective_tools.is_empty()).then_some(effective_tools.as_slice());
+        validate::validate_tools(&effective_tools_ref)?;
+        validate::validate_tool_choice(&self.inner.tool_choice, effective_tools_ref)?;
         // none for parallel_tool_calls
         validate::validate_user(self.inner.user.as_deref())?;
         // none for function call
@@ -964,6 +1001,50 @@ mod tests {
             err.to_string()
                 .contains("tool named \"search\" in tool_choice is not present in tools")
         );
+    }
+
+    #[test]
+    fn test_validate_tool_choice_required_accepts_dynamic_message_tools() {
+        // Route A: Kimi K3 dynamic tools live on `messages[].tools`, not
+        // top-level `tools`. `tool_choice=required` must resolve against the
+        // effective union, so a dynamic-only request is accepted (v6 parity —
+        // v6's hoist made these tools visible to validation).
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [{
+                    "type": "function",
+                    "function": {"name": "Calculator", "parameters": {"type": "object", "properties": {}}}
+                }]},
+                {"role": "user", "content": "compute 1+1"}
+            ],
+            "tool_choice": "required"
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request)
+            .expect("required tool_choice is satisfied by dynamic message tools");
+    }
+
+    #[test]
+    fn test_validate_tool_choice_named_accepts_dynamic_message_tool() {
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [{
+                    "type": "function",
+                    "function": {"name": "Calculator", "parameters": {"type": "object", "properties": {}}}
+                }]},
+                {"role": "user", "content": "compute"}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "Calculator"}}
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request)
+            .expect("named tool_choice resolves against dynamic message tools");
     }
 
     #[test]

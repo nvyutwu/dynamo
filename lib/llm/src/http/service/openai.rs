@@ -1726,6 +1726,19 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
                          underscore and contain only letters, digits, underscores, or dashes"
                     )));
                 }
+                // Enforce the function-name length limit. Under v6's hoist this
+                // was applied by `validate_tools` once the tool reached the
+                // top-level list; Route A no longer hoists, so restore it here
+                // (same limit + shape) so an over-long dynamic name is still a
+                // 400 (Kimi-Vendor-Verifier `too_long_257`).
+                let max_name_len = crate::protocols::openai::validate::MAX_FUNCTION_NAME_LENGTH;
+                if name.len() > max_name_len {
+                    return Err(bad_request(format!(
+                        "dynamic tool name exceeds {} character limit, got {} characters",
+                        max_name_len,
+                        name.len()
+                    )));
+                }
                 // Reject duplicates (against global tools and earlier dynamic tools).
                 if !seen.insert(name.to_string()) {
                     return Err(bad_request(format!("duplicate tool name: {name}")));
@@ -3973,6 +3986,39 @@ mod tests {
         assert_eq!(mixed["tools"].as_array().map(|a| a.len()), Some(1), "top-level tools not merged");
         assert_eq!(mixed["tools"][0]["function"]["name"], "weather");
         assert_eq!(mixed["messages"][0]["tools"][0]["function"]["name"], "calc");
+    }
+
+    #[test]
+    fn dynamic_tool_name_length_is_enforced_by_the_hoist() {
+        // Kimi-Vendor-Verifier `too_long_257`: Route A no longer hoists dynamic
+        // tools into the top-level list (where `validate_tools` used to catch an
+        // over-long name), so the hoist restores the length guard itself.
+        use crate::protocols::openai::validate::MAX_FUNCTION_NAME_LENGTH;
+
+        fn hoist_result(name: String) -> Result<Bytes, ErrorResponse> {
+            let body = serde_json::json!({
+                "model": "kimi-k3",
+                "messages": [
+                    {"role": "system", "tools": [{
+                        "type": "function",
+                        "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+                    }]},
+                    {"role": "user", "content": "hi"}
+                ]
+            });
+            hoist_dynamic_message_tools(&Bytes::from(serde_json::to_vec(&body).unwrap()))
+        }
+
+        // 257-char name -> 400.
+        let err = hoist_result("a".repeat(257)).expect_err("over-long name must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.0.message.contains("character limit"),
+            "unexpected error: {:?}",
+            err.1.0.message
+        );
+        // A name at the limit is accepted.
+        assert!(hoist_result("a".repeat(MAX_FUNCTION_NAME_LENGTH)).is_ok());
     }
     use crate::protocols::openai::completions::NvCreateCompletionRequest;
     use crate::protocols::openai::responses::NvCreateResponse;

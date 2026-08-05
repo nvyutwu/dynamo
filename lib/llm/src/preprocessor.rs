@@ -1228,7 +1228,11 @@ impl OpenAIPreprocessor {
             .tools()
             .as_ref()
             .and_then(|tools| tools.len())
-            .is_some_and(|len| len > 0);
+            .is_some_and(|len| len > 0)
+            // Kimi K3 declares dynamic tools inside `messages[].tools` rather than
+            // top-level `tools`; count those too so the tool-parser end-token
+            // handling matches a request that used top-level tools (v6 parity).
+            || Self::request_has_message_tools(request);
         let tool_choice_none = request
             .tool_choice()
             .as_ref()
@@ -1280,6 +1284,24 @@ impl OpenAIPreprocessor {
 
     fn should_keep_tool_parser_end_tokens_visible(has_tools: bool, tool_choice_none: bool) -> bool {
         has_tools && !tool_choice_none
+    }
+
+    /// True when any message carries a non-empty `tools` array (Kimi K3 dynamic
+    /// tools declared in a `system`/`developer` message). Generic over the
+    /// request trait via `messages()`, so it stays a read-only view — no coupling
+    /// to a concrete request type and no mutation of the request.
+    fn request_has_message_tools<R: OAIChatLikeRequest>(request: &R) -> bool {
+        let Ok(messages) = request.messages().try_iter() else {
+            return false;
+        };
+        for message in messages {
+            if let Ok(tools) = message.get_attr("tools")
+                && tools.len().is_some_and(|len| len > 0)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn remove_single_token_marker(
@@ -2437,12 +2459,13 @@ impl OpenAIPreprocessor {
             Box::pin(stream)
         };
 
-        // Check if tools are present and if we should apply jail
-        let has_tools = request
-            .inner
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty());
+        // Check if tools are present and if we should apply jail. Use the
+        // effective set (top-level ∪ Kimi K3 dynamic `messages[].tools`) so a
+        // dynamic-only request still applies the tool jail / guided decoding,
+        // matching v6's hoist. Read-only: `inner.tools` is never mutated (the
+        // renderer keeps declaring dynamic tools in place).
+        let effective_tools = request.effective_tools();
+        let has_tools = !effective_tools.is_empty();
 
         // K3's reasoning-only path still emits XTML response/message wrappers.
         // vLLM strips those in its K3 reasoner when no tool parser is active;
@@ -2463,17 +2486,21 @@ impl OpenAIPreprocessor {
             has_tools,
         )?;
 
-        // Convert OpenAI tools to parser ToolDefinition format before applying jail
-        let tool_definitions = request.inner.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                    name: tool.function.name.clone(),
-                    parameters: tool.function.parameters.clone(),
-                    strict: tool.function.strict,
-                })
-                .collect()
-        });
+        // Convert OpenAI tools to parser ToolDefinition format before applying
+        // jail. Built from the effective set (top-level first, then dynamic
+        // `messages[].tools` in message order — matching v6's hoist append order)
+        // so guided decoding can force a call to a dynamic tool.
+        let tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>> =
+            (!effective_tools.is_empty()).then(|| {
+                effective_tools
+                    .iter()
+                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                        name: tool.function.name.clone(),
+                        parameters: tool.function.parameters.clone(),
+                        strict: tool.function.strict,
+                    })
+                    .collect()
+            });
 
         // When DYN_ENABLE_EXPERIMENTAL_PARSERS_V2 is set, supported families
         // (Qwen3-Coder, DeepSeek-V4) stream through the dynamo-parsers-v2 parser
