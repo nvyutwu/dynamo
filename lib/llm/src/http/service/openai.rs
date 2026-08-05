@@ -1638,6 +1638,14 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
         return Ok(body.clone());
     };
 
+    // Whether the request already carried global (top-level) tools. Only when
+    // it did NOT (and we hoist ≥1 dynamic tool) are the top-level tools entirely
+    // dynamic — the case Kimi K3 renders under the long header.
+    let had_original_global_tools = obj
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| !tools.is_empty());
+
     // Seed the dedup set with any existing top-level (global) tool names.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
@@ -1736,6 +1744,18 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
         // A non-array top-level `tools` is malformed; surface a 400 rather than
         // silently discarding the hoisted dynamic tools.
         None => return Err(bad_request("`tools` must be an array")),
+    }
+
+    // Past the `hoisted.is_empty()` early-return, so ≥1 tool was hoisted. When
+    // there were no original global tools, ALL top-level tools are dynamic —
+    // signal the Kimi K3 renderer (via tools_are_dynamic()) to use the long
+    // "## New Tools Available" header. A mixed global+dynamic request keeps the
+    // short header (flag not set), matching current behavior.
+    if !had_original_global_tools {
+        obj.insert(
+            crate::protocols::openai::validate::DYNAMO_TOOLS_ARE_DYNAMIC_FIELD.to_string(),
+            serde_json::Value::Bool(true),
+        );
     }
 
     let bytes = serde_json::to_vec(&root)
@@ -3896,6 +3916,57 @@ mod tests {
     use crate::protocols::common::extensions::NvExt;
     use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
     use crate::protocols::openai::common_ext::CommonExt;
+
+    #[test]
+    fn hoist_sets_dynamic_flag_only_when_all_tools_are_dynamic() {
+        use crate::protocols::openai::validate::DYNAMO_TOOLS_ARE_DYNAMIC_FIELD as FLAG;
+
+        fn flag_after_hoist(body: serde_json::Value) -> Option<bool> {
+            let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+            let out = hoist_dynamic_message_tools(&bytes).expect("hoist should succeed");
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            value.get(FLAG).and_then(|v| v.as_bool())
+        }
+
+        let dynamic_tool = serde_json::json!({
+            "type": "function",
+            "function": {"name": "calc", "parameters": {"type": "object", "properties": {}}}
+        });
+        let global_tool = serde_json::json!({
+            "type": "function",
+            "function": {"name": "weather", "parameters": {"type": "object", "properties": {}}}
+        });
+
+        // (1) All-dynamic: ≥1 hoisted, no original global tools -> flag = true.
+        let all_dynamic = serde_json::json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "tools": [dynamic_tool.clone()]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        assert_eq!(flag_after_hoist(all_dynamic), Some(true));
+
+        // (2) Global-only: no message tools -> no hoist -> flag absent.
+        let global_only = serde_json::json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [global_tool.clone()]
+        });
+        assert_eq!(flag_after_hoist(global_only), None);
+
+        // (3) Mixed: global + dynamic -> hoisted but original global tools present
+        //     -> flag NOT set (stays short header, unchanged behavior).
+        let mixed = serde_json::json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "tools": [dynamic_tool]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": [global_tool]
+        });
+        assert_eq!(flag_after_hoist(mixed), None);
+    }
     use crate::protocols::openai::completions::NvCreateCompletionRequest;
     use crate::protocols::openai::responses::NvCreateResponse;
     use dynamo_protocols::types::responses::{CreateResponse, Input, PromptConfig};

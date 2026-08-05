@@ -133,6 +133,17 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
         }
     }
 
+    /// True when all top-level tools were hoisted from `messages[].tools`
+    /// (dynamic) with no original global tools — signalled by
+    /// `hoist_dynamic_message_tools` via the `unsupported_fields` catch-all.
+    /// Kimi K3 then renders them under the long "## New Tools Available" header.
+    fn tools_are_dynamic(&self) -> bool {
+        self.unsupported_fields
+            .get(crate::protocols::openai::validate::DYNAMO_TOOLS_ARE_DYNAMIC_FIELD)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     fn response_format(&self) -> Option<Value> {
         self.inner
             .response_format

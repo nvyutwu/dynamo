@@ -102,12 +102,23 @@ pub const MAX_REPETITION_PENALTY: f32 = 2.0;
 //
 
 /// Extra-body fields accepted for backend-specific handling.
+/// Server-internal signal injected by `hoist_dynamic_message_tools`: all
+/// top-level tools were hoisted from `messages[].tools` (dynamic) with no
+/// original global tools, so Kimi K3 renders them under the long
+/// "## New Tools Available" header (Moonshot prompt-token parity). Carried in
+/// the request's `unsupported_fields` catch-all (survives the typed parse
+/// without a struct field / literal churn) and allow-listed below so it clears
+/// `validate_no_unsupported_fields`. `skip_serializing` on `unsupported_fields`
+/// keeps it off any re-serialized body, so it never reaches the client.
+pub const DYNAMO_TOOLS_ARE_DYNAMIC_FIELD: &str = "__dynamo_tools_are_dynamic";
+
 pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "cache_salt",
     "stop_token_ids",
     "detokenize",
     "allowed_token_ids",
     "bad_words_token_ids",
+    DYNAMO_TOOLS_ARE_DYNAMIC_FIELD,
 ];
 
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
