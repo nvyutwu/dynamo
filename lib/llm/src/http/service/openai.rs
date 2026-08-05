@@ -1628,6 +1628,21 @@ mod nvcf_asset_tests {
 }
 
 fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
+    // Route A: Kimi K3 message-level dynamic `tools` (`messages[].tools`) are
+    // now preserved on the typed message (see dynamo_protocols
+    // `ChatCompletionRequest{System,Developer}Message.tools`) and rendered IN
+    // PLACE by the K3 renderer, byte-matching Moonshot `encoding_k3.py`. This
+    // function therefore NO LONGER hoists/merges dynamic tools to the top level
+    // (which produced the empty-system + merged-block token artifacts). It only:
+    //   (1) VALIDATES dynamic tools (the checks the Kimi-Vendor-Verifier
+    //       dynamic-tool suite asserts as 400s), and
+    //   (2) normalizes an absent/null `content` to "" so the content-required
+    //       typed layer accepts a `{"role":"system","tools":[...]}` message —
+    //       token-stream neutral, since the renderer ignores content for a
+    //       tool-carrying system message.
+    // It does NOT set `__dynamo_tools_are_dynamic`; top-level tools now always
+    // render under the short header (matching the reference), so
+    // `OAIChatLikeRequest::tools_are_dynamic()` is always false.
     let mut root: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         // Not valid JSON, or not an object at the top level: leave it for the
@@ -1637,14 +1652,6 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
     let Some(obj) = root.as_object_mut() else {
         return Ok(body.clone());
     };
-
-    // Whether the request already carried global (top-level) tools. Only when
-    // it did NOT (and we hoist ≥1 dynamic tool) are the top-level tools entirely
-    // dynamic — the case Kimi K3 renders under the long header.
-    let had_original_global_tools = obj
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|tools| !tools.is_empty());
 
     // Seed the dedup set with any existing top-level (global) tool names.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1659,15 +1666,22 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
         }
     }
 
-    let mut hoisted: Vec<serde_json::Value> = Vec::new();
+    let mut saw_dynamic = false;
+    let mut normalized_content = false;
     if let Some(messages) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) {
         for message in messages.iter_mut() {
             let Some(map) = message.as_object_mut() else {
                 continue;
             };
-            let Some(tools_val) = map.remove("tools") else {
+            // Inspect `tools` WITHOUT removing it — it must survive to the typed
+            // layer + renderer.
+            let Some(tools_val) = map.get("tools") else {
                 continue; // no dynamic tools on this message
             };
+            if tools_val.is_null() {
+                continue;
+            }
+            saw_dynamic = true;
 
             // Only the system role may declare dynamic tools.
             if map.get("role").and_then(|v| v.as_str()) != Some("system") {
@@ -1685,16 +1699,6 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
                 return Err(bad_request(
                     "a system message with dynamic `tools` must have empty content",
                 ));
-            }
-            // Once `tools` is removed, this system message is deserialized like
-            // any other, and a system message requires `content`. The vendor
-            // omits `content` entirely (or sends null) alongside dynamic tools,
-            // so normalize it to an empty string here to keep it valid.
-            if !matches!(map.get("content"), Some(serde_json::Value::String(_))) {
-                map.insert(
-                    "content".to_string(),
-                    serde_json::Value::String(String::new()),
-                );
             }
             // `tools` must be an array.
             let Some(arr) = tools_val.as_array() else {
@@ -1726,36 +1730,26 @@ fn hoist_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
                 if !seen.insert(name.to_string()) {
                     return Err(bad_request(format!("duplicate tool name: {name}")));
                 }
-                hoisted.push(tool.clone());
+            }
+
+            // A system message requires `content`. The vendor omits `content`
+            // entirely (or sends null) alongside dynamic tools, so normalize it
+            // to an empty string here to keep the typed parse valid. The
+            // renderer ignores content for a tool-carrying system message, so
+            // this does not change the rendered token stream.
+            if !matches!(map.get("content"), Some(serde_json::Value::String(_))) {
+                map.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+                normalized_content = true;
             }
         }
     }
 
-    if hoisted.is_empty() {
-        // Nothing to change; return the original bytes untouched.
+    // Nothing dynamic, or nothing needed normalizing: return original bytes.
+    if !saw_dynamic || !normalized_content {
         return Ok(body.clone());
-    }
-
-    let tools_entry = obj
-        .entry("tools")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    match tools_entry.as_array_mut() {
-        Some(arr) => arr.extend(hoisted),
-        // A non-array top-level `tools` is malformed; surface a 400 rather than
-        // silently discarding the hoisted dynamic tools.
-        None => return Err(bad_request("`tools` must be an array")),
-    }
-
-    // Past the `hoisted.is_empty()` early-return, so ≥1 tool was hoisted. When
-    // there were no original global tools, ALL top-level tools are dynamic —
-    // signal the Kimi K3 renderer (via tools_are_dynamic()) to use the long
-    // "## New Tools Available" header. A mixed global+dynamic request keeps the
-    // short header (flag not set), matching current behavior.
-    if !had_original_global_tools {
-        obj.insert(
-            crate::protocols::openai::validate::DYNAMO_TOOLS_ARE_DYNAMIC_FIELD.to_string(),
-            serde_json::Value::Bool(true),
-        );
     }
 
     let bytes = serde_json::to_vec(&root)
@@ -3918,14 +3912,17 @@ mod tests {
     use crate::protocols::openai::common_ext::CommonExt;
 
     #[test]
-    fn hoist_sets_dynamic_flag_only_when_all_tools_are_dynamic() {
+    fn dynamic_tools_are_validated_and_preserved_not_hoisted() {
+        // Route A: the dynamic-tool pass no longer hoists/merges `messages[].tools`
+        // to the top level nor sets the `__dynamo_tools_are_dynamic` flag. It
+        // validates the tools, preserves them on the message (for the renderer's
+        // in-place tool-declare block), and normalizes absent/null content to "".
         use crate::protocols::openai::validate::DYNAMO_TOOLS_ARE_DYNAMIC_FIELD as FLAG;
 
-        fn flag_after_hoist(body: serde_json::Value) -> Option<bool> {
+        fn hoist(body: serde_json::Value) -> serde_json::Value {
             let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
             let out = hoist_dynamic_message_tools(&bytes).expect("hoist should succeed");
-            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
-            value.get(FLAG).and_then(|v| v.as_bool())
+            serde_json::from_slice(&out).unwrap()
         }
 
         let dynamic_tool = serde_json::json!({
@@ -3937,35 +3934,45 @@ mod tests {
             "function": {"name": "weather", "parameters": {"type": "object", "properties": {}}}
         });
 
-        // (1) All-dynamic: ≥1 hoisted, no original global tools -> flag = true.
-        let all_dynamic = serde_json::json!({
+        // (1) All-dynamic (no global tools): the flag is NEVER set; the dynamic
+        //     tool stays ON the system message (not moved to top-level `tools`);
+        //     absent content is normalized to "".
+        let all_dynamic = hoist(serde_json::json!({
             "model": "kimi-k3",
             "messages": [
                 {"role": "system", "tools": [dynamic_tool.clone()]},
                 {"role": "user", "content": "hi"}
             ]
-        });
-        assert_eq!(flag_after_hoist(all_dynamic), Some(true));
+        }));
+        assert_eq!(all_dynamic.get(FLAG).and_then(|v| v.as_bool()), None);
+        assert!(all_dynamic.get("tools").is_none(), "must not hoist to top-level tools");
+        let sys = &all_dynamic["messages"][0];
+        assert_eq!(sys["tools"][0]["function"]["name"], "calc", "tools preserved on message");
+        assert_eq!(sys["content"], "", "absent content normalized to empty string");
 
-        // (2) Global-only: no message tools -> no hoist -> flag absent.
-        let global_only = serde_json::json!({
+        // (2) Global-only: no message tools -> body untouched, no flag.
+        let global_only = hoist(serde_json::json!({
             "model": "kimi-k3",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [global_tool.clone()]
-        });
-        assert_eq!(flag_after_hoist(global_only), None);
+        }));
+        assert_eq!(global_only.get(FLAG).and_then(|v| v.as_bool()), None);
+        assert_eq!(global_only["tools"][0]["function"]["name"], "weather");
 
-        // (3) Mixed: global + dynamic -> hoisted but original global tools present
-        //     -> flag NOT set (stays short header, unchanged behavior).
-        let mixed = serde_json::json!({
+        // (3) Mixed: global stays top-level, dynamic stays in place; no merge,
+        //     no flag. The renderer emits both as separate tool-declare blocks.
+        let mixed = hoist(serde_json::json!({
             "model": "kimi-k3",
             "messages": [
                 {"role": "system", "tools": [dynamic_tool]},
                 {"role": "user", "content": "hi"}
             ],
             "tools": [global_tool]
-        });
-        assert_eq!(flag_after_hoist(mixed), None);
+        }));
+        assert_eq!(mixed.get(FLAG).and_then(|v| v.as_bool()), None);
+        assert_eq!(mixed["tools"].as_array().map(|a| a.len()), Some(1), "top-level tools not merged");
+        assert_eq!(mixed["tools"][0]["function"]["name"], "weather");
+        assert_eq!(mixed["messages"][0]["tools"][0]["function"]["name"], "calc");
     }
     use crate::protocols::openai::completions::NvCreateCompletionRequest;
     use crate::protocols::openai::responses::NvCreateResponse;
