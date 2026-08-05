@@ -54,14 +54,17 @@ pub struct DeltaGenerator {
     /// count — this is what every internal/metric consumer reads (`get_isl`,
     /// trace `input_tokens`, Prometheus). It is never reduced.
     usage: dynamo_protocols::types::CompletionUsage,
-    /// CLIENT-ONLY override for the serialized `usage.prompt_tokens`. Set when
-    /// the frontend computes a model-specific parity value (Kimi K3: Moonshot
-    /// tokenism reports `prompt_tokens` as `total - pending`, excluding the
-    /// generation-prompt stub). Applied *only* where the OpenAI usage object is
-    /// emitted to the client (`client_usage` → `create_usage_chunk` /
-    /// continuous-usage `create_choice`); it never touches `self.usage`, so no
-    /// metric/trace/ISL consumer sees it. `None` = report the full count.
-    client_prompt_tokens: Option<u32>,
+    /// CLIENT-ONLY: length of the Kimi K3 generation-prompt stub to subtract
+    /// from the serialized `usage.prompt_tokens` (Moonshot tokenism reports
+    /// `total - pending`, excluding that stub). Applied *only* where the OpenAI
+    /// usage object is emitted to the client (`client_usage` →
+    /// `create_usage_chunk` / continuous-usage `create_choice`), by subtracting
+    /// from the FULL `self.usage.prompt_tokens` — which at the terminal chunk is
+    /// the worker's count and, for vision, includes image tokens. Storing a
+    /// LENGTH (not an absolute value) preserves those image tokens. It never
+    /// touches `self.usage`, so no metric/trace/ISL consumer sees it. `None` =
+    /// report the full count.
+    client_prompt_stub: Option<u32>,
     /// Counter tracking the number of messages issued.
     msg_counter: u64,
     /// Configuration options for response generation.
@@ -81,7 +84,7 @@ impl DeltaGenerator {
             system_fingerprint: None,
             service_tier: None,
             usage,
-            client_prompt_tokens: None,
+            client_prompt_stub: None,
             msg_counter: 0,
             options,
             tracker,
@@ -101,13 +104,12 @@ impl DeltaGenerator {
         self.usage.prompt_tokens = isl;
     }
 
-    /// Set the CLIENT-facing `usage.prompt_tokens` value (Kimi K3 tokenism
-    /// parity: full render minus the generation-prompt stub). This is applied
-    /// only when the OpenAI usage object is serialized to the client; the
-    /// internal `usage.prompt_tokens` / ISL / metrics keep the full count.
-    /// See [`Self::client_prompt_tokens`].
-    pub fn set_client_prompt_tokens(&mut self, prompt_tokens: u32) {
-        self.client_prompt_tokens = Some(prompt_tokens);
+    /// Set the length of the Kimi K3 generation-prompt stub to exclude from the
+    /// CLIENT-facing `usage.prompt_tokens` (subtracted from the worker's full
+    /// count at emission). The internal `usage.prompt_tokens` / ISL / metrics
+    /// keep the full count. See [`Self::client_prompt_stub`].
+    pub fn set_client_prompt_stub(&mut self, stub_len: u32) {
+        self.client_prompt_stub = Some(stub_len);
     }
 
     pub fn create_logprobs(
@@ -257,17 +259,20 @@ impl DeltaGenerator {
         usage
     }
 
-    /// CLIENT-facing usage object: [`Self::get_usage`] with the K3 tokenism
-    /// parity override applied to `prompt_tokens` (and `total_tokens`) when set.
-    /// Used only by the client-emission paths (`create_usage_chunk`,
+    /// CLIENT-facing usage object: [`Self::get_usage`] with the Kimi K3
+    /// generation-prompt stub subtracted from `prompt_tokens` (and
+    /// `total_tokens` recomputed) when set. Subtracting a LENGTH from the full
+    /// count is correct for both text (worker == frontend) and vision (the
+    /// worker's `prompt_tokens` includes image tokens the frontend ISL never
+    /// had). Used only by the client-emission paths (`create_usage_chunk`,
     /// continuous-usage `create_choice`); the non-streaming aggregator reads
     /// these emitted chunks, so both streaming and non-streaming clients see the
     /// reduced value while every internal consumer keeps the full count.
     fn client_usage(&self) -> dynamo_protocols::types::CompletionUsage {
         let mut usage = self.get_usage();
-        if let Some(client_prompt_tokens) = self.client_prompt_tokens {
-            usage.prompt_tokens = client_prompt_tokens;
-            usage.total_tokens = client_prompt_tokens.saturating_add(usage.completion_tokens);
+        if let Some(stub_len) = self.client_prompt_stub {
+            usage.prompt_tokens = usage.prompt_tokens.saturating_sub(stub_len);
+            usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
         }
         usage
     }
@@ -551,6 +556,59 @@ mod tests {
             .expect("completion token details should be propagated");
 
         assert_eq!(completion_details.reasoning_tokens, Some(3));
+    }
+
+    #[test]
+    fn client_usage_subtracts_k3_stub_for_text_and_vision() {
+        // K3 request: the frontend pins the generation-prompt stub LENGTH; the
+        // worker's terminal completion_usage carries the FULL prompt_tokens (for
+        // vision, including image tokens the frontend ISL never had). client_usage
+        // must subtract only the stub, while metrics keep the worker's full count.
+        const STUB: u32 = 3;
+
+        // Returns (client-facing prompt_tokens from the emitted usage chunk,
+        // metric/ISL prompt_tokens from get_usage).
+        fn client_and_metric(worker_prompt_tokens: u32, stub: Option<u32>) -> (u32, u32) {
+            let request = create_test_request();
+            let mut generator = request.response_generator("req-vision".to_string());
+            if let Some(stub_len) = stub {
+                generator.set_client_prompt_stub(stub_len);
+            }
+            let mut backend_output = final_backend_output();
+            backend_output.completion_usage = Some(CompletionUsage {
+                prompt_tokens: worker_prompt_tokens,
+                completion_tokens: 1,
+                total_tokens: worker_prompt_tokens + 1,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            });
+            generator
+                .choice_from_postprocessor(backend_output)
+                .expect("choice generation");
+            let client = generator
+                .create_usage_chunk()
+                .inner
+                .usage
+                .expect("usage chunk carries usage")
+                .prompt_tokens;
+            (client, generator.get_usage().prompt_tokens)
+        }
+
+        // Text: worker == frontend full render (231); stub 3 -> client 228.
+        let (client, metric) = client_and_metric(231, Some(STUB));
+        assert_eq!(client, 228, "text client prompt_tokens = full - stub");
+        assert_eq!(metric, 231, "metric/ISL keeps the full count");
+
+        // Vision: worker prompt_tokens includes image tokens (4164); stub 3 ->
+        // client 4161 (image tokens preserved, not clobbered by a text-only ISL).
+        let (client, metric) = client_and_metric(4164, Some(STUB));
+        assert_eq!(client, 4161, "vision client prompt_tokens = worker full - stub");
+        assert_eq!(metric, 4164);
+
+        // No stub pinned (non-K3): client == worker full, byte-identical behavior.
+        let (client, metric) = client_and_metric(197, None);
+        assert_eq!(client, 197);
+        assert_eq!(metric, 197);
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {

@@ -911,7 +911,7 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
     ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
-        let (preprocessed, annotations, prompt_injected_reasoning, _reported_prompt_tokens) = self
+        let (preprocessed, annotations, prompt_injected_reasoning, _client_prompt_stub) = self
             .preprocess_request_with_options(request, tracker, PreprocessRequestOptions::default())
             .await?;
         Ok((preprocessed, annotations, prompt_injected_reasoning))
@@ -976,13 +976,13 @@ impl OpenAIPreprocessor {
         };
         TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
 
-        // Kimi K3 parity: the reported `prompt_tokens` excludes the trailing
-        // generation-prompt stub. Compute it here while the rendered prompt is
-        // in scope; `None` for every other model leaves the ISL unchanged.
-        let reported_prompt_tokens = self.kimi_k3_reported_prompt_tokens(
-            formatted_prompt.as_ref().map(RenderedPrompt::as_str),
-            token_ids.len(),
-        );
+        // Kimi K3 parity: the CLIENT-facing `prompt_tokens` excludes the
+        // trailing generation-prompt stub. Carry the stub LENGTH (subtracted at
+        // the terminal chunk against the worker's full count, which for vision
+        // includes image tokens) while the rendered prompt is in scope; `None`
+        // for every other model.
+        let client_prompt_stub =
+            self.kimi_k3_generation_stub_len(formatted_prompt.as_ref().map(RenderedPrompt::as_str));
 
         let _mm_image_entries = self
             .gather_multi_modal_data(
@@ -1061,7 +1061,7 @@ impl OpenAIPreprocessor {
             preprocessed,
             annotations,
             prompt_injected_reasoning,
-            reported_prompt_tokens,
+            client_prompt_stub,
         ))
     }
 
@@ -2491,6 +2491,20 @@ impl OpenAIPreprocessor {
                 None | Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto)
             );
 
+        // Kimi K3: the tool parser doubles as the XTML wrapper decoder, so the
+        // jail stays on even for tool_choice=none (unlike other models, which
+        // skip it — see should_apply_tool_jail). The jail would then still
+        // surface any tool markup the model wrongly emits as `tool_calls`,
+        // violating tool_choice=none. Suppress tool-call emission post-jail for
+        // this case; wrapper decoding is preserved, and auto/required are
+        // unaffected.
+        let suppress_tool_calls_for_none = matches!(
+            request.inner.tool_choice.as_ref(),
+            Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::None)
+        ) && effective_tool_call_parser
+            .as_deref()
+            .is_some_and(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
+
         // Apply jail conditionally
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
             if should_jail && use_parsers_v2 {
@@ -2513,7 +2527,35 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
+        let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            if suppress_tool_calls_for_none {
+                Box::pin(transformed_stream.map(Self::suppress_stream_tool_calls))
+            } else {
+                transformed_stream
+            };
+
         Ok(transformed_stream)
+    }
+
+    /// Post-jail suppression for Kimi K3 `tool_choice=none`: the jail is kept on
+    /// for XTML wrapper decoding, but must not surface model-emitted tool markup
+    /// as `tool_calls`. Drop any `tool_calls` and normalize a `ToolCalls` finish
+    /// reason to `Stop`, so the contract "no tool calls when tool_choice=none"
+    /// holds. Content (wrappers already stripped by the jail) is untouched.
+    fn suppress_stream_tool_calls(
+        mut annotated: Annotated<NvCreateChatCompletionStreamResponse>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        if let Some(data) = annotated.data.as_mut() {
+            for choice in data.inner.choices.iter_mut() {
+                choice.delta.tool_calls = None;
+                if choice.finish_reason
+                    == Some(dynamo_protocols::types::FinishReason::ToolCalls)
+                {
+                    choice.finish_reason = Some(dynamo_protocols::types::FinishReason::Stop);
+                }
+            }
+        }
+        annotated
     }
 
     pub fn transform_postprocessor_stream<S, Resp>(
@@ -3230,27 +3272,28 @@ impl OpenAIPreprocessor {
         }
     }
 
-    /// Kimi K3 reports `usage.prompt_tokens` as Moonshot tokenism's
-    /// `total_tokens - pending_tokens`: the trailing generation-prompt channel
-    /// stub the renderer appends (`<|open|>think<|sep|>` in thinking mode,
-    /// `<|open|>response<|sep|>` otherwise) is *pending*, not prompt. Dynamo's
-    /// rendered `token_ids` include that stub, so the value surfaced in
-    /// `usage.prompt_tokens` must exclude exactly the stub's tokens.
+    /// Length (in tokens) of the trailing generation-prompt channel stub the
+    /// Kimi K3 renderer appends (`<|open|>think<|sep|>` in thinking mode,
+    /// `<|open|>response<|sep|>` otherwise). Moonshot's tokenism reports
+    /// `usage.prompt_tokens` as `total - pending`, treating that stub as pending
+    /// rather than prompt, so the CLIENT-facing count must exclude exactly these
+    /// tokens.
     ///
-    /// This adjusts only the *reported* input length — the worker still receives
-    /// the full `token_ids`, so KV/prefix-cache, routing, and scheduling are
-    /// untouched. The stub length is measured from the actual rendered tail
-    /// (mirroring [`Self::prompt_injected_reasoning_start`]) and tokenized the
-    /// same way it entered `token_ids` (the markers are special tokens, the
-    /// channel name ordinary text), so it stays correct across thinking-on/off
-    /// rather than being a hardcoded constant. Returns `None` for non-K3 models
-    /// or when no generation-prompt stub is present (e.g.
-    /// `add_generation_prompt=false`), leaving the ISL unchanged.
-    fn kimi_k3_reported_prompt_tokens(
-        &self,
-        formatted_prompt: Option<&str>,
-        token_ids_len: usize,
-    ) -> Option<u32> {
+    /// Returns the stub LENGTH (not an absolute prompt count) so the subtraction
+    /// is applied at the terminal chunk against the worker's full
+    /// `prompt_tokens` — which for VISION requests includes image tokens the
+    /// frontend `token_ids` never carried. Subtracting an absolute
+    /// frontend-derived value there would silently drop the image tokens;
+    /// subtracting the stub length is correct for both text (worker == frontend)
+    /// and vision (worker includes images).
+    ///
+    /// The stub is measured from the actual rendered tail (mirroring
+    /// [`Self::prompt_injected_reasoning_start`]) and tokenized the same way it
+    /// entered `token_ids` (the markers are special tokens, the channel name
+    /// ordinary text), so it stays correct across thinking-on/off rather than
+    /// being a hardcoded constant. Returns `None` for non-K3 models or when no
+    /// generation-prompt stub is present (e.g. `add_generation_prompt=false`).
+    fn kimi_k3_generation_stub_len(&self, formatted_prompt: Option<&str>) -> Option<u32> {
         if !matches!(
             self.runtime_config.reasoning_parser.as_deref(),
             Some("kimi_k3" | "kimi-k3")
@@ -3292,7 +3335,7 @@ impl OpenAIPreprocessor {
             .token_ids()
             .len();
 
-        Some((token_ids_len as u32).saturating_sub(stub_len as u32))
+        Some(stub_len as u32)
     }
 
     /// Check if reasoning parsing should be disabled based on per-request parameters.
@@ -3701,7 +3744,7 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning, reported_prompt_tokens) =
+        let (mut common_request, annotations, prompt_injected_reasoning, client_prompt_stub) =
             self.preprocess_request_with_options(
                 &request,
                 tracker.as_deref(),
@@ -3741,12 +3784,14 @@ impl
         if common_request.prompt_embeds.is_none() {
             let isl = common_request.token_ids.len() as u32;
             response_generator.update_isl(isl);
-            // Kimi K3 only: the CLIENT-facing usage.prompt_tokens is the
-            // tokenism-parity value (full render minus the generation-prompt
-            // stub). This is applied solely at client serialization; it does not
-            // change the ISL above or any metric.
-            if let Some(client_prompt_tokens) = reported_prompt_tokens {
-                response_generator.set_client_prompt_tokens(client_prompt_tokens);
+            // Kimi K3 only: the CLIENT-facing usage.prompt_tokens excludes the
+            // generation-prompt stub. Carry the stub LENGTH; delta.rs subtracts
+            // it from the worker's full terminal count (correct for vision,
+            // whose image tokens the frontend ISL above never had). Applied
+            // solely at client serialization; the ISL above and every metric
+            // keep the full count.
+            if let Some(stub_len) = client_prompt_stub {
+                response_generator.set_client_prompt_stub(stub_len);
             }
         }
 
@@ -4089,6 +4134,87 @@ mod tests {
 
     const K3_MARKER: &str = "<|kimi_image_placeholder|>";
     const K3_PAD: &str = "<|media_pad|>";
+
+    #[test]
+    fn suppress_stream_tool_calls_drops_calls_and_normalizes_finish() {
+        // A jail-emitted chunk that surfaced a tool call (finish_reason=tool_calls).
+        let chunk: NvCreateChatCompletionStreamResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "kimi-k3",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("valid stream chunk");
+        let annotated = Annotated {
+            data: Some(chunk),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        };
+
+        let out = OpenAIPreprocessor::suppress_stream_tool_calls(annotated);
+        let choice = &out.data.as_ref().unwrap().inner.choices[0];
+        assert!(
+            choice.delta.tool_calls.is_none(),
+            "tool_calls must be suppressed for tool_choice=none"
+        );
+        assert_eq!(
+            choice.finish_reason,
+            Some(dynamo_protocols::types::FinishReason::Stop),
+            "tool_calls finish_reason must normalize to stop"
+        );
+    }
+
+    #[test]
+    fn suppress_stream_tool_calls_preserves_plain_content() {
+        // A normal content chunk (no tool call) must pass through unchanged.
+        let chunk: NvCreateChatCompletionStreamResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-y",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "kimi-k3",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "今天北京晴。"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("valid stream chunk");
+        let annotated = Annotated {
+            data: Some(chunk),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        };
+
+        let out = OpenAIPreprocessor::suppress_stream_tool_calls(annotated);
+        let choice = &out.data.as_ref().unwrap().inner.choices[0];
+        assert!(choice.delta.tool_calls.is_none());
+        assert_eq!(
+            choice.finish_reason,
+            Some(dynamo_protocols::types::FinishReason::Stop)
+        );
+        match &choice.delta.content {
+            Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) => {
+                assert_eq!(text, "今天北京晴。")
+            }
+            other => panic!("content should be preserved, got: {other:?}"),
+        }
+    }
 
     fn seg(text: &str, allow_special: bool) -> crate::tokenizers::EncodeSegment {
         crate::tokenizers::EncodeSegment {
