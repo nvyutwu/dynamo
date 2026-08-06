@@ -2345,7 +2345,20 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             .as_ref()
             .map(|error| error.message())
             .unwrap_or(&error_str);
-        if let Ok(error_payload) = serde_json::from_str::<ErrorPayload>(status_message) {
+        // Worker errors cross the worker->frontend wire as their Display string, so
+        // `message()` may carry a leading "<ErrorType>: " prefix (e.g.
+        // `BackendInvalidArgument: {"message":...,"code":400}`) that breaks a strict JSON
+        // parse and hides the backend status (falling back to 500). Parse as-is first
+        // (frontend-local clean case), then retry from the first '{' to recover the
+        // embedded {message, code} envelope emitted by py_err_to_dynamo / map_python_exception.
+        let parsed = serde_json::from_str::<ErrorPayload>(status_message)
+            .ok()
+            .or_else(|| {
+                status_message
+                    .find('{')
+                    .and_then(|i| serde_json::from_str::<ErrorPayload>(&status_message[i..]).ok())
+            });
+        if let Some(error_payload) = parsed {
             // Preserve explicit HTTP-like statuses (for example 415); Python
             // 4xx exceptions share the Backend(InvalidArgument) category.
             let code = if overloaded {
@@ -7126,6 +7139,32 @@ mod tests {
         assert_eq!(error_response.1.code, StatusCode::BAD_REQUEST.as_u16());
         assert_eq!(error_response.1.error_type, "Bad Request");
         assert_eq!(error_response.1.message, "invalid second prompt");
+    }
+
+    #[tokio::test]
+    async fn test_decorated_worker_validation_error_retains_400() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use futures::stream;
+
+        // Worker errors cross the wire as their Display string, so the JSON
+        // envelope arrives behind an "<ErrorType>: " prefix. The embedded
+        // status and message must still be recovered.
+        let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"BackendInvalidArgument: {"message":"At most 8 images may be provided","code":400}"#
+                    .to_string(),
+            ]),
+            error: None,
+        };
+        let result = check_for_backend_error(stream::iter(vec![error_event]), None).await;
+        let Err(response) = result else {
+            panic!("expected worker validation error")
+        };
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(response.1.message, "At most 8 images may be provided");
     }
 
     #[tokio::test]
