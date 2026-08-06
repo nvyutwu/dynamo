@@ -2631,7 +2631,20 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             .as_ref()
             .map(|error| error.message())
             .unwrap_or(&error_str);
-        if let Ok(error_payload) = serde_json::from_str::<ErrorPayload>(status_message) {
+        // Worker errors cross the worker->frontend wire as their Display string, so
+        // `message()` may carry a leading "<ErrorType>: " prefix (e.g.
+        // `BackendInvalidArgument: {"message":...,"code":400}`) that breaks a strict JSON
+        // parse and hides the backend status (falling back to 500). Parse as-is first
+        // (frontend-local clean case), then retry from the first '{' to recover the
+        // embedded {message, code} envelope emitted by py_err_to_dynamo / map_python_exception.
+        let parsed = serde_json::from_str::<ErrorPayload>(status_message)
+            .ok()
+            .or_else(|| {
+                status_message
+                    .find('{')
+                    .and_then(|i| serde_json::from_str::<ErrorPayload>(&status_message[i..]).ok())
+            });
+        if let Some(error_payload) = parsed {
             // Preserve explicit HTTP-like statuses (for example 415); Python
             // 4xx exceptions share the Backend(InvalidArgument) category.
             let code = if overloaded {
