@@ -2689,7 +2689,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "5.1.2"
-source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=e2eb42432acd8771549a3a9c950b79b68c9ac803#e2eb42432acd8771549a3a9c950b79b68c9ac803"
+source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2#ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2727,7 +2727,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "4.0.0"
-source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=e2eb42432acd8771549a3a9c950b79b68c9ac803#e2eb42432acd8771549a3a9c950b79b68c9ac803"
+source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2#ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -2743,7 +2743,7 @@ dependencies = [
 [[package]]
 name = "dynamo-renderer"
 version = "2.0.0"
-source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=e2eb42432acd8771549a3a9c950b79b68c9ac803#e2eb42432acd8771549a3a9c950b79b68c9ac803"
+source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2#ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2884,7 +2884,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokenizers"
 version = "1.5.3"
-source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=e2eb42432acd8771549a3a9c950b79b68c9ac803#e2eb42432acd8771549a3a9c950b79b68c9ac803"
+source = "git+https://github.com/nvyutwu/frontend-crates.git?rev=ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2#ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -6908,8 +6908,8 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -6928,8 +6928,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -6950,7 +6950,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -6963,7 +6963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",

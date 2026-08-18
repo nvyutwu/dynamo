@@ -125,7 +125,7 @@ strip = false
 # needs its own copy of the root Cargo.toml patch. maturin builds from here,
 # so without it the wheel would link the crates.io versions instead.
 [patch.crates-io]
-dynamo-parsers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "e2eb42432acd8771549a3a9c950b79b68c9ac803" }
-dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "e2eb42432acd8771549a3a9c950b79b68c9ac803" }
-dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "e2eb42432acd8771549a3a9c950b79b68c9ac803" }
-dynamo-tokenizers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "e2eb42432acd8771549a3a9c950b79b68c9ac803" }
+dynamo-parsers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
+dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
+dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
+dynamo-tokenizers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
