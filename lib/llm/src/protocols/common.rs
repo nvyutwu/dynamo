@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Engine Protocols
-//! ================
-//!
+//! =========//!
 //! This module contains the protocols in public API for the LLM Engine and AsyncEngine facades.
 //!
 //! The core components are the `CompletionRequest` and `StreamingCompletionResponse` objects.
@@ -88,6 +87,13 @@ pub enum FinishReason {
 
     #[serde(rename = "content_filter")]
     ContentFilter,
+
+    /// vLLM's repetition detector fired (RequestStatus::FINISHED_REPETITION ->
+    /// FinishReason::REPETITION -> the wire string "repetition"). Without this variant the
+    /// request_trace payload fold fails to deserialize and NO audit record is emitted for the
+    /// request, so repetition-terminated responses vanish from payload logging entirely.
+    #[serde(rename = "repetition")]
+    Repetition,
 }
 
 impl std::fmt::Display for FinishReason {
@@ -99,6 +105,7 @@ impl std::fmt::Display for FinishReason {
             FinishReason::Error(msg) => write!(f, "error: {}", msg),
             FinishReason::Cancelled => write!(f, "cancelled"),
             FinishReason::ContentFilter => write!(f, "content_filter"),
+            FinishReason::Repetition => write!(f, "repetition"),
         }
     }
 }
@@ -116,6 +123,7 @@ impl std::str::FromStr for FinishReason {
             "error" => Ok(FinishReason::Error(
                 "backend emitted finish_reason=error without a message".into(),
             )),
+            "repetition" => Ok(FinishReason::Repetition),
             s if s.starts_with("error: ") => Ok(FinishReason::Error(s[7..].to_string())),
             _ => Err(anyhow::anyhow!("Invalid FinishReason variant: '{}'", s)),
         }
@@ -144,7 +152,7 @@ impl<'de> serde::de::Visitor<'de> for FinishReasonVisitor {
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            r#"a finish reason: "eos", "length", "stop", "cancelled", "abort", "content_filter", "error", "error: <message>", or {"error": "<message>"}"#,
+            r#"a finish reason: "eos", "length", "stop", "cancelled", "abort", "content_filter", "repetition", "error", "error: <message>", or {"error": "<message>"}"#,
         )
     }
 
@@ -183,9 +191,10 @@ impl<'de> serde::de::Visitor<'de> for FinishReasonVisitor {
 impl From<FinishReason> for dynamo_protocols::types::CompletionFinishReason {
     fn from(reason: FinishReason) -> Self {
         match reason {
-            FinishReason::EoS | FinishReason::Stop | FinishReason::Cancelled => {
-                dynamo_protocols::types::CompletionFinishReason::Stop
-            }
+            FinishReason::EoS
+            | FinishReason::Stop
+            | FinishReason::Cancelled
+            | FinishReason::Repetition => dynamo_protocols::types::CompletionFinishReason::Stop,
             FinishReason::ContentFilter => {
                 dynamo_protocols::types::CompletionFinishReason::ContentFilter
             }
