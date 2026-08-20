@@ -63,6 +63,13 @@ pub enum FinishReason {
 
     #[serde(rename = "content_filter")]
     ContentFilter,
+
+    /// vLLM's repetition detector fired (RequestStatus::FINISHED_REPETITION ->
+    /// FinishReason::REPETITION -> the wire string "repetition"). Without this variant the
+    /// request_trace payload fold fails to deserialize and NO audit record is emitted for the
+    /// request, so repetition-terminated responses vanish from payload logging entirely.
+    #[serde(rename = "repetition")]
+    Repetition,
 }
 
 impl std::fmt::Display for FinishReason {
@@ -74,6 +81,7 @@ impl std::fmt::Display for FinishReason {
             FinishReason::Error(msg) => write!(f, "error: {}", msg),
             FinishReason::Cancelled => write!(f, "cancelled"),
             FinishReason::ContentFilter => write!(f, "content_filter"),
+            FinishReason::Repetition => write!(f, "repetition"),
         }
     }
 }
@@ -87,6 +95,7 @@ impl std::str::FromStr for FinishReason {
             "length" => Ok(FinishReason::Length),
             "stop" => Ok(FinishReason::Stop),
             "cancelled" | "abort" => Ok(FinishReason::Cancelled),
+            "repetition" => Ok(FinishReason::Repetition),
             s if s.starts_with("error: ") => Ok(FinishReason::Error(s[7..].to_string())),
             _ => Err(anyhow::anyhow!("Invalid FinishReason variant: '{}'", s)),
         }
@@ -96,9 +105,10 @@ impl std::str::FromStr for FinishReason {
 impl From<FinishReason> for dynamo_protocols::types::CompletionFinishReason {
     fn from(reason: FinishReason) -> Self {
         match reason {
-            FinishReason::EoS | FinishReason::Stop | FinishReason::Cancelled => {
-                dynamo_protocols::types::CompletionFinishReason::Stop
-            }
+            FinishReason::EoS
+            | FinishReason::Stop
+            | FinishReason::Cancelled
+            | FinishReason::Repetition => dynamo_protocols::types::CompletionFinishReason::Stop,
             FinishReason::ContentFilter => {
                 dynamo_protocols::types::CompletionFinishReason::ContentFilter
             }
