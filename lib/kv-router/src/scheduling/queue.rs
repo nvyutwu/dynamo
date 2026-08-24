@@ -1826,6 +1826,10 @@ mod tests {
                 required_blocks: request.request_blocks(block_size),
                 effective_overlap_blocks: request.effective_overlap_blocks_for(worker),
                 cached_tokens: request.effective_cached_tokens_for(worker),
+                eligible_oracle_cached_tokens: SchedulingContext::new(request, workers)
+                    .best_cached_tokens(),
+                resident_oracle_cached_tokens: SchedulingContext::new(request, workers)
+                    .best_cached_tokens(),
             })
         }
     }
