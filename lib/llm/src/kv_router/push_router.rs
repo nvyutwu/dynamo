@@ -318,7 +318,10 @@ impl KvPushRouter {
                 }
             }
             let input_tokens = routing_parts.token_ids.len() as u64;
-            guard.request_metrics().input_tokens_total.inc_by(input_tokens);
+            guard
+                .request_metrics()
+                .input_tokens_total
+                .inc_by(input_tokens);
             guard
                 .request_metrics()
                 .selected_cached_tokens_total

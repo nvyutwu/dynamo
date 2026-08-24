@@ -40,9 +40,9 @@ fn oracle_cached_tokens<C: WorkerConfigLike>(
         .effective_cached_tokens
         .iter()
         .filter(|(worker, _)| {
-            workers.get(&worker.worker_id).is_some_and(|config| {
-                eligibility.allows_worker(worker.worker_id, config)
-            })
+            workers
+                .get(&worker.worker_id)
+                .is_some_and(|config| eligibility.allows_worker(worker.worker_id, config))
         })
         .map(|(_, cached_tokens)| *cached_tokens)
         .max()
