@@ -19,6 +19,7 @@ from dynamo._core import FrontendRoute as FrontendRoute
 from dynamo._core import HttpAsyncEngine as HttpAsyncEngine
 from dynamo._core import HttpService as HttpService
 from dynamo._core import KserveGrpcService as KserveGrpcService
+from dynamo._core import KvCacheSolEstimator as KvCacheSolEstimator
 from dynamo._core import KvDcRelay as KvDcRelay
 from dynamo._core import KvEventPublisher as KvEventPublisher
 from dynamo._core import KvRouter as KvRouter

@@ -1713,6 +1713,7 @@ impl ModelWatcher {
                         encoder_chooser.clone(),
                         uses_multimodal_cache_routing(card),
                         router_config.session_affinity_ttl_secs,
+                        card.runtime_config.enable_eagle,
                     )
                     .await
                     .context("build_preprocessed_routing")?,
