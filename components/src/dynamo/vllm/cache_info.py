@@ -17,12 +17,31 @@ MAIN_ATTENTION_KV_CACHE_KINDS = {
 }
 
 
+def _decode_context_parallel_size(vllm_config: VllmConfig) -> int:
+    """Return vLLM's decode-context-parallel world size, or 1 when unavailable.
+
+    vLLM scales attention-group blocks by this factor before publishing KV events, while
+    ``get_kv_cache_group_metadata`` reports the unscaled spec value. Older configs and test stubs
+    may not expose the field, so preserve their pre-DCP behavior instead of failing startup.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    try:
+        dcp_world_size = int(
+            getattr(parallel_config, "decode_context_parallel_size", 1) or 1
+        )
+    except (TypeError, ValueError):
+        return 1
+    return dcp_world_size if dcp_world_size > 1 else 1
+
+
 def get_configured_kv_event_block_size(vllm_config: VllmConfig) -> int:
     """Return the configured KV event block size, falling back to vLLM's cache block size."""
     additional_config = vllm_config.additional_config or {}
-    return additional_config.get(
-        DYNAMO_KV_EVENT_BLOCK_SIZE_KEY,
-        vllm_config.cache_config.block_size,
+    cached = additional_config.get(DYNAMO_KV_EVENT_BLOCK_SIZE_KEY)
+    if cached is not None:
+        return cached
+    return vllm_config.cache_config.block_size * _decode_context_parallel_size(
+        vllm_config
     )
 
 
@@ -63,6 +82,17 @@ async def configure_kv_event_block_size(
             group_metadata,
             fallback_block_size,
         )
+
+    dcp_world_size = _decode_context_parallel_size(vllm_config)
+    engine_block_size = kv_event_block_size
+    kv_event_block_size = engine_block_size * dcp_world_size
+    logger.info(
+        "KV-event block size %d = main-attention block %d x "
+        "decode_context_parallel_size %d",
+        kv_event_block_size,
+        engine_block_size,
+        dcp_world_size,
+    )
 
     if vllm_config.additional_config is None:
         vllm_config.additional_config = {}
