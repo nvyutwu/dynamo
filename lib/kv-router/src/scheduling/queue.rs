@@ -1460,6 +1460,8 @@ impl<
             best_worker: selection.worker,
             effective_overlap_blocks: selection.effective_overlap_blocks,
             cached_tokens: selection.cached_tokens,
+            eligible_oracle_cached_tokens: selection.eligible_oracle_cached_tokens,
+            resident_oracle_cached_tokens: selection.resident_oracle_cached_tokens,
             selected_worker_tiers,
             request_progress,
             lifecycle_lease: None,
