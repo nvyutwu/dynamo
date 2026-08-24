@@ -317,6 +317,28 @@ impl KvPushRouter {
                     guard.request_metrics().kv_hit_rate.observe(hit_rate);
                 }
             }
+            let input_tokens = routing_parts.token_ids.len() as u64;
+            guard.request_metrics().input_tokens_total.inc_by(input_tokens);
+            guard
+                .request_metrics()
+                .selected_cached_tokens_total
+                .inc_by(selection.cached_tokens.min(routing_parts.token_ids.len()) as u64);
+            guard
+                .request_metrics()
+                .eligible_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .eligible_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
+                );
+            guard
+                .request_metrics()
+                .resident_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .resident_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
+                );
             guard
                 .request_metrics()
                 .input_sequence_tokens
@@ -541,6 +563,25 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             self.request_metrics
                 .input_sequence_tokens
                 .observe(request.token_ids.len() as f64);
+            let input_tokens = routing_parts.token_ids.len() as u64;
+            self.request_metrics.input_tokens_total.inc_by(input_tokens);
+            self.request_metrics
+                .selected_cached_tokens_total
+                .inc_by(selection.cached_tokens.min(routing_parts.token_ids.len()) as u64);
+            self.request_metrics
+                .eligible_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .eligible_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
+                );
+            self.request_metrics
+                .resident_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .resident_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
+                );
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker

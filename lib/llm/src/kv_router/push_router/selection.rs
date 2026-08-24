@@ -26,6 +26,8 @@ pub(super) struct WorkerSelection {
     pub(super) overlap_amount: u32,
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
+    pub(super) eligible_oracle_cached_tokens: usize,
+    pub(super) resident_oracle_cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
 }
@@ -100,6 +102,8 @@ impl KvPushRouter {
                 overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                eligible_oracle_cached_tokens,
+                resident_oracle_cached_tokens,
                 routing_hashes,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
@@ -107,6 +111,8 @@ impl KvPushRouter {
                 overlap_amount: overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                eligible_oracle_cached_tokens,
+                resident_oracle_cached_tokens,
                 routing_hashes,
                 lifecycle,
             }),

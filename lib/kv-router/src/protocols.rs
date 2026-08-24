@@ -547,6 +547,12 @@ pub struct WorkerSelectionResult {
 
     /// Approximate cached-token count derived from the weighted cache hit.
     pub cached_tokens: usize,
+
+    /// Maximum cached-token count on any worker eligible after overload filtering.
+    pub eligible_oracle_cached_tokens: usize,
+
+    /// Maximum cached-token count on any allowed worker before overload filtering.
+    pub resident_oracle_cached_tokens: usize,
 }
 
 /// Active load metrics for a worker, used for overload detection.

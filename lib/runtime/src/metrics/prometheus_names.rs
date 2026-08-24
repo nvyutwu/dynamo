@@ -633,6 +633,20 @@ pub mod router {
     /// Predicted KV cache hit rate at routing time (0.0-1.0)
     pub const KV_HIT_RATE: &str = "router_kv_hit_rate";
 
+    /// Input tokens included in token-weighted router overlap accounting
+    pub const INPUT_TOKENS_TOTAL: &str = "router_input_tokens_total";
+
+    /// Predicted cached tokens on the worker selected by the router
+    pub const SELECTED_CACHED_TOKENS_TOTAL: &str = "router_selected_cached_tokens_total";
+
+    /// Best cached tokens among workers eligible after overload filtering
+    pub const ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL: &str =
+        "router_eligible_oracle_cached_tokens_total";
+
+    /// Best cached tokens among allowed workers before overload filtering
+    pub const RESIDENT_ORACLE_CACHED_TOKENS_TOTAL: &str =
+        "router_resident_oracle_cached_tokens_total";
+
     /// Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
     pub const SHARED_CACHE_HIT_RATE: &str = "router_shared_cache_hit_rate";
 

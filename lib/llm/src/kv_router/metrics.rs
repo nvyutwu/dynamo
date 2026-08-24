@@ -825,6 +825,10 @@ pub struct RouterRequestMetrics {
     pub input_sequence_tokens: prometheus::Histogram,
     pub output_sequence_tokens: prometheus::Histogram,
     pub kv_hit_rate: prometheus::Histogram,
+    pub input_tokens_total: prometheus::IntCounter,
+    pub selected_cached_tokens_total: prometheus::IntCounter,
+    pub eligible_oracle_cached_tokens_total: prometheus::IntCounter,
+    pub resident_oracle_cached_tokens_total: prometheus::IntCounter,
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
@@ -920,6 +924,34 @@ impl RouterRequestMetrics {
                         Some(prometheus::linear_buckets(0.0, 0.05, 21).unwrap()),
                     )
                     .expect("failed to create router_kv_hit_rate");
+                let input_tokens_total = metrics
+                    .create_intcounter(
+                        router::INPUT_TOKENS_TOTAL,
+                        "Input tokens included in token-weighted router overlap accounting",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_input_tokens_total");
+                let selected_cached_tokens_total = metrics
+                    .create_intcounter(
+                        router::SELECTED_CACHED_TOKENS_TOTAL,
+                        "Predicted cached tokens on the worker selected by the router",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_selected_cached_tokens_total");
+                let eligible_oracle_cached_tokens_total = metrics
+                    .create_intcounter(
+                        router::ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL,
+                        "Best cached tokens among workers eligible after overload filtering",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_eligible_oracle_cached_tokens_total");
+                let resident_oracle_cached_tokens_total = metrics
+                    .create_intcounter(
+                        router::RESIDENT_ORACLE_CACHED_TOKENS_TOTAL,
+                        "Best cached tokens among allowed workers before overload filtering",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_resident_oracle_cached_tokens_total");
                 let kv_transfer_estimated_latency_seconds = metrics
                     .create_histogram(
                         &router_metric(frontend_service::KV_TRANSFER_ESTIMATED_LATENCY_SECONDS),
@@ -951,6 +983,10 @@ impl RouterRequestMetrics {
                     input_sequence_tokens,
                     output_sequence_tokens,
                     kv_hit_rate,
+                    input_tokens_total,
+                    selected_cached_tokens_total,
+                    eligible_oracle_cached_tokens_total,
+                    resident_oracle_cached_tokens_total,
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
                     shared_cache_beyond_blocks,

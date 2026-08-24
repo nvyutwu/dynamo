@@ -77,6 +77,8 @@ pub enum FindBestMatchOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        eligible_oracle_cached_tokens: usize,
+        resident_oracle_cached_tokens: usize,
         routing_hashes: Option<RoutingDecisionHashes>,
     },
     QueueRejected {
@@ -759,6 +761,8 @@ where
                 overlap_blocks: response.effective_overlap_blocks.round() as u32,
                 effective_overlap_blocks: response.effective_overlap_blocks,
                 cached_tokens: response.cached_tokens,
+                eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
+                resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                 routing_hashes,
             },
             lifecycle,
@@ -1368,6 +1372,8 @@ mod tests {
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,
                 cached_tokens: 0,
+                eligible_oracle_cached_tokens: 0,
+                resident_oracle_cached_tokens: 0,
             })
         }
     }

@@ -23,6 +23,32 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
 }
 
+fn oracle_cached_tokens<C: WorkerConfigLike>(
+    workers: &HashMap<WorkerId, C>,
+    request: &SchedulingRequest,
+    eligibility: RoutingEligibility<'_>,
+) -> usize {
+    if let Some(worker) = eligibility.pinned_worker() {
+        return eligibility
+            .validate_worker_rank(workers, worker)
+            .ok()
+            .map_or(0, |_| request.effective_cached_tokens_for(worker));
+    }
+
+    request
+        .overlap
+        .effective_cached_tokens
+        .iter()
+        .filter(|(worker, _)| {
+            workers.get(&worker.worker_id).is_some_and(|config| {
+                eligibility.allows_worker(worker.worker_id, config)
+            })
+        })
+        .map(|(_, cached_tokens)| *cached_tokens)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Helper function for softmax sampling.
 /// Returns the selected worker and its logit.
 fn softmax_sample(
@@ -268,6 +294,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         }
 
         let request_blocks = request.request_blocks(block_size);
+        let resident_oracle_cached_tokens =
+            oracle_cached_tokens(workers, request, request.eligibility());
+        let eligible_oracle_cached_tokens = oracle_cached_tokens(workers, request, eligibility);
 
         let weights = LogitWeights {
             overlap_score_credit: request
@@ -325,6 +354,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                eligible_oracle_cached_tokens,
+                resident_oracle_cached_tokens,
             });
         }
 
@@ -437,6 +468,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                eligible_oracle_cached_tokens,
+                resident_oracle_cached_tokens,
             });
         }
 
@@ -465,6 +498,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             required_blocks: request_blocks,
             effective_overlap_blocks: best_overlap,
             cached_tokens: best_cached_tokens,
+            eligible_oracle_cached_tokens,
+            resident_oracle_cached_tokens,
         })
     }
 }
@@ -755,6 +790,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.worker.worker_id, 1);
+        assert_eq!(result.cached_tokens, 0);
+        assert_eq!(result.eligible_oracle_cached_tokens, 0);
+        assert_eq!(result.resident_oracle_cached_tokens, 64);
     }
 
     #[test]

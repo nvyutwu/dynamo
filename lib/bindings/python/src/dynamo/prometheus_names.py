@@ -371,6 +371,18 @@ class router:
     OUTPUT_SEQUENCE_TOKENS = "router_output_sequence_tokens"
     # Predicted KV cache hit rate at routing time (0.0-1.0)
     KV_HIT_RATE = "router_kv_hit_rate"
+    # Input tokens included in token-weighted router overlap accounting
+    INPUT_TOKENS_TOTAL = "router_input_tokens_total"
+    # Predicted cached tokens on the worker selected by the router
+    SELECTED_CACHED_TOKENS_TOTAL = "router_selected_cached_tokens_total"
+    # Best cached tokens among workers eligible after overload filtering
+    ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL = (
+        "router_eligible_oracle_cached_tokens_total"
+    )
+    # Best cached tokens among allowed workers before overload filtering
+    RESIDENT_ORACLE_CACHED_TOKENS_TOTAL = (
+        "router_resident_oracle_cached_tokens_total"
+    )
     # Whether the router currently has a worker/dp_rank registered (1 = registered)
     WORKER_REGISTERED = "router_worker_registered"
 
