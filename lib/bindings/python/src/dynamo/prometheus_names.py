@@ -271,6 +271,8 @@ class kvstats:
     TOTAL_BLOCKS = "total_blocks"
     # GPU cache usage as a percentage (0.0-1.0)
     GPU_CACHE_USAGE_PERCENT = "gpu_cache_usage_percent"
+    # Prefix cache hit rate (0.0-1.0), portable across vLLM / SGLang / TRT-LLM
+    KV_CACHE_HIT_RATE = "kv_cache_hit_rate"
 
 
 class labels:

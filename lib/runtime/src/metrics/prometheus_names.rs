@@ -823,6 +823,9 @@ pub mod kvstats {
 
     /// GPU cache usage as a percentage (0.0-1.0)
     pub const GPU_CACHE_USAGE_PERCENT: &str = "gpu_cache_usage_percent";
+
+    /// Prefix cache hit rate (0.0-1.0), portable across vLLM / SGLang / TRT-LLM
+    pub const KV_CACHE_HIT_RATE: &str = "kv_cache_hit_rate";
 }
 
 // Model information metrics
