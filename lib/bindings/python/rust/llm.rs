@@ -30,7 +30,6 @@ pub mod entrypoint;
 pub mod fpm;
 pub mod frontend_routes;
 pub mod kv;
-pub mod kv_cache_sol;
 pub mod kv_dc_relay;
 pub mod local_model;
 pub mod lora;
