@@ -6,10 +6,144 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
+use dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart,
+};
 
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
+
+const INLINE_MEDIA_REDACTION_TAG: &str = "redacted-inline-media";
+
+fn inline_media_data_uri_parts(value: &str) -> Option<(&str, &str)> {
+    let scheme = value.get(..5)?;
+    if !scheme.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let data_uri = value.get(5..)?;
+    let (metadata, encoded_body) = data_uri.split_once(',')?;
+    let mime_type = metadata.split(';').next()?.trim().to_ascii_lowercase();
+    ["image/", "video/", "audio/"]
+        .iter()
+        .any(|prefix| mime_type.starts_with(prefix))
+        .then_some((metadata, encoded_body))
+}
+
+/// Replace an inline image/video/audio data URI with a compact,
+/// non-reversible marker suitable for request-payload logs.
+///
+/// The hash covers the encoded body in the parsed request. Keeping the original
+/// data-URI metadata preserves the MIME type (and any parameters), while the
+/// body itself never reaches a request-trace sink.
+fn redact_inline_media_data_uri(value: &str) -> Option<String> {
+    let (metadata, encoded_body) = inline_media_data_uri_parts(value)?;
+    let encoded_hash = blake3::hash(encoded_body.as_bytes()).to_hex();
+    Some(format!(
+        "data:{metadata},{INLINE_MEDIA_REDACTION_TAG};encoded_blake3={encoded_hash};encoded_bytes={}",
+        encoded_body.len()
+    ))
+}
+
+fn redact_inline_media_data_uris(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => {
+            values.iter_mut().map(redact_inline_media_data_uris).sum()
+        }
+        serde_json::Value::Object(values) => {
+            values.values_mut().map(redact_inline_media_data_uris).sum()
+        }
+        serde_json::Value::String(value) => {
+            let Some(redacted) = redact_inline_media_data_uri(value) else {
+                return 0;
+            };
+            *value = redacted;
+            1
+        }
+        _ => 0,
+    }
+}
+
+fn is_inline_media_data_uri(url: Option<&str>) -> bool {
+    url.and_then(inline_media_data_uri_parts).is_some()
+}
+
+/// Read-only detection over every message variant whose protocol type can carry
+/// a media part: `user` content parts and `tool` content parts (tool observations
+/// returned as image/video/audio). Assistant, system, and developer parts are
+/// text-only in `dynamo-protocols`, so this check is exhaustive; extend it if a
+/// protocols bump adds media to another role, or the fast path below leaks.
+fn request_contains_inline_media_data_uri(req: &NvCreateChatCompletionRequest) -> bool {
+    req.inner.messages.iter().any(|message| match message {
+        ChatCompletionRequestMessage::User(user_message) => {
+            let ChatCompletionRequestUserMessageContent::Array(parts) = &user_message.content
+            else {
+                return false;
+            };
+            parts.iter().any(|part| {
+                is_inline_media_data_uri(match part {
+                    ChatCompletionRequestUserMessageContentPart::ImageUrl(part) => part
+                        .image_url
+                        .as_ref()
+                        .map(|image_url| image_url.url.as_str()),
+                    ChatCompletionRequestUserMessageContentPart::VideoUrl(part) => part
+                        .video_url
+                        .as_ref()
+                        .map(|video_url| video_url.url.as_str()),
+                    ChatCompletionRequestUserMessageContentPart::AudioUrl(part) => part
+                        .audio_url
+                        .as_ref()
+                        .map(|audio_url| audio_url.url.as_str()),
+                    _ => None,
+                })
+            })
+        }
+        ChatCompletionRequestMessage::Tool(tool_message) => {
+            let ChatCompletionRequestToolMessageContent::Array(parts) = &tool_message.content
+            else {
+                return false;
+            };
+            parts.iter().any(|part| {
+                is_inline_media_data_uri(match part {
+                    ChatCompletionRequestToolMessageContentPart::ImageUrl(part) => part
+                        .image_url
+                        .as_ref()
+                        .map(|image_url| image_url.url.as_str()),
+                    ChatCompletionRequestToolMessageContentPart::VideoUrl(part) => part
+                        .video_url
+                        .as_ref()
+                        .map(|video_url| video_url.url.as_str()),
+                    ChatCompletionRequestToolMessageContentPart::AudioUrl(part) => part
+                        .audio_url
+                        .as_ref()
+                        .map(|audio_url| audio_url.url.as_str()),
+                    _ => None,
+                })
+            })
+        }
+        _ => false,
+    })
+}
+
+fn sanitized_request_snapshot(
+    req: &NvCreateChatCompletionRequest,
+) -> Result<NvCreateChatCompletionRequest, String> {
+    if !request_contains_inline_media_data_uri(req) {
+        return Ok(req.clone());
+    }
+
+    // Use the request's serialized shape so every supported message/content
+    // variant is redacted without duplicating a mutable typed traversal. The
+    // read-only fast path above keeps text-only payload capture clone-only.
+    let mut value = serde_json::to_value(req).map_err(|error| error.to_string())?;
+    let redacted_count = redact_inline_media_data_uris(&mut value);
+    if redacted_count == 0 {
+        return Err("inline media was detected but no data URI was redacted".to_string());
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
 
 /// Context key for the allowlisted headers captured at the HTTP layer.
 pub const HTTP_HEADERS_CONTEXT_KEY: &str = "request_trace.http.request.headers";
@@ -130,16 +264,29 @@ fn create_handle_with_config(
     }
     let requested_streaming = req.inner.stream.unwrap_or(false);
     let model = req.inner.model.clone();
+    let request = match sanitized_request_snapshot(req) {
+        Ok(request) => request,
+        Err(error) => {
+            // Redaction is a privacy boundary. Fail closed rather than falling
+            // back to the original request, which may contain inline media.
+            tracing::warn!(
+                request_id,
+                %error,
+                "request payload skipped because inline-media sanitization failed"
+            );
+            return None;
+        }
+    };
 
     Some(RequestPayloadHandle {
         requested_streaming,
         request_id: request_id.to_string(),
         model,
-        // Snapshot the pristine inbound request (before the preprocessor
-        // overrides stream/usage) and stamp arrival time on the producing
-        // thread, so the record reflects what the client sent and when.
+        // Snapshot the inbound request before the preprocessor overrides
+        // stream/usage. Inline media bodies are replaced with compact metadata
+        // markers before the snapshot can reach any request-trace sink.
         event_time: SystemTime::now(),
-        request: Arc::new(req.clone()),
+        request: Arc::new(request),
         http_request_headers,
     })
 }
@@ -197,6 +344,99 @@ mod tests {
             handle.is_none(),
             "request_payload records disabled should skip payloads even with store=true"
         );
+    }
+
+    #[test]
+    fn request_payload_redacts_inline_media_and_preserves_urls() {
+        let image_body = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+        let video_body = "AAAAHGZ0eXBtcDQyAAAAAG1wNDJpc29t";
+        let image_data_uri = format!("data:image/png;base64,{image_body}");
+        let video_data_uri = format!("data:video/mp4;charset=binary;base64,{video_body}");
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe these inputs"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_data_uri}
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"}
+                    },
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": video_data_uri}
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let handle = create_handle_with_config(&request, "test-id", true, true, None).unwrap();
+        let serialized = serde_json::to_string(handle.request.as_ref()).unwrap();
+
+        assert!(!serialized.contains(image_body));
+        assert!(!serialized.contains(video_body));
+        assert!(serialized.contains("https://example.com/image.png"));
+        assert_eq!(serialized.matches(INLINE_MEDIA_REDACTION_TAG).count(), 2);
+        assert!(serialized.contains("data:image/png;base64,redacted-inline-media;"));
+        assert!(serialized.contains("data:video/mp4;charset=binary;base64,redacted-inline-media;"));
+        assert!(serialized.contains(&format!("encoded_bytes={}", image_body.len())));
+        assert!(serialized.contains(&format!(
+            "encoded_blake3={}",
+            blake3::hash(image_body.as_bytes()).to_hex()
+        )));
+    }
+
+    #[test]
+    fn request_payload_redacts_inline_media_in_tool_messages() {
+        // A tool observation (e.g. a screenshot returned by a tool) is the only
+        // inline media in the request; it must not take the clone-only fast path.
+        let image_body = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Take a screenshot"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "screenshot", "arguments": "{}"}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:image/png;base64,{image_body}")}
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let handle = create_handle_with_config(&request, "test-id", true, true, None).unwrap();
+        let serialized = serde_json::to_string(handle.request.as_ref()).unwrap();
+
+        assert!(
+            !serialized.contains(image_body),
+            "tool-message media leaked: {serialized}"
+        );
+        assert_eq!(serialized.matches(INLINE_MEDIA_REDACTION_TAG).count(), 1);
+    }
+
+    #[test]
+    fn inline_media_redaction_covers_media_data_uris_only() {
+        assert!(redact_inline_media_data_uri("https://example.com/image.png").is_none());
+        assert!(redact_inline_media_data_uri("data:text/plain;base64,aGVsbG8=").is_none());
+        assert!(redact_inline_media_data_uri("data:image/svg+xml,<svg/>").is_some());
+        assert!(redact_inline_media_data_uri("DATA:IMAGE/PNG;BASE64,AAAA").is_some());
     }
 
     #[test]
