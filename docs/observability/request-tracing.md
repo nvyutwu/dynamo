@@ -200,6 +200,14 @@ sink drops an oversized payload body, the row contains
 `payload_complete=false` and `payload_drop_reason`; captured HTTP headers are
 kept in the marker unless the marker itself still exceeds the limit.
 
+Before recording a request payload, Dynamo replaces the body of every inline
+image, video, or audio `data:` URI with a
+`redacted-inline-media;encoded_blake3=...;encoded_bytes=...` marker. The
+marker preserves the data URI metadata, including its MIME type, but does not
+contain the media body. The hash covers the encoded body in the parsed request.
+HTTP, HTTPS, and file URLs remain unchanged. This redaction applies to every
+request trace sink and cannot be disabled.
+
 Optional harness tool events use the `RequestTraceToolEventIngress` payload below. Dynamo normalizes these events into request trace rows before writing them to sinks.
 
 ```json
