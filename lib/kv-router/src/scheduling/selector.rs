@@ -796,6 +796,162 @@ mod tests {
     }
 
     #[test]
+    fn test_oracle_metrics_match_selected_best_worker() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.0,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+        ]);
+        let worker0 = WorkerWithDpRank::from_worker_id(0);
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let mut request = base_request(64);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .extend([(worker0, 4.0), (worker1, 2.0)]);
+        request
+            .overlap
+            .effective_cached_tokens
+            .extend([(worker0, 64), (worker1, 32)]);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker0);
+        assert_eq!(result.cached_tokens, 64);
+        assert_eq!(result.eligible_oracle_cached_tokens, 64);
+        assert_eq!(result.resident_oracle_cached_tokens, 64);
+    }
+
+    #[test]
+    fn test_oracle_metrics_expose_routing_regret() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.0,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+        ]);
+        let worker0 = WorkerWithDpRank::from_worker_id(0);
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let mut request = base_request(64);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .extend([(worker0, 4.0), (worker1, 1.0)]);
+        request
+            .overlap
+            .effective_cached_tokens
+            .extend([(worker0, 64), (worker1, 16)]);
+        request.worker_loads =
+            worker_loads_with_active_decode(FxHashMap::from_iter([(worker0, 10)]));
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker1);
+        assert_eq!(result.cached_tokens, 16);
+        assert_eq!(result.eligible_oracle_cached_tokens, 64);
+        assert_eq!(result.resident_oracle_cached_tokens, 64);
+    }
+
+    #[test]
+    fn test_oracle_metrics_respect_allowed_workers() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.0,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+        ]);
+        let worker0 = WorkerWithDpRank::from_worker_id(0);
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let mut request = base_request(64);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .extend([(worker0, 4.0), (worker1, 1.0)]);
+        request
+            .overlap
+            .effective_cached_tokens
+            .extend([(worker0, 64), (worker1, 16)]);
+        request.allowed_worker_ids = Some(HashSet::from([1]));
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker1);
+        assert_eq!(result.cached_tokens, 16);
+        assert_eq!(result.eligible_oracle_cached_tokens, 16);
+        assert_eq!(result.resident_oracle_cached_tokens, 16);
+    }
+
+    #[test]
+    fn test_oracle_metrics_respect_pinned_worker() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.0,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+        ]);
+        let worker0 = WorkerWithDpRank::from_worker_id(0);
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let mut request = base_request(64);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .extend([(worker0, 4.0), (worker1, 1.0)]);
+        request
+            .overlap
+            .effective_cached_tokens
+            .extend([(worker0, 64), (worker1, 16)]);
+        request.pinned_worker = Some(worker1);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker1);
+        assert_eq!(result.cached_tokens, 16);
+        assert_eq!(result.eligible_oracle_cached_tokens, 16);
+        assert_eq!(result.resident_oracle_cached_tokens, 16);
+    }
+
+    #[test]
     fn test_all_eligible_workers_overloaded_returns_overload_error() {
         use crate::test_utils::SimpleWorkerConfig;
 
