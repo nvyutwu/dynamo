@@ -34,7 +34,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, monitor_for_disconnects,
+        monitor_for_disconnects_with_activity,
+    },
     error::HttpError,
     metadata::{attach_x_request_id, extract_metadata_from_http},
     metrics::{
@@ -2396,6 +2399,18 @@ async fn chat_completions(
         ),
     );
 
+    let move_reasoning_to_content_when_empty =
+        crate::preprocessor::OpenAIPreprocessor::wants_reasoning_as_content_when_empty(
+            request.chat_template_args.as_ref(),
+        );
+    let parsing_options = parsing_options
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+    let stream_can_defer_all_output =
+        crate::preprocessor::OpenAIPreprocessor::stream_can_defer_all_output(
+            parsing_options.reasoning_parser.as_deref(),
+            request.chat_template_args.as_ref(),
+        );
+
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
@@ -2453,6 +2468,7 @@ async fn chat_completions(
         // Optionally prepend extra SSE events before each regular chunk:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
         //   - `event: reasoning_dispatch`  — complete reasoning block (emitted once)
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = async_stream::stream! {
             let mut stream = Box::pin(stream);
             let mut events: Vec<Result<Event, axum::Error>> = Vec::with_capacity(4);
@@ -2462,6 +2478,19 @@ async fn chat_completions(
 
                 // Drop empty chunks from multi-byte token assembly.
                 if response.data.as_ref().is_some_and(is_empty_stream_response) {
+                    let _ = activity_tx.send(());
+                    // Not forwarded, but the engine still generated these tokens,
+                    // so account for them before discarding. Otherwise the
+                    // real-time output-token counter undercounts and TTFT is
+                    // attributed to the first *renderable* chunk rather than the
+                    // first generated one. This already affected multi-byte token
+                    // assembly; the Nemotron force_nonempty_content deferral makes
+                    // empty chunks common enough to matter.
+                    process_chat_response_and_observe_metrics(
+                        &response,
+                        &mut response_collector,
+                        &mut http_queue_guard,
+                    );
                     continue;
                 }
                 if tool_dispatch_enabled {
@@ -2500,14 +2529,19 @@ async fn chat_completions(
                 }
             }
         };
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let keep_alive = state.sse_keep_alive_for_response(stream_can_defer_all_output);
+        let stream = monitor_for_disconnects_with_activity(
+            stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            activity_rx,
+        );
 
         let mut sse_stream = Sse::new(stream);
-
-        if let Some(keep_alive) = state.sse_keep_alive() {
+        if let Some(keep_alive) = keep_alive {
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
-
         Ok(sse_stream.into_response())
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
@@ -2894,6 +2928,21 @@ async fn responses(
             request.inner.tool_choice.as_ref(),
         ),
     );
+
+    // NOTE: `move_reasoning_to_content_when_empty` is the aggregator flag and is
+    // not set here. A non-streaming Responses request DOES reach the aggregator
+    // (forcing stream=true on the converted request only drives internal
+    // streaming; the client-facing `streaming` flag still selects the aggregating
+    // branch below), so it reaches it with the flag false.
+    //
+    // That is currently unreachable rather than wrong: the Responses-to-chat
+    // conversion hard-codes `chat_template_args: None`, so
+    // `force_nonempty_content` can never be set on this path in the first place.
+    // If that conversion ever forwards chat_template_args, the streaming stage
+    // would still cover the reasoning-only case — `postprocessor_parsing_stream`
+    // gates on the request's own args via `wants_reasoning_as_content_when_empty`
+    // rather than on this flag — but the aggregator backstop should be wired here
+    // too at that point. Tracked as follow-up.
 
     let mut response_collector = state
         .metrics_clone()

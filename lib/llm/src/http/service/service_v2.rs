@@ -50,6 +50,15 @@ use tower_http::trace::TraceLayer;
 
 use crate::frontend_config::{FrontendApiConfig, MetricsConfig};
 
+const DEFERRED_RESPONSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+fn effective_sse_keep_alive(
+    configured: Option<Duration>,
+    response_can_defer_all_output: bool,
+) -> Option<Duration> {
+    configured.or(response_can_defer_all_output.then_some(DEFERRED_RESPONSE_KEEP_ALIVE))
+}
+
 /// Middleware that echoes `x-request-id` from request to response headers.
 async fn echo_request_id_header(
     request: axum::extract::Request,
@@ -449,6 +458,13 @@ impl State {
     // TODO
     pub fn sse_keep_alive(&self) -> Option<Duration> {
         None
+    }
+
+    pub fn sse_keep_alive_for_response(
+        &self,
+        response_can_defer_all_output: bool,
+    ) -> Option<Duration> {
+        effective_sse_keep_alive(self.sse_keep_alive(), response_can_defer_all_output)
     }
 
     /// Returns true if Anthropic billing preamble stripping is enabled.

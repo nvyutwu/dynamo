@@ -53,7 +53,8 @@ use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
 
 use dynamo_parsers::{
-    ReasoningParser, ReasoningParserType, tool_calling::parsers::get_tool_parser_map,
+    ReasoningParser, ReasoningParserType, reasoning::ParserResult,
+    tool_calling::parsers::get_tool_parser_map,
 };
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, ResponseStream};
 use dynamo_runtime::pipeline::{
@@ -168,14 +169,72 @@ where
     attach_metrics_annotation(response, &metrics);
 }
 
-// Reasoning State for reasoning parsing transformation step
+// Per-choice state for reasoning parsing. Each streamed choice must own an
+// independent parser because choices can be interleaved.
+struct ChoiceReasoningState {
+    parser: Box<dyn ReasoningParser>,
+    guided_json_bypass_decision: Option<bool>,
+    pending_reasoning: String,
+    pending_content: String,
+    left_reasoning: bool,
+    drained: bool,
+    parser_finished: bool,
+}
+
+fn scrub_synthetic_chunk_metadata(
+    response: &mut Annotated<NvCreateChatCompletionStreamResponse>,
+) -> Option<()> {
+    response.event = None;
+    response.comment = None;
+    response.error = None;
+    let data = response.data.as_mut()?;
+    data.inner.usage = None;
+    data.llm_metrics = None;
+    data.nvext = None;
+    Some(())
+}
+
+fn drain_deferred_reasoning(state: &mut ChoiceReasoningState) -> (Option<String>, Option<String>) {
+    if state.drained {
+        return (None, None);
+    }
+    state.drained = true;
+    let pending = std::mem::take(&mut state.pending_reasoning);
+    let pending_content = std::mem::take(&mut state.pending_content);
+    let result = if state.parser_finished {
+        ParserResult::default()
+    } else {
+        state.parser_finished = true;
+        state.parser.finish_reasoning_stream()
+    };
+
+    if state.left_reasoning {
+        let mut content = pending_content;
+        content.push_str(&result.normal_text);
+        (
+            (!content.is_empty()).then_some(content),
+            (!result.reasoning_text.is_empty()).then_some(result.reasoning_text),
+        )
+    } else {
+        let mut text = pending;
+        text.push_str(&result.reasoning_text);
+        text.push_str(&result.normal_text);
+        if text.is_empty() {
+            text = pending_content;
+        }
+        ((!text.is_empty()).then_some(text), None)
+    }
+}
+
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
-    reasoning_parser: Option<Box<dyn ReasoningParser>>,
+    parser_name: String,
+    prompt_injected_reasoning: bool,
     bypass_bare_guided_json: bool,
-    // TODO: Track this per choice.index for n > 1. The current bypass
-    // decision and parser state are shared across all streamed choices.
-    guided_json_bypass_decision: Option<bool>,
+    choices: HashMap<u32, ChoiceReasoningState>,
+    last_response: Option<Annotated<NvCreateChatCompletionStreamResponse>>,
+    defer_reasoning_for_nonempty_content: bool,
+    saw_terminal_error: bool,
 }
 
 /// Per-image routing payload accumulated by `gather_multi_modal_data` and
@@ -2444,12 +2503,20 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
+        // Only a force_nonempty_content request needs the deferral and the EOF
+        // flush of a truncated `<think>` prefix; gating on the request keeps the
+        // per-token clone and the finish_reasoning_stream() flush off every
+        // other request's path. Same predicate the aggregator uses, so the
+        // streaming and non-streaming paths cannot disagree.
+        let defer_reasoning_for_nonempty_content =
+            Self::wants_reasoning_as_content_when_empty(request.chat_template_args.as_ref());
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
             Box::pin(Self::parse_reasoning_content_from_stream_inner(
                 stream,
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
                 prompt_injected_reasoning,
                 bypass_reasoning_for_bare_guided_json,
+                defer_reasoning_for_nonempty_content,
             ))
         } else if should_strip_disabled_reasoning_start {
             Box::pin(Self::strip_leading_reasoning_start_from_stream(
@@ -2458,6 +2525,12 @@ impl OpenAIPreprocessor {
         } else {
             Box::pin(stream)
         };
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            if defer_reasoning_for_nonempty_content || should_strip_disabled_reasoning_start {
+                Box::pin(Self::hold_usage_until_stream_end(stream))
+            } else {
+                stream
+            };
 
         // Check if tools are present and if we should apply jail. Use the
         // effective set (top-level ∪ Kimi K3 dynamic `messages[].tools`) so a
@@ -3194,6 +3267,71 @@ impl OpenAIPreprocessor {
         )
     }
 
+    /// Whether a request should surface parsed `reasoning_content` as `content`
+    /// when no content was generated: any request carrying
+    /// `force_nonempty_content=true`.
+    ///
+    /// Deliberately NOT keyed on the model or its reasoning parser. The flag is a
+    /// request-level contract — "this response will have non-empty content" — so
+    /// it is honored generically after parsing and before the response is sent,
+    /// rather than being reimplemented inside each model-specific parser. Keying
+    /// it on a parser allow-list means every new alias silently loses the
+    /// behavior until someone edits the list.
+    ///
+    /// Note it rides in on `chat_template_args` but is NOT consumed by the chat
+    /// template: the Nemotron template never reads `force_nonempty_content`, and
+    /// rendering with it set produces a byte-identical prompt. It is a
+    /// serving-layer flag that upstream happens to transport through the template
+    /// kwargs, which is why the check belongs in postprocessing and not in a
+    /// parser. So a client can set it on any model, and doing so is an explicit
+    /// request for non-empty content — honoring it generically is the intent, not
+    /// an accident of where the flag is declared.
+    ///
+    /// Drives both paths. The chat and Anthropic HTTP handlers pass it to the
+    /// aggregator via `ParsingOptions::move_reasoning_to_content_when_empty` for
+    /// non-streaming, and `postprocessor_parsing_stream` passes it as
+    /// `defer_reasoning_for_nonempty_content` so the streaming path can hold
+    /// reasoning back and reach the same answer at the terminal chunk. Both must
+    /// use this one predicate or the two paths would disagree on the same input.
+    ///
+    /// `enable_thinking` is intentionally not consulted here: when thinking is
+    /// off, reasoning parsing is disabled, so `reasoning_content` is always empty
+    /// and the move is vacuous rather than suppressed.
+    pub(crate) fn wants_reasoning_as_content_when_empty(
+        chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> bool {
+        chat_template_args.is_some_and(|args| {
+            args.get("force_nonempty_content") == Some(&serde_json::Value::Bool(true))
+        })
+    }
+
+    /// Whether this request's stream can withhold every data frame while it
+    /// buffers, which is the only reason to force SSE keep-alive frames on.
+    ///
+    /// The HTTP handlers used to gate the heartbeat on
+    /// `wants_reasoning_as_content_when_empty && reasoning_parser.is_some()`,
+    /// but that is broader than the deferral it describes: the buffering only
+    /// runs when `postprocessor_parsing_stream` takes its `should_parse_reasoning`
+    /// branch. A `force_nonempty_content=true` request with reasoning disabled
+    /// (`enable_thinking=false`) defers nothing, yet still got heartbeats — and
+    /// the configured interval is opt-in precisely because some
+    /// OpenAI-compatible clients do not ignore SSE comment frames.
+    ///
+    /// Known gap: `skip_reasoning_for_guided_json` also suppresses the deferral,
+    /// but it is derived from guided-output inspection that is not available at
+    /// the HTTP layer, so a guided-JSON bypass still enables the heartbeat when
+    /// nothing is withheld. That direction is conservative — extra comment
+    /// frames on an opt-in path rather than a silent stream — and closing it
+    /// needs the guided-output derivation lifted out of the stream builder.
+    pub(crate) fn stream_can_defer_all_output(
+        reasoning_parser: Option<&str>,
+        chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> bool {
+        reasoning_parser.is_some()
+            && Self::wants_reasoning_as_content_when_empty(chat_template_args)
+            && !Self::is_reasoning_disabled_by_request(reasoning_parser, chat_template_args)
+    }
+
     /// Parsers that begin streaming in reasoning mode (force_reasoning=true).
     /// These swallow any leading text without an open `<think>` tag as
     /// reasoning_content, so they cannot run on guided-decoding output where
@@ -3368,7 +3506,10 @@ impl OpenAIPreprocessor {
     /// Check if reasoning parsing should be disabled based on per-request parameters.
     /// For kimi_k25/K3: disabled when chat_template_args contains "thinking": false.
     /// For Nemotron force-reasoning aliases: disabled when chat_template_args
-    ///   contains "enable_thinking": false or "force_nonempty_content": true.
+    ///   contains "enable_thinking": false. "force_nonempty_content": true does
+    ///   NOT disable parsing (streaming or non-streaming): the parser stays on so
+    ///   reasoning is split from the answer, and reasoning is surfaced as content
+    ///   only when no content was generated (non-streaming, in the aggregator).
     /// For DeepSeek: follows the same effective mode used by the prompt renderer.
     /// For Mistral: disabled unless `reasoning_effort` is present and not `none`.
     /// For gemma4: disabled when chat_template_args contains "enable_thinking": false.
@@ -3388,16 +3529,22 @@ impl OpenAIPreprocessor {
                 dynamo_renderer::thinking_bool_from_args(chat_template_args) == Some(false)
             }
             parser if Self::is_nemotron_force_reasoning(parser) => {
-                if dynamo_renderer::thinking_bool_from_args(chat_template_args) == Some(false) {
-                    return true;
-                }
-                if let Some(args) = chat_template_args
-                    && let Some(force_nonempty) = args.get("force_nonempty_content")
-                    && force_nonempty == &serde_json::Value::Bool(true)
-                {
-                    return true;
-                }
-                false
+                // `enable_thinking=false` turns reasoning off entirely (streaming
+                // and non-streaming). `force_nonempty_content=true` does NOT
+                // disable parsing: keeping the parser on splits reasoning from the
+                // answer, so a reasoning+answer turn no longer leaks the reasoning
+                // text and `</think>` into `content`.
+                //
+                // The reasoning-*only* move (surface reasoning as content when the
+                // answer is empty) happens on both paths, by different means.
+                // Non-streaming uses the aggregator flag
+                // ParsingOptions::move_reasoning_to_content_when_empty. Streaming
+                // cannot retract a reasoning_content delta already sent, so it
+                // instead holds reasoning back until it knows whether an answer
+                // follows — see `defer_reasoning_for_nonempty_content` and
+                // `drain_deferred_reasoning`. Both end with the same contract: a
+                // reasoning-only turn surfaces its text as `content`.
+                dynamo_renderer::thinking_bool_from_args(chat_template_args) == Some(false)
             }
             Some("deepseek_v3" | "deepseek_v3_1") => {
                 !Self::deepseek_renderer_reasoning_enabled(chat_template_args, false)
@@ -3449,6 +3596,7 @@ impl OpenAIPreprocessor {
             parser_name,
             prompt_injected_reasoning,
             false,
+            false,
         )
     }
 
@@ -3457,93 +3605,246 @@ impl OpenAIPreprocessor {
         parser_name: String,
         prompt_injected_reasoning: bool,
         bypass_bare_guided_json: bool,
+        defer_reasoning_for_nonempty_content: bool,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
-        // Initialize reasoning parser from parser_name
-        let mut reasoning_parser = Box::new(ReasoningParserType::get_reasoning_parser_from_name(
-            parser_name.as_ref(),
-        )) as Box<dyn ReasoningParser>;
-
-        if prompt_injected_reasoning {
-            reasoning_parser.set_in_reasoning(true);
-        }
-
         let state = ReasoningState {
             stream: Box::pin(stream),
-            reasoning_parser: Some(reasoning_parser),
+            parser_name,
+            prompt_injected_reasoning,
             bypass_bare_guided_json,
-            guided_json_bypass_decision: None,
+            choices: HashMap::new(),
+            last_response: None,
+            defer_reasoning_for_nonempty_content,
+            saw_terminal_error: false,
         };
 
         stream::unfold(state, |mut state| async move {
             if let Some(response) = state.stream.next().await {
-                let guided_json_bypass_decision = if state.bypass_bare_guided_json {
-                    match state.guided_json_bypass_decision {
-                        Some(decision) => Some(decision),
-                        None => {
-                            // Decide once from the first non-whitespace content.
-                            let decision = response.data.as_ref().and_then(|data| {
-                                data.inner.choices.iter().find_map(|choice| {
-                                    if let Some(ChatCompletionMessageContent::Text(text)) =
-                                        choice.delta.content.as_ref()
-                                    {
-                                        let text = text.trim_start();
-                                        if text.is_empty() {
-                                            return None;
-                                        }
-                                        return Some(matches!(text.as_bytes()[0], b'[' | b'{'));
-                                    }
-                                    None
-                                })
-                            });
-                            if let Some(decision) = decision {
-                                state.guided_json_bypass_decision = Some(decision);
-                            }
-                            decision
-                        }
-                    }
-                } else {
-                    Some(false)
-                };
+                if response.is_error() {
+                    state.saw_terminal_error = true;
+                }
+                let processed_response = {
+                    let ReasoningState {
+                        parser_name,
+                        prompt_injected_reasoning,
+                        bypass_bare_guided_json,
+                        choices,
+                        defer_reasoning_for_nonempty_content,
+                        ..
+                    } = &mut state;
+                    let parser_name = &*parser_name;
+                    let prompt_injected_reasoning = *prompt_injected_reasoning;
+                    let bypass_bare_guided_json = *bypass_bare_guided_json;
+                    let defer_reasoning = *defer_reasoning_for_nonempty_content;
 
-                // Process the response through reasoning parser if available
-                let processed_response = if guided_json_bypass_decision != Some(false) {
-                    // Keep bare JSON and leading whitespace available to the tool jail.
-                    response
-                } else if let Some(ref mut parser) = state.reasoning_parser {
                     response.map_data(|mut data| {
-                        // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
-                            // Reasoning parsing only applies to text content
-                            if let Some(ChatCompletionMessageContent::Text(text)) =
-                                choice.delta.content.as_ref()
-                            {
-                                let parser_result =
-                                    parser.parse_reasoning_streaming_incremental(text, &[]);
+                            let choice_state = choices.entry(choice.index).or_insert_with(|| {
+                                let mut parser = Box::new(
+                                    ReasoningParserType::get_reasoning_parser_from_name(parser_name),
+                                ) as Box<dyn ReasoningParser>;
+                                if prompt_injected_reasoning {
+                                    parser.set_in_reasoning(true);
+                                }
+                                ChoiceReasoningState {
+                                    parser,
+                                    guided_json_bypass_decision: (!bypass_bare_guided_json)
+                                        .then_some(false),
+                                    pending_reasoning: String::new(),
+                                    pending_content: String::new(),
+                                    left_reasoning: false,
+                                    drained: false,
+                                    parser_finished: false,
+                                }
+                            });
 
-                                // Update this specific choice with parsed content
-                                choice.delta.content = parser_result
-                                    .get_some_normal_text()
-                                    .map(ChatCompletionMessageContent::Text);
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                            let bypass_decision = if bypass_bare_guided_json {
+                                match choice_state.guided_json_bypass_decision {
+                                    Some(decision) => Some(decision),
+                                    None => {
+                                        let decision = match choice.delta.content.as_ref() {
+                                            Some(ChatCompletionMessageContent::Text(text)) => {
+                                                let text = text.trim_start();
+                                                (!text.is_empty()).then(|| {
+                                                    matches!(text.as_bytes()[0], b'[' | b'{')
+                                                })
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(decision) = decision {
+                                            choice_state.guided_json_bypass_decision =
+                                                Some(decision);
+                                        }
+                                        decision
+                                    }
+                                }
+                            } else {
+                                Some(false)
+                            };
+
+                            if bypass_decision == Some(false)
+                                && let Some(ChatCompletionMessageContent::Text(text)) =
+                                    choice.delta.content.as_ref()
+                            {
+                                let parser_result = choice_state
+                                    .parser
+                                    .parse_reasoning_streaming_incremental(text, &[]);
+                                choice_state.drained = false;
+                                if defer_reasoning && !choice_state.left_reasoning {
+                                    choice_state
+                                        .pending_reasoning
+                                        .push_str(&parser_result.reasoning_text);
+                                    if parser_result.normal_text.trim().is_empty() {
+                                        choice_state
+                                            .pending_content
+                                            .push_str(&parser_result.normal_text);
+                                        choice.delta.content = None;
+                                        choice.delta.reasoning_content = None;
+                                    } else {
+                                        choice_state.left_reasoning = true;
+                                        choice.delta.reasoning_content = (!choice_state
+                                            .pending_reasoning
+                                            .is_empty())
+                                        .then(|| {
+                                            std::mem::take(&mut choice_state.pending_reasoning)
+                                        });
+                                        let mut text =
+                                            std::mem::take(&mut choice_state.pending_content);
+                                        text.push_str(&parser_result.normal_text);
+                                        choice.delta.content =
+                                            Some(ChatCompletionMessageContent::Text(text));
+                                    }
+                                } else {
+                                    choice.delta.content = parser_result
+                                        .get_some_normal_text()
+                                        .map(ChatCompletionMessageContent::Text);
+                                    choice.delta.reasoning_content =
+                                        parser_result.get_some_reasoning();
+                                }
                             }
-                            // For multimodal content, pass through unchanged
+
+                            let terminal_carries_parts = matches!(
+                                choice.delta.content,
+                                Some(ChatCompletionMessageContent::Parts(_))
+                            );
+                            if defer_reasoning
+                                && choice.finish_reason.is_some()
+                                && !terminal_carries_parts
+                                && bypass_decision == Some(false)
+                            {
+                                let (content, reasoning) = drain_deferred_reasoning(choice_state);
+                                if let Some(content) = content {
+                                    let merged = match choice.delta.content.take() {
+                                        Some(ChatCompletionMessageContent::Text(existing)) => {
+                                            existing + &content
+                                        }
+                                        Some(other) => {
+                                            choice.delta.content = Some(other);
+                                            content
+                                        }
+                                        None => content,
+                                    };
+                                    if choice.delta.content.is_none() {
+                                        choice.delta.content =
+                                            Some(ChatCompletionMessageContent::Text(merged));
+                                    }
+                                }
+                                if let Some(reasoning) = reasoning {
+                                    choice.delta.reasoning_content = Some(
+                                        choice.delta.reasoning_content.take().unwrap_or_default()
+                                            + &reasoning,
+                                    );
+                                }
+                            }
                         }
                         Ok(data)
                     })
-                } else {
-                    // No reasoning parser configured, pass through unchanged
-                    response
                 };
 
+                if state.defer_reasoning_for_nonempty_content
+                    && processed_response
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| !data.inner.choices.is_empty())
+                {
+                    state.last_response = Some(processed_response.clone());
+                }
                 Some((processed_response, state))
-            } else {
+            } else if !state.defer_reasoning_for_nonempty_content || state.saw_terminal_error {
                 None
+            } else {
+                let mut indices: Vec<u32> = state.choices.keys().copied().collect();
+                indices.sort_unstable();
+                #[allow(clippy::type_complexity)]
+                let flushed: Vec<(u32, Option<String>, Option<String>)> = indices
+                    .into_iter()
+                    .filter_map(|index| {
+                        let choice_state = state.choices.get_mut(&index)?;
+                        if choice_state.guided_json_bypass_decision != Some(false) {
+                            return None;
+                        }
+                        let (content, reasoning) = drain_deferred_reasoning(choice_state);
+                        (content.is_some() || reasoning.is_some())
+                            .then_some((index, content, reasoning))
+                    })
+                    .collect();
+                if flushed.is_empty() {
+                    return None;
+                }
+                let mut response = state.last_response.take()?;
+                scrub_synthetic_chunk_metadata(&mut response)?;
+                let data = response.data.as_mut()?;
+                let template = data.inner.choices.first()?.clone();
+                data.inner.choices = flushed
+                    .into_iter()
+                    .map(|(index, content, reasoning)| {
+                        let mut choice = template.clone();
+                        choice.index = index;
+                        choice.delta.role = None;
+                        choice.delta.tool_calls = None;
+                        choice.delta.function_call = None;
+                        choice.delta.refusal = None;
+                        choice.finish_reason = None;
+                        choice.logprobs = None;
+                        choice.delta.content = content.map(ChatCompletionMessageContent::Text);
+                        choice.delta.reasoning_content = reasoning;
+                        choice
+                    })
+                    .collect();
+                Some((response, state))
             }
         })
         .fuse()
+    }
+
+    fn hold_usage_until_stream_end<S>(
+        stream: S,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        async_stream::stream! {
+            tokio::pin!(stream);
+            let mut pending_usage = None;
+            while let Some(response) = stream.next().await {
+                let is_usage_only = response.data.as_ref().is_some_and(|data| {
+                    data.inner.choices.is_empty() && data.inner.usage.is_some()
+                });
+                if is_usage_only {
+                    if let Some(previous) = pending_usage.replace(response) {
+                        yield previous;
+                    }
+                } else {
+                    yield response;
+                }
+            }
+            if let Some(usage) = pending_usage {
+                yield usage;
+            }
+        }
     }
 
     // Motivation: when Nemotron reasoning is disabled by request flags, the
@@ -3650,35 +3951,49 @@ impl OpenAIPreprocessor {
                 }
 
                 response.data = Some(data);
-                state.last_response = Some(response.clone());
+                if response
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| !data.inner.choices.is_empty())
+                {
+                    state.last_response = Some(response.clone());
+                }
 
                 Some((response, state))
             } else if state.eof_flushed {
                 None
             } else {
                 state.eof_flushed = true;
-                let mut flushed = drain_undecided_buffers(&mut state.choices);
+                let flushed = drain_undecided_buffers(&mut state.choices);
                 if flushed.is_empty() {
                     None
                 } else {
                     let mut response = state.last_response.clone()?;
+                    // Same envelope problem as the reasoning-stream flush: this
+                    // is a clone of an already-counted chunk, so it goes through
+                    // the shared scrub rather than repeating a partial copy of
+                    // it here.
+                    scrub_synthetic_chunk_metadata(&mut response)?;
                     let data = response.data.as_mut()?;
-                    data.inner.usage = None;
-                    data.inner.choices.retain_mut(|choice| {
-                        if let Some(buffer) = flushed.remove(&choice.index) {
-                            choice.delta.role = None;
+                    let mut template = data.inner.choices.first()?.clone();
+                    template.delta.role = None;
+                    template.delta.tool_calls = None;
+                    template.delta.function_call = None;
+                    template.delta.refusal = None;
+                    template.delta.reasoning_content = None;
+                    template.finish_reason = None;
+                    template.logprobs = None;
+                    let mut flushed: Vec<_> = flushed.into_iter().collect();
+                    flushed.sort_unstable_by_key(|(index, _)| *index);
+                    data.inner.choices = flushed
+                        .into_iter()
+                        .map(|(index, buffer)| {
+                            let mut choice = template.clone();
+                            choice.index = index;
                             choice.delta.content = Some(ChatCompletionMessageContent::Text(buffer));
-                            choice.delta.tool_calls = None;
-                            choice.delta.function_call = None;
-                            choice.delta.refusal = None;
-                            choice.delta.reasoning_content = None;
-                            choice.finish_reason = None;
-                            choice.logprobs = None;
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                            choice
+                        })
+                        .collect();
 
                     if data.inner.choices.is_empty() {
                         None
@@ -5223,7 +5538,7 @@ mod tests {
                     "SGLang gate mismatch for {description}"
                 );
                 assert_eq!(
-                    !OpenAIPreprocessor::is_reasoning_disabled_by_request(Some("kimi_k25"), args),
+                    !OpenAIPreprocessor::is_reasoning_disabled_by_request(Some("kimi_k25"), args,),
                     expected,
                     "postprocessor gate mismatch for {description}"
                 );
@@ -5608,8 +5923,8 @@ mod tests {
             (
                 Some("nemotron3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron3 + force_nonempty_content=true → NOT disabled (parser stays on)",
             ),
             (
                 Some("nemotron_v3"),
@@ -5620,8 +5935,8 @@ mod tests {
             (
                 Some("nemotron_v3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron_v3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron_v3 + force_nonempty_content=true → NOT disabled (parser stays on)",
             ),
             // deepseek_v4 — same convention as deepseek_r1; verify all three aliases
             // (deepseek_v4 / deepseek-v4 / deepseekv4) plus both signal keys.
@@ -5742,6 +6057,8 @@ mod tests {
             ),
         ];
 
+        // The disable decision no longer depends on streaming — `enable_thinking`
+        // and the per-family signals decide it identically for both paths.
         for (parser, args, expected, desc) in cases {
             assert_eq!(
                 OpenAIPreprocessor::is_reasoning_disabled_by_request(parser, args),
@@ -5749,6 +6066,37 @@ mod tests {
                 "FAILED: {desc}",
             );
         }
+
+        // force_nonempty_content=true does NOT disable reasoning parsing for
+        // either path: the parser stays on so reasoning is split from the answer
+        // (no leak). Non-streaming additionally moves reasoning into content when
+        // no content was generated (the aggregator); streaming skips that move.
+        assert!(
+            !OpenAIPreprocessor::is_reasoning_disabled_by_request(
+                Some("nemotron3"),
+                Some(&force_nonempty_content_true),
+            ),
+            "nemotron3 + force_nonempty_content=true → NOT disabled",
+        );
+        assert!(
+            !OpenAIPreprocessor::is_reasoning_disabled_by_request(
+                Some("nemotron_v3"),
+                Some(&force_nonempty_content_true),
+            ),
+            "nemotron_v3 + force_nonempty_content=true → NOT disabled",
+        );
+        // enable_thinking=false disables entirely (user turned thinking off).
+        assert!(
+            OpenAIPreprocessor::is_reasoning_disabled_by_request(
+                Some("nemotron3"),
+                Some(&enable_thinking_false),
+            ),
+            "nemotron3 + enable_thinking=false → disabled",
+        );
+
+        // The force_nonempty_content=true → NOT disabled behavior is what lets a
+        // reasoning-only non-streaming turn surface reasoning as content; verify
+        // the aggregator half in test_move_reasoning_to_content_when_empty.
     }
 
     /// Different query strings must produce different hashes. `?v=1` and

@@ -30,7 +30,9 @@ use tracing::Instrument;
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, monitor_for_disconnects_with_activity,
+    },
     metrics::{
         CancellationLabels, Endpoint,
         process_chat_response_and_observe_metrics as process_response_and_observe_metrics,
@@ -360,6 +362,18 @@ async fn anthropic_messages(
         ),
     );
 
+    let move_reasoning_to_content_when_empty =
+        crate::preprocessor::OpenAIPreprocessor::wants_reasoning_as_content_when_empty(
+            request.chat_template_args.as_ref(),
+        );
+    let parsing_options = parsing_options
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+    let stream_can_defer_all_output =
+        crate::preprocessor::OpenAIPreprocessor::stream_can_defer_all_output(
+            parsing_options.reasoning_parser.as_deref(),
+            request.chat_template_args.as_ref(),
+        );
+
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // Create inflight_guard early to ensure all errors are counted
@@ -439,6 +453,7 @@ async fn anthropic_messages(
 
         let mut http_queue_guard = Some(http_queue_guard);
         let mut engine_stream = engine_stream;
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let full_stream = async_stream::stream! {
             let mut events = Vec::with_capacity(4);
@@ -450,6 +465,7 @@ async fn anthropic_messages(
             let mut saw_error = false;
 
             while let Some(annotated_chunk) = engine_stream.next().await {
+                let _ = activity_tx.send(());
                 process_response_and_observe_metrics(
                     &annotated_chunk,
                     &mut response_collector,
@@ -479,13 +495,19 @@ async fn anthropic_messages(
             }
         };
 
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let keep_alive = state.sse_keep_alive_for_response(stream_can_defer_all_output);
+        let stream = monitor_for_disconnects_with_activity(
+            full_stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            activity_rx,
+        );
 
         let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = state.sse_keep_alive() {
+        if let Some(keep_alive) = keep_alive {
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
-
         Ok(sse_stream.into_response())
     } else {
         // Non-streaming path: aggregate stream into single response
