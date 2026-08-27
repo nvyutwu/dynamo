@@ -77,7 +77,7 @@ pub(crate) fn emit_request_end(
         kv_hit_rate: None,
         kv_transfer_estimated_latency_ms: None,
         queue_depth: None,
-        worker: None,
+        worker: tracker.get_worker_info().map(Into::into),
         replay: Some(replay),
         finish_reason_metadata: None,
     };
@@ -227,6 +227,49 @@ mod tests {
                 .input_length,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn emits_aggregated_worker_ids_without_agent_context() {
+        BUS.init(16);
+        let mut rx = BUS.subscribe();
+        let tracker = RequestTracker::new();
+        tracker.record_worker(
+            42,
+            Some(3),
+            crate::protocols::common::timing::WORKER_TYPE_DECODE,
+        );
+
+        emit_request_end(
+            "req-worker".to_string(),
+            &tracker,
+            RequestReplayMetrics {
+                trace_block_size: 2,
+                input_length: 2,
+                input_sequence_hashes: vec![11],
+            },
+        );
+
+        let record = loop {
+            let record = rx.recv().await.unwrap();
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|request| request.request_id == "req-worker")
+            {
+                break record;
+            }
+        };
+        assert!(record.agent_context.is_none());
+        let worker = record
+            .request
+            .as_ref()
+            .and_then(|request| request.worker.as_ref())
+            .expect("worker metadata");
+        assert_eq!(worker.prefill_worker_id, Some(42));
+        assert_eq!(worker.prefill_dp_rank, Some(3));
+        assert_eq!(worker.decode_worker_id, Some(42));
+        assert_eq!(worker.decode_dp_rank, Some(3));
     }
 
     #[test]

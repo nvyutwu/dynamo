@@ -23,7 +23,7 @@ use crate::protocols::openai::{
 };
 use crate::request_trace::{
     DEFAULT_TOOL_EVENTS_TOPIC, FinishReasonMetadata, RequestReplayMetrics, RequestTraceMetrics,
-    RequestTraceWorkerInfo, ToolCallMetadata, tool_relay::ToolEventRelay,
+    ToolCallMetadata, tool_relay::ToolEventRelay,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -193,16 +193,9 @@ pub(crate) fn request_metrics(
     tracker: Option<&RequestTracker>,
 ) -> RequestTraceMetrics {
     let timing = tracker.map(RequestTracker::get_timing_info);
-    let worker = tracker.and_then(|tracker| {
-        tracker
-            .get_worker_info()
-            .map(|worker| RequestTraceWorkerInfo {
-                prefill_worker_id: worker.prefill_worker_id,
-                prefill_dp_rank: worker.prefill_dp_rank,
-                decode_worker_id: worker.decode_worker_id,
-                decode_dp_rank: worker.decode_dp_rank,
-            })
-    });
+    let worker = tracker
+        .and_then(RequestTracker::get_worker_info)
+        .map(Into::into);
 
     RequestTraceMetrics {
         request_id,

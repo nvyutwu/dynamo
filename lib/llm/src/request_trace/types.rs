@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocols::common::extensions::AgentContext;
+use crate::protocols::common::extensions::{AgentContext, WorkerIdInfo};
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
@@ -135,6 +135,17 @@ pub struct RequestTraceWorkerInfo {
     pub decode_worker_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_dp_rank: Option<u32>,
+}
+
+impl From<WorkerIdInfo> for RequestTraceWorkerInfo {
+    fn from(worker: WorkerIdInfo) -> Self {
+        Self {
+            prefill_worker_id: worker.prefill_worker_id,
+            prefill_dp_rank: worker.prefill_dp_rank,
+            decode_worker_id: worker.decode_worker_id,
+            decode_dp_rank: worker.decode_dp_rank,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
