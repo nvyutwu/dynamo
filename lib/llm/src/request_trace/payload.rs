@@ -48,14 +48,12 @@ fn redact_inline_media_data_uri(value: &str) -> Option<String> {
 
 fn redact_inline_media_data_uris(value: &mut serde_json::Value) -> usize {
     match value {
-        serde_json::Value::Array(values) => values
-            .iter_mut()
-            .map(redact_inline_media_data_uris)
-            .sum(),
-        serde_json::Value::Object(values) => values
-            .values_mut()
-            .map(redact_inline_media_data_uris)
-            .sum(),
+        serde_json::Value::Array(values) => {
+            values.iter_mut().map(redact_inline_media_data_uris).sum()
+        }
+        serde_json::Value::Object(values) => {
+            values.values_mut().map(redact_inline_media_data_uris).sum()
+        }
         serde_json::Value::String(value) => {
             let Some(redacted) = redact_inline_media_data_uri(value) else {
                 return 0;
@@ -352,9 +350,7 @@ mod tests {
         assert!(serialized.contains("https://example.com/image.png"));
         assert_eq!(serialized.matches(INLINE_MEDIA_REDACTION_TAG).count(), 2);
         assert!(serialized.contains("data:image/png;base64,redacted-inline-media;"));
-        assert!(
-            serialized.contains("data:video/mp4;charset=binary;base64,redacted-inline-media;")
-        );
+        assert!(serialized.contains("data:video/mp4;charset=binary;base64,redacted-inline-media;"));
         assert!(serialized.contains(&format!("encoded_bytes={}", image_body.len())));
         assert!(serialized.contains(&format!(
             "encoded_blake3={}",
