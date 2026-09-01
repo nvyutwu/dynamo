@@ -107,6 +107,8 @@ _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
 _RL_INIT_WEIGHTS_TIMEOUT_ENV = "DYN_RL_INIT_WEIGHTS_TIMEOUT_S"
 _RL_INIT_WEIGHTS_TIMEOUT_DEFAULT_S = 30.0
+_KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY: Final = "kv_transfer_params"
+_ROUTER_HINT_EXTRA_ARGS_KEY: Final = "router_hint"
 _LORA_LOCK_STRIPES = 64
 _DISTRIBUTED_WEIGHT_UPDATE_RESERVED_KEYS: Final = frozenset(
     {
@@ -817,28 +819,32 @@ def build_sampling_params(
         sampling_params.max_tokens = min(configured_default, dynamic_default)
 
     if isinstance(extra_args, dict):
-        router_hint = extra_args.get("router_hint")
-        if isinstance(router_hint, dict):
-            source_control_endpoint = router_hint.get("source_control_endpoint")
-            block_hashes = router_hint.get("block_hashes")
-            if (
-                isinstance(source_control_endpoint, str)
-                and source_control_endpoint
-                and isinstance(block_hashes, list)
-                and block_hashes
-            ):
-                if sampling_params.extra_args is None:
-                    sampling_params.extra_args = {}
-                kv_transfer_params = sampling_params.extra_args.setdefault(
-                    "kv_transfer_params", {}
+        request_kv_transfer_params = extra_args.get(_KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY)
+        if isinstance(request_kv_transfer_params, dict):
+            passthrough_router_hint = request_kv_transfer_params.get(
+                _ROUTER_HINT_EXTRA_ARGS_KEY
+            )
+            if isinstance(passthrough_router_hint, dict):
+                passthrough_extra_args = (
+                    dict(sampling_params.extra_args)
+                    if isinstance(sampling_params.extra_args, dict)
+                    else {}
                 )
-                if isinstance(kv_transfer_params, dict):
-                    # Compatibility shim: current vLLM KVCC consumes the router
-                    # hint as a remote-G2 plan under kv_transfer_params.
-                    kv_transfer_params["remote_g2_plan"] = {
-                        "source_control_endpoint": source_control_endpoint,
-                        "block_hashes": block_hashes,
-                    }
+                existing_kv_transfer_params = passthrough_extra_args.get(
+                    _KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY
+                )
+                passthrough_kv_transfer_params = (
+                    dict(existing_kv_transfer_params)
+                    if isinstance(existing_kv_transfer_params, dict)
+                    else {}
+                )
+                passthrough_kv_transfer_params[
+                    _ROUTER_HINT_EXTRA_ARGS_KEY
+                ] = passthrough_router_hint
+                passthrough_extra_args[
+                    _KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY
+                ] = passthrough_kv_transfer_params
+                sampling_params.extra_args = passthrough_extra_args
 
     # Dynamo's internal token path consumes disjoint token deltas. This mirrors
     # the SGLang integration and lets vLLM's stream_interval gate reduce backend
@@ -847,6 +853,33 @@ def build_sampling_params(
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
 
     return sampling_params
+
+
+def _update_kv_transfer_params(
+    sampling_params: SamplingParams,
+    kv_transfer_params: Mapping[str, Any],
+    *,
+    preserve_router_hint: bool = False,
+) -> None:
+    extra_args = (
+        dict(sampling_params.extra_args)
+        if isinstance(sampling_params.extra_args, dict)
+        else {}
+    )
+    updated_params = dict(kv_transfer_params)
+    updated_params.pop(_ROUTER_HINT_EXTRA_ARGS_KEY, None)
+
+    existing_params = extra_args.get(_KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY)
+    router_hint = (
+        existing_params.get(_ROUTER_HINT_EXTRA_ARGS_KEY)
+        if preserve_router_hint and isinstance(existing_params, Mapping)
+        else None
+    )
+    if isinstance(router_hint, Mapping):
+        updated_params[_ROUTER_HINT_EXTRA_ARGS_KEY] = router_hint
+
+    extra_args[_KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY] = updated_params
+    sampling_params.extra_args = extra_args
 
 
 def build_sampling_params_openai(
@@ -2276,9 +2309,6 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             }
 
                             runtime_config = ModelRuntimeConfig()
-                            enable_router_hint_support(
-                                runtime_config, self.config.engine_args
-                            )
                             runtime_config.context_length = self.model_max_len
                             runtime_config.tool_call_parser = (
                                 self.config.dyn_tool_call_parser
@@ -2317,6 +2347,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                                 lora_needs_set = []
                             if self.config.route_to_encoder:
                                 lora_needs_set.append(WorkerType.Encode)
+                            runtime_config.data_parallel_start_rank = self.dp_range[0]
+                            runtime_config.data_parallel_size = self.dp_range[1]
+                            enable_router_hint_support(
+                                runtime_config,
+                                self.config.engine_args,
+                                lora_worker_type,
+                                self.dp_range,
+                            )
                             lora_needs: list[list[WorkerType]] = (
                                 [lora_needs_set] if lora_needs_set else []
                             )
@@ -3183,9 +3221,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         )
 
         if kv_params is not None:
-            if sampling_params.extra_args is None:
-                sampling_params.extra_args = {}
-            sampling_params.extra_args["kv_transfer_params"] = kv_params
+            _update_kv_transfer_params(sampling_params, kv_params)
             logger.debug(
                 f"Using disaggregated params from prefill for request {request_id}"
             )
@@ -3485,11 +3521,11 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         kv_protocol: KvConnectorProtocol = make_kv_connector_protocol(
             self.engine_client.vllm_config
         )
-        if sampling_params.extra_args is None:
-            sampling_params.extra_args = {}
-        sampling_params.extra_args[
-            "kv_transfer_params"
-        ] = kv_protocol.prefill_request_kv_transfer_params()
+        _update_kv_transfer_params(
+            sampling_params,
+            kv_protocol.prefill_request_kv_transfer_params(),
+            preserve_router_hint=True,
+        )
         # Override for prefill: only generate 1 token
         sampling_params.max_tokens = 1
         sampling_params.min_tokens = 1

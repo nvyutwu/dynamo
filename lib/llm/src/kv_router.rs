@@ -412,39 +412,45 @@ where
         cache_hit_for_worker(cache_hit_estimates, worker)
     }
 
+    fn has_router_hint_capable_workers(&self) -> bool {
+        self.workers_with_configs.borrow().values().any(|config| {
+            let start = config.data_parallel_start_rank();
+            let end = start.saturating_add(config.data_parallel_size());
+            (start..end).any(|dp_rank| config.router_hint_metadata_for_dp_rank(dp_rank).is_some())
+        })
+    }
+
     fn router_hint_for_selection(
         &self,
         target: WorkerWithDpRank,
         target_cached_prefix_blocks: u32,
         candidates: Option<&RouterHintRootCandidates>,
     ) -> Option<RouterHint> {
-        if !self.kv_router_config.router_hints {
-            return None;
-        }
         let candidates = candidates?;
 
         let (block_hashes, source_control_endpoint) = {
             let configs = self.workers_with_configs.borrow();
             let target_config = configs.get(&target.worker_id)?;
-            if !target_config.supports_router_hints() {
-                return None;
-            }
+            let target_metadata = target_config.router_hint_metadata_for_dp_rank(target.dp_rank)?;
 
             let prefix_blocks_to_beat =
                 usize::try_from(target_cached_prefix_blocks).unwrap_or(usize::MAX);
             let (source, block_hashes) =
                 candidates.best_source(prefix_blocks_to_beat, |worker| {
                     worker != target
-                        && configs
-                            .get(&worker.worker_id)
-                            .is_some_and(|config| {
-                                config.supports_router_hints()
-                                    && config.router_hint_source_control_endpoint().is_some()
-                            })
+                        && configs.get(&worker.worker_id).is_some_and(|config| {
+                            config
+                                .router_hint_metadata_for_dp_rank(worker.dp_rank)
+                                .is_some_and(|source_metadata| {
+                                    source_metadata.worker_type == target_metadata.worker_type
+                                        && source_metadata.source_control_endpoint.is_some()
+                                })
+                        })
                 })?;
             let source_control_endpoint = configs
                 .get(&source.worker_id)?
-                .router_hint_source_control_endpoint()?
+                .router_hint_metadata_for_dp_rank(source.dp_rank)?
+                .source_control_endpoint?
                 .to_string();
             (block_hashes, source_control_endpoint)
         };
@@ -456,7 +462,6 @@ where
         Some(RouterHint {
             source_control_endpoint,
             block_hashes,
-            target_cached_prefix_blocks,
         })
     }
 
@@ -684,8 +689,9 @@ where
         let seq_hash_elapsed = start.elapsed();
 
         let supports_overlap_refresh = self.scheduler.supports_overlap_refresh();
+        let retain_router_hint_chain = self.has_router_hint_capable_workers();
         let retain_block_hashes =
-            supports_overlap_refresh || return_routing_hashes || self.kv_router_config.router_hints;
+            supports_overlap_refresh || return_routing_hashes || retain_router_hint_chain;
 
         let TieredLookupResult {
             tiered_matches,
@@ -701,7 +707,7 @@ where
             block_hashes,
             cache_namespace.as_deref(),
             retain_block_hashes,
-            self.kv_router_config.router_hints,
+            retain_router_hint_chain,
         )
         .await?;
 

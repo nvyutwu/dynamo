@@ -172,6 +172,13 @@ pub fn compute_seq_hash_for_block(block_hashes: &[LocalBlockHash]) -> Vec<Sequen
     sequence_hashes
 }
 
+/// Router-hint metadata exposed by a worker config for one global DP rank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouterHintWorkerMetadata<'a> {
+    pub worker_type: &'a str,
+    pub source_control_endpoint: Option<&'a str>,
+}
+
 /// Trait abstracting the worker configuration fields needed by the scheduling layer.
 ///
 /// `ModelRuntimeConfig` (in `lib/llm`) implements this directly so no adapter type is needed.
@@ -181,13 +188,11 @@ pub trait WorkerConfigLike {
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
 
-    /// Whether this worker can consume router_hint extra args attached by the KV router.
-    fn supports_router_hints(&self) -> bool {
-        false
-    }
-
-    /// Advertised peer-control endpoint used as a router_hint source, if available.
-    fn router_hint_source_control_endpoint(&self) -> Option<&str> {
+    /// Router-hint capability and source metadata for a specific global DP rank.
+    fn router_hint_metadata_for_dp_rank(
+        &self,
+        _dp_rank: DpRank,
+    ) -> Option<RouterHintWorkerMetadata<'_>> {
         None
     }
 

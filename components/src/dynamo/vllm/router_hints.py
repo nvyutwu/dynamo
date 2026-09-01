@@ -3,69 +3,138 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
-from typing import Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.engine.arg_utils import AsyncEngineArgs
 
 from dynamo.common.constants import (
     ROUTER_HINT_RUNTIME_CAPABILITY_KEY,
-    ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY,
+    ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
+    ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
 )
+from dynamo.llm import ModelRuntimeConfig, WorkerType
 
 
-def _get(value: Any, key: str) -> Any:
-    if isinstance(value, dict):
-        return value.get(key)
-    return getattr(value, key, None)
-
-
-def _secondary_tiers(engine_args: Any) -> list[Any]:
-    kv_config = _get(engine_args, "kv_transfer_config")
-    extra_config = _get(kv_config, "kv_connector_extra_config")
-    secondary_tiers = _get(extra_config, "secondary_tiers")
+def _secondary_tiers(engine_args: AsyncEngineArgs) -> list[Mapping[str, Any]]:
+    kv_config = getattr(engine_args, "kv_transfer_config", None)
+    extra_config = getattr(kv_config, "kv_connector_extra_config", None)
+    if not isinstance(extra_config, Mapping):
+        return []
+    secondary_tiers = extra_config.get("secondary_tiers")
     if not isinstance(secondary_tiers, list):
         return []
-    return secondary_tiers
+    return [tier for tier in secondary_tiers if isinstance(tier, Mapping)]
 
 
-def _supports_router_hint(tier: Any) -> bool:
-    capabilities = _get(tier, "router_capabilities")
-    if not isinstance(capabilities, list):
-        return False
-    return ROUTER_HINT_RUNTIME_CAPABILITY_KEY in capabilities
+def _supports_router_hint(tier: Mapping[str, Any]) -> bool:
+    capabilities = tier.get("router_capabilities")
+    return isinstance(capabilities, list) and (
+        ROUTER_HINT_RUNTIME_CAPABILITY_KEY in capabilities
+    )
 
 
-def _router_hint_source_control_endpoint(engine_args: Any) -> str | None:
-    for tier in _secondary_tiers(engine_args):
-        if not _supports_router_hint(tier):
-            continue
-        try:
-            control_port = int(_get(tier, "control_port"))
-        except (TypeError, ValueError):
+def _router_hint_tiers(engine_args: AsyncEngineArgs) -> list[Mapping[str, Any]]:
+    return [tier for tier in _secondary_tiers(engine_args) if _supports_router_hint(tier)]
+
+
+def _router_hint_source_host(host: str | None) -> str | None:
+    if not host:
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.is_unspecified:
+        return None
+    if address.version == 6:
+        return f"[{address.compressed}]"
+    return address.compressed
+
+
+def _router_hint_source_port(configured_port: object) -> int | None:
+    if isinstance(configured_port, bool) or not isinstance(configured_port, (int, str)):
+        return None
+    try:
+        control_port = int(configured_port)
+    except ValueError:
+        return None
+    return control_port if 0 < control_port <= 65535 else None
+
+
+def _router_hint_source_control_endpoints(
+    tier: Mapping[str, Any], dp_range: tuple[int, int]
+) -> dict[str, str] | None:
+    dp_start, dp_size = dp_range
+    if dp_start < 0 or dp_size <= 0:
+        return None
+    control_ports = tier.get("control_ports")
+    if not isinstance(control_ports, list):
+        raise ValueError("router_hint support requires control_ports to be a list")
+    if len(control_ports) != dp_size:
+        raise ValueError(
+            "router_hint support requires control_ports to contain exactly "
+            f"{dp_size} entries for the worker-local DP ranks; got {len(control_ports)}"
+        )
+    configured_host = tier.get("control_advertise_host")
+    host = _router_hint_source_host(
+        configured_host if isinstance(configured_host, str) else None
+    )
+    if host is None:
+        return None
+
+    endpoints: dict[str, str] = {}
+    for local_dp_rank, global_dp_rank in enumerate(range(dp_start, dp_start + dp_size)):
+        control_port = _router_hint_source_port(control_ports[local_dp_rank])
+        if control_port is None:
             return None
-        if control_port <= 0:
-            return None
-        host = _get(tier, "control_advertise_host") or _get(tier, "control_host")
-        if not isinstance(host, str) or not host or host in {"0.0.0.0", "::"}:
-            return None
-        return f"tcp://{host}:{control_port}"
-
-    return None
+        endpoints[str(global_dp_rank)] = f"tcp://{host}:{control_port}"
+    return endpoints
 
 
-def enable_router_hint_support(runtime_config: Any, engine_args: Any) -> None:
-    if not any(_supports_router_hint(tier) for tier in _secondary_tiers(engine_args)):
+def _router_hint_worker_type(worker_type: WorkerType) -> str | None:
+    role = getattr(worker_type, "value", None)
+    if not isinstance(role, str):
+        role = str(worker_type)
+    if role == "agg":
+        role = "aggregated"
+    return role if role in {"aggregated", "prefill", "decode"} else None
+
+
+def enable_router_hint_support(
+    runtime_config: ModelRuntimeConfig,
+    engine_args: AsyncEngineArgs,
+    worker_type: WorkerType,
+    dp_range: tuple[int, int] = (0, 1),
+) -> None:
+    router_hint_worker_type = _router_hint_worker_type(worker_type)
+    if router_hint_worker_type is None:
         return
 
-    control_endpoint = _router_hint_source_control_endpoint(engine_args)
-    if control_endpoint is None:
+    router_hint_tiers = _router_hint_tiers(engine_args)
+    if not router_hint_tiers:
+        return
+    if len(router_hint_tiers) > 1:
         raise ValueError(
-            "router_hint support requires an advertisable source control endpoint; "
-            "set control_advertise_host and a positive control_port on the "
-            "router_hint secondary tier"
+            "router_hint support requires exactly one router-hint-capable secondary tier"
         )
 
-    runtime_config.set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, "true")
+    endpoints = _router_hint_source_control_endpoints(router_hint_tiers[0], dp_range)
+    if endpoints is None:
+        raise ValueError(
+            "router_hint support requires advertisable source control endpoints "
+            "for all managed DP ranks"
+        )
+
     runtime_config.set_engine_specific(
-        ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY,
-        json.dumps(control_endpoint),
+        ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, json.dumps(endpoints)
+    )
+    runtime_config.set_engine_specific(
+        ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY, json.dumps(router_hint_worker_type)
+    )
+    runtime_config.set_engine_specific(
+        ROUTER_HINT_RUNTIME_CAPABILITY_KEY, json.dumps(True)
     )

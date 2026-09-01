@@ -23,11 +23,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 #[cfg(feature = "bench")]
 use super::WorkerObservationState;
 use super::{EventKind, KvIndexerMetrics, SyncIndexer, WorkerLookupStats, WorkerTask};
-use crate::router_hint::RouterHintRootCandidates;
 use crate::protocols::{
     ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheEventError, KvCacheStoreData,
     KvCacheStoredBlockData, LocalBlockHash, OverlapScores, RouterEvent, WorkerWithDpRank,
 };
+use crate::router_hint::RouterHintRootCandidates;
 
 type WorkerSet = FxHashSet<WorkerWithDpRank>;
 type FrontierBuckets = FxHashMap<Option<ExternalSequenceBlockHash>, WorkerSet>;
@@ -995,6 +995,7 @@ mod tests {
                 ExternalSequenceBlockHash(102)
             ]
         );
+        assert_eq!(candidates.owner_prefix_blocks, vec![(worker, 2)]);
     }
 
     #[test]

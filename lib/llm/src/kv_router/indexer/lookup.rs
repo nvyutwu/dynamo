@@ -164,7 +164,6 @@ impl TieredMatchProvider for Indexer {
     ) -> Result<TieredMatchDetails, KvRouterError> {
         self.find_matches_by_tier_ref(sequence).await
     }
-
 }
 
 impl<'a> LookupPipeline<'a> {

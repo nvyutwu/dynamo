@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use validator::{Validate, ValidationError};
 
 use dynamo_kv_router::{
-    protocols::KvTransferEnforcement,
+    protocols::{KvTransferEnforcement, RouterHintWorkerMetadata},
     router_hint::{
-        ROUTER_HINT_RUNTIME_CAPABILITY_KEY, ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY,
+        ROUTER_HINT_RUNTIME_CAPABILITY_KEY, ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
+        ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
     },
 };
 use dynamo_runtime::protocols::EndpointId;
@@ -320,6 +321,26 @@ impl Default for ModelRuntimeConfig {
     }
 }
 
+impl ModelRuntimeConfig {
+    fn router_hints_enabled(&self) -> bool {
+        match self.runtime_data.get(ROUTER_HINT_RUNTIME_CAPABILITY_KEY) {
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(serde_json::Value::String(value)) => value == "true",
+            _ => false,
+        }
+    }
+
+    fn router_hint_endpoint_for_dp_rank(&self, dp_rank: u32) -> Option<&str> {
+        let endpoint = self
+            .runtime_data
+            .get(ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY)?
+            .as_object()?
+            .get(&dp_rank.to_string())?
+            .as_str()?;
+        (!endpoint.is_empty()).then_some(endpoint)
+    }
+}
+
 impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
     fn data_parallel_start_rank(&self) -> u32 {
         self.data_parallel_start_rank
@@ -337,21 +358,24 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
         self.total_kv_blocks
     }
 
-    fn supports_router_hints(&self) -> bool {
-        match self.runtime_data.get(ROUTER_HINT_RUNTIME_CAPABILITY_KEY) {
-            Some(serde_json::Value::Bool(true)) => true,
-            // Python ModelRuntimeConfig.set_engine_specific currently stores
-            // engine-specific values as strings.
-            Some(serde_json::Value::String(value)) => value == "true",
-            _ => false,
+    fn router_hint_metadata_for_dp_rank(
+        &self,
+        dp_rank: u32,
+    ) -> Option<RouterHintWorkerMetadata<'_>> {
+        if !self.router_hints_enabled() {
+            return None;
         }
-    }
-
-    fn router_hint_source_control_endpoint(&self) -> Option<&str> {
-        self.runtime_data
-            .get(ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY)
-            .and_then(serde_json::Value::as_str)
-            .filter(|endpoint| !endpoint.is_empty())
+        let worker_type = self
+            .runtime_data
+            .get(ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY)?
+            .as_str()?;
+        if worker_type.is_empty() {
+            return None;
+        }
+        Some(RouterHintWorkerMetadata {
+            worker_type,
+            source_control_endpoint: self.router_hint_endpoint_for_dp_rank(dp_rank),
+        })
     }
 
     fn native_offloading_capacity_tokens(&self) -> Option<u64> {
@@ -767,34 +791,43 @@ mod tests {
         use dynamo_kv_router::WorkerConfigLike;
 
         let mut config = ModelRuntimeConfig::default();
-        assert!(!config.supports_router_hints());
+        assert!(config.router_hint_metadata_for_dp_rank(0).is_none());
 
         config
             .set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, true)
             .unwrap();
-        assert!(config.supports_router_hints());
+        assert!(config.router_hint_metadata_for_dp_rank(0).is_none());
 
         config
-            .set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, "true")
+            .set_engine_specific(ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY, "prefill")
             .unwrap();
-        assert!(config.supports_router_hints());
+        let metadata = config.router_hint_metadata_for_dp_rank(0).unwrap();
+        assert_eq!(metadata.worker_type, "prefill");
+        assert!(metadata.source_control_endpoint.is_none());
+
+        config
+            .set_engine_specific(
+                ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
+                serde_json::json!({"0": "tcp://127.0.0.1:23280"}),
+            )
+            .unwrap();
+        let metadata = config.router_hint_metadata_for_dp_rank(0).unwrap();
+        assert_eq!(
+            metadata.source_control_endpoint,
+            Some("tcp://127.0.0.1:23280")
+        );
+        assert!(
+            config
+                .router_hint_metadata_for_dp_rank(1)
+                .unwrap()
+                .source_control_endpoint
+                .is_none()
+        );
 
         config
             .set_engine_specific(ROUTER_HINT_RUNTIME_CAPABILITY_KEY, "false")
             .unwrap();
-        assert!(!config.supports_router_hints());
-
-        assert!(config.router_hint_source_control_endpoint().is_none());
-        config
-            .set_engine_specific(
-                ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY,
-                "tcp://127.0.0.1:23280",
-            )
-            .unwrap();
-        assert_eq!(
-            config.router_hint_source_control_endpoint(),
-            Some("tcp://127.0.0.1:23280")
-        );
+        assert!(config.router_hint_metadata_for_dp_rank(0).is_none());
     }
 
     #[test]

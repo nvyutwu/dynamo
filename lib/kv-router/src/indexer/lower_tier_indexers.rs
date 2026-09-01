@@ -260,7 +260,39 @@ pub fn query_lower_tiers_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::{LocalBlockHash, OverlapScores, WorkerWithDpRank};
+    use crate::indexer::KvIndexerInterface;
+    use crate::protocols::{
+        ExternalSequenceBlockHash, KvCacheEventData, KvCacheStoreData, LocalBlockHash,
+        OverlapScores, WorkerWithDpRank,
+    };
+    use crate::test_utils::{router_event, stored_blocks_with_sequence_hashes};
+
+    fn local_hashes(values: &[u64]) -> Vec<LocalBlockHash> {
+        values.iter().copied().map(LocalBlockHash).collect()
+    }
+
+    fn store_event(
+        worker_id: u64,
+        dp_rank: u32,
+        event_id: u64,
+        parent_hash: Option<u64>,
+        local_values: &[u64],
+        external_hashes: &[u64],
+    ) -> crate::protocols::RouterEvent {
+        router_event(
+            worker_id,
+            event_id,
+            dp_rank,
+            KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: parent_hash.map(ExternalSequenceBlockHash),
+                start_position: None,
+                blocks: stored_blocks_with_sequence_hashes(
+                    &local_hashes(local_values),
+                    external_hashes,
+                ),
+            }),
+        )
+    }
 
     #[test]
     fn query_lower_tiers_returns_empty_when_no_tiers_allocated() {

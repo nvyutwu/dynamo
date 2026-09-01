@@ -13,9 +13,12 @@ pub const ROUTER_HINT_EXTRA_ARGS_KEY: &str = "router_hint";
 /// Worker runtime_data key. Boolean true means the worker can consume router_hint extra args.
 pub const ROUTER_HINT_RUNTIME_CAPABILITY_KEY: &str = "router_hint";
 
-/// Worker runtime_data key for the advertised KVCC control endpoint.
-pub const ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY: &str =
-    "router_hint_source_control_endpoint";
+/// Worker runtime_data key for matching router-hint sources to targets by backend role.
+pub const ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY: &str = "router_hint_worker_type";
+
+/// Worker runtime_data key for per-global-DP-rank advertised KVCC control endpoints.
+pub const ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY: &str =
+    "router_hint_source_control_endpoints";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouterHint {
@@ -23,8 +26,6 @@ pub struct RouterHint {
     /// Root-aligned source-side KV block hashes. `block_hashes[i]`
     /// corresponds to request block `i`; the target decides which suffix to fetch.
     pub block_hashes: Vec<ExternalSequenceBlockHash>,
-    /// Router's view of the selected target's locally cached contiguous prefix.
-    pub target_cached_prefix_blocks: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

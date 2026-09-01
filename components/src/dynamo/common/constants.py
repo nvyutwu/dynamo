@@ -6,7 +6,10 @@
 from enum import Enum
 
 ROUTER_HINT_RUNTIME_CAPABILITY_KEY = "router_hint"
-ROUTER_HINT_SOURCE_CONTROL_ENDPOINT_RUNTIME_KEY = "router_hint_source_control_endpoint"
+ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY = "router_hint_worker_type"
+ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY = (
+    "router_hint_source_control_endpoints"
+)
 
 class DisaggregationMode(Enum):
     """Disaggregation mode for LLM workers."""
