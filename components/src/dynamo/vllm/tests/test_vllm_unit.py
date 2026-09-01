@@ -1192,6 +1192,9 @@ def test_build_sampling_params_forwards_router_hint_under_kv_transfer_params():
 
     router_hint = {
         "source_control_endpoint": "tcp://127.0.0.1:23280",
+        "source_inventory_epoch": 7,
+        "start_block": 1,
+        "hinted_blocks": 1,
         "block_hashes": [11, 22],
     }
     request = {

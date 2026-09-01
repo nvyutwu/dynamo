@@ -13,8 +13,8 @@ use validator::{Validate, ValidationError};
 use dynamo_kv_router::{
     protocols::{KvTransferEnforcement, RouterHintWorkerMetadata},
     router_hint::{
-        ROUTER_HINT_RUNTIME_CAPABILITY_KEY, ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
-        ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
+        ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY, ROUTER_HINT_RUNTIME_CAPABILITY_KEY,
+        ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
     },
 };
 use dynamo_runtime::protocols::EndpointId;
@@ -375,6 +375,10 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
         Some(RouterHintWorkerMetadata {
             worker_type,
             source_control_endpoint: self.router_hint_endpoint_for_dp_rank(dp_rank),
+            source_inventory_epoch: self
+                .runtime_data
+                .get(ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY)
+                .and_then(serde_json::Value::as_u64),
         })
     }
 
@@ -804,6 +808,7 @@ mod tests {
         let metadata = config.router_hint_metadata_for_dp_rank(0).unwrap();
         assert_eq!(metadata.worker_type, "prefill");
         assert!(metadata.source_control_endpoint.is_none());
+        assert!(metadata.source_inventory_epoch.is_none());
 
         config
             .set_engine_specific(
@@ -815,6 +820,18 @@ mod tests {
         assert_eq!(
             metadata.source_control_endpoint,
             Some("tcp://127.0.0.1:23280")
+        );
+        assert!(metadata.source_inventory_epoch.is_none());
+
+        config
+            .set_engine_specific(ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY, 42_u64)
+            .unwrap();
+        assert_eq!(
+            config
+                .router_hint_metadata_for_dp_rank(0)
+                .unwrap()
+                .source_inventory_epoch,
+            Some(42)
         );
         assert!(
             config

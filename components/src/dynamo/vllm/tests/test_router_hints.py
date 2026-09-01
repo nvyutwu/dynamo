@@ -8,12 +8,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from dynamo.common.constants import (
+    ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
     ROUTER_HINT_RUNTIME_CAPABILITY_KEY,
     ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
     ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
 )
 from dynamo.llm import WorkerType
 from dynamo.vllm.router_hints import enable_router_hint_support
+from dynamo.vllm.router_hints import _ROUTER_HINT_INVENTORY_EPOCH
 
 
 def engine_args(tiers):
@@ -45,6 +47,10 @@ def test_enable_router_hint_support_maps_explicit_ports_to_global_dp_ranks():
     )
     runtime_config.set_engine_specific.assert_any_call(
         ROUTER_HINT_RUNTIME_CAPABILITY_KEY, json.dumps(True)
+    )
+    runtime_config.set_engine_specific.assert_any_call(
+        ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
+        json.dumps(_ROUTER_HINT_INVENTORY_EPOCH),
     )
 
 

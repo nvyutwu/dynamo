@@ -469,6 +469,9 @@ mod tests {
             .unwrap();
         let hint = RouterHint {
             source_control_endpoint: "tcp://127.0.0.1:23280".to_string(),
+            source_inventory_epoch: 7,
+            start_block: 1,
+            hinted_blocks: 1,
             block_hashes: vec![ExternalSequenceBlockHash(11), ExternalSequenceBlockHash(22)],
         };
 
@@ -487,6 +490,18 @@ mod tests {
         assert_eq!(
             extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["block_hashes"],
             serde_json::json!([11, 22])
+        );
+        assert_eq!(
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["source_inventory_epoch"],
+            7
+        );
+        assert_eq!(
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["start_block"],
+            1
+        );
+        assert_eq!(
+            extra_args[KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY][ROUTER_HINT_EXTRA_ARGS_KEY]["hinted_blocks"],
+            1
         );
     }
 
@@ -516,6 +531,9 @@ mod tests {
                 .unwrap();
             let hint = RouterHint {
                 source_control_endpoint: "tcp://127.0.0.1:23280".to_string(),
+                source_inventory_epoch: 8,
+                start_block: 0,
+                hinted_blocks: 1,
                 block_hashes: vec![ExternalSequenceBlockHash(33)],
             };
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import secrets
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -12,11 +13,17 @@ if TYPE_CHECKING:
     from vllm.engine.arg_utils import AsyncEngineArgs
 
 from dynamo.common.constants import (
+    ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
     ROUTER_HINT_RUNTIME_CAPABILITY_KEY,
     ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
     ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
 )
 from dynamo.llm import ModelRuntimeConfig, WorkerType
+
+
+# One random generation per backend process. A restarted process advertises a new
+# value even when it reuses the same stable worker identity or control endpoint.
+_ROUTER_HINT_INVENTORY_EPOCH = secrets.randbits(64)
 
 
 def _secondary_tiers(engine_args: AsyncEngineArgs) -> list[Mapping[str, Any]]:
@@ -131,6 +138,10 @@ def enable_router_hint_support(
 
     runtime_config.set_engine_specific(
         ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, json.dumps(endpoints)
+    )
+    runtime_config.set_engine_specific(
+        ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
+        json.dumps(_ROUTER_HINT_INVENTORY_EPOCH),
     )
     runtime_config.set_engine_specific(
         ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY, json.dumps(router_hint_worker_type)

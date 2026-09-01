@@ -40,6 +40,9 @@ use rs::protocols::annotated::Annotated as RsAnnotated;
 use tracing;
 
 use llm_rs::kv_router::KvPushRouter as RsKvPushRouter;
+use llm_rs::kv_router::metrics::{
+    InventoryMismatchReason, record_inventory_mismatch as record_inventory_mismatch_metric,
+};
 use llm_rs::kv_router::publisher::{KvEventSourceConfig, create_stored_blocks};
 use llm_rs::protocols::common::timing::RequestTracker;
 use llm_rs::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
@@ -50,6 +53,16 @@ use super::entrypoint::AicPerfConfig;
 mod demand_driven;
 
 const MAX_RESPONSE_BUFFER_SIZE: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+#[pyfunction]
+pub fn record_kv_inventory_mismatch(reason: &str, blocks: u64) -> PyResult<bool> {
+    let reason = InventoryMismatchReason::from_label(reason).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported inventory mismatch reason: {reason}"
+        ))
+    })?;
+    Ok(record_inventory_mismatch_metric(reason, blocks))
+}
 
 #[cfg(any(feature = "slot-tracker", feature = "select-service"))]
 fn parse_nonzero_port(value: &str) -> Result<u16, String> {

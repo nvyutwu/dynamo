@@ -647,10 +647,10 @@ pub mod router {
     pub const RESIDENT_ORACLE_CACHED_TOKENS_TOTAL: &str =
         "router_resident_oracle_cached_tokens_total";
 
-    /// Best useful prefix overlap among allowed resident workers, in blocks.
+    /// Best compatible integer source prefix advertised to the router, in blocks.
     pub const MAX_OVERLAP_BLOCKS_TOTAL: &str = "kv_router_max_overlap_blocks_total";
 
-    /// Useful prefix overlap on the selected worker, in blocks.
+    /// Integer device prefix on the selected worker, in blocks.
     pub const SELECTED_OVERLAP_BLOCKS_TOTAL: &str = "kv_router_selected_overlap_blocks_total";
 
     /// Routing opportunity not resident on the selected worker, in blocks.
@@ -662,8 +662,15 @@ pub mod router {
     /// Producer-to-router age of inventory events.
     pub const INVENTORY_EVENT_LAG_SECONDS: &str = "kv_router_inventory_event_lag_seconds";
 
+    /// Inventory batches rejected because their producer timestamp is invalid.
+    pub const INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL: &str =
+        "kv_router_inventory_event_timestamp_invalid_total";
+
     /// Missing inventory sequence identifiers observed by the router.
     pub const INVENTORY_SEQUENCE_GAP_TOTAL: &str = "kv_router_inventory_sequence_gap_total";
+
+    /// Repeated or out-of-order inventory sequence identifiers by bounded reason.
+    pub const INVENTORY_SEQUENCE_ANOMALY_TOTAL: &str = "kv_router_inventory_sequence_anomaly_total";
 
     /// Inventory blocks rejected during reconciliation, partitioned by bounded reason.
     pub const INVENTORY_MISMATCH_BLOCKS_TOTAL: &str = "kv_router_inventory_mismatch_blocks_total";

@@ -408,7 +408,7 @@ Not all metrics appear in every deployment. The chart below shows which metric g
 
 Histograms and counters for aggregate request-level statistics. Eagerly registered via `from_component()` with the DRT `MetricsRegistry` hierarchy. On the frontend, exposed at `/metrics` on the HTTP port (default 8000) via the `drt_metrics` bridge. On the standalone router (`python -m dynamo.router`), exposed on `DYN_SYSTEM_PORT` when set. Populated per-request when `--router-mode kv` is active; registered with zero values in non-KV modes.
 
-All metrics carry the standard hierarchy labels (`dynamo_namespace`, `dynamo_component`, `dynamo_endpoint`).
+The established request metrics carry the standard hierarchy labels (`dynamo_namespace`, `dynamo_component`, `dynamo_endpoint`). The four R3 block counters below are deliberately identity-free so their conservation equations can be evaluated directly.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -423,22 +423,24 @@ All metrics carry the standard hierarchy labels (`dynamo_namespace`, `dynamo_com
 | `dynamo_component_router_selected_cached_tokens_total` | Counter | Predicted cached tokens on the selected worker |
 | `dynamo_component_router_eligible_oracle_cached_tokens_total` | Counter | Best cached tokens after overload filtering |
 | `dynamo_component_router_resident_oracle_cached_tokens_total` | Counter | Best cached tokens before overload filtering |
-| `dynamo_component_kv_router_max_overlap_blocks_total` | Counter | `M`: best useful prefix overlap among allowed resident workers |
-| `dynamo_component_kv_router_selected_overlap_blocks_total` | Counter | `L`: useful prefix overlap on the selected worker |
-| `dynamo_component_kv_router_remediation_blocks_total` | Counter | `R = max(0, M-L)`: routing opportunity missing on the selected worker |
-| `dynamo_component_kv_router_hint_blocks_total` | Counter | `H`: remediation blocks represented by successfully attached compact hints |
+| `kv_router_max_overlap_blocks_total` | Counter | `M`: best compatible integer source prefix advertised to the router |
+| `kv_router_selected_overlap_blocks_total` | Counter | `L`: integer device prefix on the selected worker |
+| `kv_router_remediation_blocks_total` | Counter | `R = max(0, M-L)`: routing opportunity missing on the selected worker |
+| `kv_router_hint_blocks_total` | Counter | `H`: remediation suffix represented by successfully attached compact hints |
 
-The block counters are recorded from one scheduling snapshot and capped at the request block count. `H` is also capped at `R`, so `0 <= H <= R` remains true when only part of an opportunity is represented by a hint.
+The block counters are identity-free metric families: worker IDs, router IDs, endpoints, and request IDs are not labels. They use raw integer prefix blocks rather than weighted scheduling credit, are recorded from one routing snapshot, and are capped at the request block count. `H` is also capped at `R`, so `0 <= H <= R` remains true when only part of an opportunity is represented by a hint.
 
-#### KV Inventory Health (`dynamo_component_kv_router_inventory_*`)
+#### KV Inventory Health (`kv_router_inventory_*`)
 
 These worker-side metrics are registered with the KV event publisher. They measure whether the router's cache view is timely and reconcilable; an absent series is not equivalent to zero.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `dynamo_component_kv_router_inventory_event_lag_seconds` | Histogram | Producer timestamp to router-ingress age for decoded ZMQ inventory batches; invalid or future timestamps are ignored |
-| `dynamo_component_kv_router_inventory_sequence_gap_total` | Counter | Missing ZMQ envelope sequence numbers plus missing direct-publisher event IDs |
-| `dynamo_component_kv_router_inventory_mismatch_blocks_total{reason}` | Counter | Rejected inventory blocks; `reason` is bounded to `source_missing`, `epoch_mismatch`, `worker_unreachable`, or `layout_mismatch` |
+| `kv_router_inventory_event_lag_seconds` | Histogram | Producer timestamp to router-ingress age for decoded ZMQ inventory batches |
+| `kv_router_inventory_event_timestamp_invalid_total` | Counter | Non-finite, negative, or future producer timestamps excluded from the lag histogram |
+| `kv_router_inventory_sequence_gap_total` | Counter | Missing ZMQ envelope sequence numbers plus missing direct-publisher event IDs |
+| `kv_router_inventory_sequence_anomaly_total{reason}` | Counter | Repeated or out-of-order sequence IDs, with a bounded `reason` |
+| `kv_router_inventory_mismatch_blocks_total{reason}` | Counter | Rejected inventory blocks; `reason` is bounded to `source_missing`, `epoch_mismatch`, `worker_unreachable`, or `layout_mismatch` |
 
 #### Per-Request Routing Overhead (`dynamo_router_overhead_*`)
 

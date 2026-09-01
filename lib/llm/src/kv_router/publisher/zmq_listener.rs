@@ -13,7 +13,7 @@ use dynamo_kv_router::protocols::*;
 use dynamo_kv_router::zmq_wire::*;
 
 use crate::kv_router::metrics::{
-    forward_sequence_gap, inventory_event_lag_seconds, kv_publisher_metrics,
+    forward_sequence_gap, inventory_event_lag_seconds, kv_publisher_metrics, sequence_anomaly,
 };
 use crate::utils::zmq::{connect_sub_socket, multipart_message};
 
@@ -105,12 +105,16 @@ pub(super) async fn start_zmq_listener(
                         .duration_since(UNIX_EPOCH)
                         .map(|duration| duration.as_secs_f64())
                         .ok();
-                    if let Some(lag) = now.and_then(|now| inventory_event_lag_seconds(batch.ts, now)) {
-                        metrics.observe_inventory_event_lag(lag);
+                    match now.and_then(|now| inventory_event_lag_seconds(batch.ts, now)) {
+                        Some(lag) => metrics.observe_inventory_event_lag(lag),
+                        None => metrics.increment_inventory_timestamp_invalid(),
                     }
                     let gap = forward_sequence_gap(last_engine_seq, engine_seq);
                     if gap > 0 {
                         metrics.increment_inventory_sequence_gap(gap);
+                    }
+                    if let Some(reason) = sequence_anomaly(last_engine_seq, engine_seq) {
+                        metrics.increment_inventory_sequence_anomaly(reason);
                     }
                 }
                 if last_engine_seq.is_none_or(|previous| engine_seq > previous) {

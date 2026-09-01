@@ -56,6 +56,52 @@ use dynamo_runtime::metrics::prometheus_names::{
 fn router_metric(suffix: &str) -> String {
     format!("{}{}", router_request::METRIC_PREFIX, suffix)
 }
+
+fn register_identity_free_counter(
+    component: &Component,
+    name: &str,
+    help: &str,
+) -> prometheus::IntCounter {
+    let counter = prometheus::IntCounter::new(name, help)
+        .unwrap_or_else(|error| panic!("failed to create {name}: {error}"));
+    component
+        .get_metrics_registry()
+        .add_metric(Box::new(counter.clone()))
+        .unwrap_or_else(|error| panic!("failed to register {name}: {error}"));
+    counter
+}
+
+fn register_identity_free_histogram(
+    component: &Component,
+    name: &str,
+    help: &str,
+    buckets: Vec<f64>,
+) -> prometheus::Histogram {
+    let histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(name, help).buckets(buckets),
+    )
+    .unwrap_or_else(|error| panic!("failed to create {name}: {error}"));
+    component
+        .get_metrics_registry()
+        .add_metric(Box::new(histogram.clone()))
+        .unwrap_or_else(|error| panic!("failed to register {name}: {error}"));
+    histogram
+}
+
+fn register_identity_free_counter_vec(
+    component: &Component,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> prometheus::IntCounterVec {
+    let counter = prometheus::IntCounterVec::new(prometheus::Opts::new(name, help), labels)
+        .unwrap_or_else(|error| panic!("failed to create {name}: {error}"));
+    component
+        .get_metrics_registry()
+        .add_metric(Box::new(counter.clone()))
+        .unwrap_or_else(|error| panic!("failed to register {name}: {error}"));
+    counter
+}
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use prometheus::{HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts};
 
@@ -80,9 +126,8 @@ fn async_overhead_buckets() -> Vec<f64> {
 // KV publisher metrics
 // ---------------------------------------------------------------------------
 
-/// Metrics for the KV publisher, created via the MetricsHierarchy API.
-/// This provides automatic `dynamo_namespace`, `dynamo_component`, and other
-/// hierarchy labels for free.
+/// Metrics for the KV publisher. Legacy publisher metrics use the component
+/// hierarchy; R3 inventory-health metrics register directly without identity labels.
 pub(crate) struct KvPublisherMetrics {
     /// Total number of raw events dropped by engines before reaching publisher.
     pub engines_dropped_events_total: IntCounter,
@@ -96,8 +141,10 @@ pub(crate) struct KvPublisherMetrics {
     pub zmq_suspicious_events_total: IntCounterVec,
     /// Producer-to-router age for decoded KV inventory batches.
     pub inventory_event_lag_seconds: prometheus::Histogram,
+    pub inventory_event_timestamp_invalid_total: IntCounter,
     /// Missing sequence identifiers in either direct or ZMQ inventory streams.
     pub inventory_sequence_gap_total: IntCounter,
+    pub inventory_sequence_anomaly_total: IntCounterVec,
     /// Blocks rejected during inventory reconciliation by a bounded reason.
     inventory_mismatch_blocks_total: IntCounterVec,
 }
@@ -126,14 +173,32 @@ impl InventoryMismatchReason {
             Self::LayoutMismatch => "layout_mismatch",
         }
     }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "source_missing" => Some(Self::SourceMissing),
+            "epoch_mismatch" => Some(Self::EpochMismatch),
+            "worker_unreachable" => Some(Self::WorkerUnreachable),
+            "layout_mismatch" => Some(Self::LayoutMismatch),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn inventory_event_lag_seconds(producer_timestamp: f64, now: f64) -> Option<f64> {
-    if !producer_timestamp.is_finite() || !now.is_finite() {
+    if !producer_timestamp.is_finite() || producer_timestamp < 0.0 || !now.is_finite() {
         return None;
     }
     let lag = now - producer_timestamp;
     (lag >= 0.0).then_some(lag)
+}
+
+pub(crate) fn sequence_anomaly(previous: Option<u64>, current: u64) -> Option<&'static str> {
+    match previous {
+        Some(previous) if current == previous => Some("repeated"),
+        Some(previous) if current < previous => Some("out_of_order"),
+        _ => None,
+    }
 }
 
 pub(crate) fn forward_sequence_gap(previous: Option<u64>, current: u64) -> u64 {
@@ -193,29 +258,37 @@ impl KvPublisherMetrics {
                         &[],
                     )
                     .expect("failed to create kv_publisher_zmq_suspicious_events_total");
-                let inventory_event_lag_seconds = metrics
-                    .create_histogram(
-                        router::INVENTORY_EVENT_LAG_SECONDS,
-                        "Producer-to-router age of decoded KV inventory batches",
-                        &[],
-                        Some(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]),
-                    )
-                    .expect("failed to create kv_router_inventory_event_lag_seconds");
-                let inventory_sequence_gap_total = metrics
-                    .create_intcounter(
-                        router::INVENTORY_SEQUENCE_GAP_TOTAL,
-                        "Missing sequence identifiers in KV inventory streams",
-                        &[],
-                    )
-                    .expect("failed to create kv_router_inventory_sequence_gap_total");
-                let inventory_mismatch_blocks_total = metrics
-                    .create_intcountervec(
-                        router::INVENTORY_MISMATCH_BLOCKS_TOTAL,
-                        "KV inventory blocks rejected during reconciliation",
-                        &["reason"],
-                        &[],
-                    )
-                    .expect("failed to create kv_router_inventory_mismatch_blocks_total");
+                let inventory_event_lag_seconds = register_identity_free_histogram(
+                    component,
+                    router::INVENTORY_EVENT_LAG_SECONDS,
+                    "Producer-to-router age of decoded KV inventory batches",
+                    vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+                );
+                let inventory_sequence_gap_total = register_identity_free_counter(
+                    component,
+                    router::INVENTORY_SEQUENCE_GAP_TOTAL,
+                    "Missing sequence identifiers in KV inventory streams",
+                );
+                let inventory_event_timestamp_invalid_total = register_identity_free_counter(
+                    component,
+                    router::INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL,
+                    "Decoded KV inventory batches with an invalid producer timestamp",
+                );
+                let inventory_sequence_anomaly_total = register_identity_free_counter_vec(
+                    component,
+                    router::INVENTORY_SEQUENCE_ANOMALY_TOTAL,
+                    "Repeated or out-of-order KV inventory sequence identifiers",
+                    &["reason"],
+                );
+                for reason in ["repeated", "out_of_order"] {
+                    inventory_sequence_anomaly_total.with_label_values(&[reason]);
+                }
+                let inventory_mismatch_blocks_total = register_identity_free_counter_vec(
+                    component,
+                    router::INVENTORY_MISMATCH_BLOCKS_TOTAL,
+                    "KV inventory blocks rejected during reconciliation",
+                    &["reason"],
+                );
                 for reason in InventoryMismatchReason::ALL {
                     inventory_mismatch_blocks_total.with_label_values(&[reason.as_label()]);
                 }
@@ -227,7 +300,9 @@ impl KvPublisherMetrics {
                     zmq_conversion_issues_total,
                     zmq_suspicious_events_total,
                     inventory_event_lag_seconds,
+                    inventory_event_timestamp_invalid_total,
                     inventory_sequence_gap_total,
+                    inventory_sequence_anomaly_total,
                     inventory_mismatch_blocks_total,
                 })
             })
@@ -269,6 +344,17 @@ impl KvPublisherMetrics {
 
     pub fn increment_inventory_sequence_gap(&self, count: u64) {
         self.inventory_sequence_gap_total.inc_by(count);
+    }
+
+    pub fn increment_inventory_timestamp_invalid(&self) {
+        self.inventory_event_timestamp_invalid_total.inc();
+    }
+
+    pub fn increment_inventory_sequence_anomaly(&self, reason: &'static str) {
+        debug_assert!(matches!(reason, "repeated" | "out_of_order"));
+        self.inventory_sequence_anomaly_total
+            .with_label_values(&[reason])
+            .inc();
     }
 
     fn record_inventory_mismatch(&self, reason: InventoryMismatchReason, blocks: u64) {
@@ -886,14 +972,14 @@ impl RoutingOverheadMetrics {
 }
 
 // ---------------------------------------------------------------------------
-// Router request metrics (dynamo_component_router_* via MetricsHierarchy)
+// Router request metrics (legacy hierarchy families plus identity-free R3 families)
 // ---------------------------------------------------------------------------
 
 /// Aggregate per-request metrics observed at the router level.
 ///
-/// Component-scoped via `from_component()` to get automatic `dynamo_component_` prefix,
-/// `dynamo_namespace`/`dynamo_component`/`dynamo_endpoint` labels, and registration
-/// with the DRT `MetricsRegistry` hierarchy.
+/// `from_component()` registers established request metrics through the component
+/// hierarchy and registers the R3 M/L/R/H block counters directly, without identity
+/// labels, in the component's DRT registry.
 ///
 /// # Scrapeability
 ///
@@ -910,14 +996,11 @@ impl RoutingOverheadMetrics {
 /// Both the frontend pipeline and the standalone router (via Python bindings)
 /// create a `KvPushRouter`, so both get these metrics registered automatically.
 ///
-/// # Why component-scoped
+/// # Registration scope
 ///
-/// These metrics MUST be registered through the Component hierarchy (not a standalone
-/// registry). In global planner deployments, the frontend's router is the global
-/// entry point, but each worker pool has its own local router (e.g. prefill pool,
-/// decode pool). Component-scoped metrics let each local router emit metrics with
-/// distinct `dynamo_component` labels, so pools can be monitored and scaled
-/// independently.
+/// Existing request families remain component-scoped so local router pools can be
+/// distinguished. The R3 counters intentionally omit router, worker, endpoint, and
+/// request identity labels; deployment-level separation belongs at the scrape target.
 pub struct RouterRequestMetrics {
     pub requests_total: prometheus::IntCounter,
     pub time_to_first_token_seconds: prometheus::Histogram,
@@ -943,25 +1026,15 @@ pub(crate) struct RoutingOpportunity {
     pub max_overlap_blocks: u64,
     pub selected_overlap_blocks: u64,
     pub remediation_blocks: u64,
-    pub hint_blocks: u64,
 }
 
 impl RoutingOpportunity {
-    pub(crate) fn new(
-        max_overlap_blocks: u64,
-        selected_overlap_blocks: u64,
-        hinted_prefix_blocks: Option<u64>,
-    ) -> Self {
+    pub(crate) fn new(max_overlap_blocks: u64, selected_overlap_blocks: u64) -> Self {
         let remediation_blocks = max_overlap_blocks.saturating_sub(selected_overlap_blocks);
-        let hint_blocks = hinted_prefix_blocks
-            .map(|prefix| prefix.saturating_sub(selected_overlap_blocks))
-            .unwrap_or(0)
-            .min(remediation_blocks);
         Self {
             max_overlap_blocks,
             selected_overlap_blocks,
             remediation_blocks,
-            hint_blocks,
         }
     }
 }
@@ -983,9 +1056,8 @@ impl RouterRequestMetrics {
     }
 
     /// Create from a Component, memoized in a static OnceLock.
-    /// Uses the MetricsHierarchy API which auto-prepends `dynamo_component_`,
-    /// injects hierarchy labels, and registers with the DRT `MetricsRegistry`.
-    /// Also adds `router_id` (discovery instance_id) to distinguish router instances.
+    /// Established metrics use the hierarchy and a `router_id` label. R3 block
+    /// counters register directly in the DRT registry with no identity labels.
     ///
     /// Called eagerly by `KvPushRouter::new()` so metrics appear as zeros at startup.
     pub fn from_component(component: &Component) -> Arc<Self> {
@@ -1084,34 +1156,26 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_resident_oracle_cached_tokens_total");
-                let max_overlap_blocks_total = metrics
-                    .create_intcounter(
-                        router::MAX_OVERLAP_BLOCKS_TOTAL,
-                        "Best useful prefix overlap among allowed resident workers, in blocks",
-                        extra_labels,
-                    )
-                    .expect("failed to create kv_router_max_overlap_blocks_total");
-                let selected_overlap_blocks_total = metrics
-                    .create_intcounter(
-                        router::SELECTED_OVERLAP_BLOCKS_TOTAL,
-                        "Useful prefix overlap on the selected worker, in blocks",
-                        extra_labels,
-                    )
-                    .expect("failed to create kv_router_selected_overlap_blocks_total");
-                let remediation_blocks_total = metrics
-                    .create_intcounter(
-                        router::REMEDIATION_BLOCKS_TOTAL,
-                        "Routing opportunity not resident on the selected worker, in blocks",
-                        extra_labels,
-                    )
-                    .expect("failed to create kv_router_remediation_blocks_total");
-                let hint_blocks_total = metrics
-                    .create_intcounter(
-                        router::HINT_BLOCKS_TOTAL,
-                        "Remediation blocks represented by attached compact router hints",
-                        extra_labels,
-                    )
-                    .expect("failed to create kv_router_hint_blocks_total");
+                let max_overlap_blocks_total = register_identity_free_counter(
+                    component,
+                    router::MAX_OVERLAP_BLOCKS_TOTAL,
+                    "Best compatible integer source prefix advertised to the router, in blocks",
+                );
+                let selected_overlap_blocks_total = register_identity_free_counter(
+                    component,
+                    router::SELECTED_OVERLAP_BLOCKS_TOTAL,
+                    "Integer device prefix on the selected worker, in blocks",
+                );
+                let remediation_blocks_total = register_identity_free_counter(
+                    component,
+                    router::REMEDIATION_BLOCKS_TOTAL,
+                    "Routing opportunity not resident on the selected worker, in blocks",
+                );
+                let hint_blocks_total = register_identity_free_counter(
+                    component,
+                    router::HINT_BLOCKS_TOTAL,
+                    "Remediation blocks represented by attached compact router hints",
+                );
                 let kv_transfer_estimated_latency_seconds = metrics
                     .create_histogram(
                         &router_metric(frontend_service::KV_TRANSFER_ESTIMATED_LATENCY_SECONDS),
@@ -1166,7 +1230,10 @@ impl RouterRequestMetrics {
             .inc_by(opportunity.selected_overlap_blocks);
         self.remediation_blocks_total
             .inc_by(opportunity.remediation_blocks);
-        self.hint_blocks_total.inc_by(opportunity.hint_blocks);
+    }
+
+    pub(crate) fn observe_hint_blocks(&self, hint_blocks: u64) {
+        self.hint_blocks_total.inc_by(hint_blocks);
     }
 }
 
@@ -1561,26 +1628,21 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
     #[test]
     fn routing_opportunity_obeys_r3_conservation() {
         assert_eq!(
-            RoutingOpportunity::new(100, 40, None),
+            RoutingOpportunity::new(100, 40),
             RoutingOpportunity {
                 max_overlap_blocks: 100,
                 selected_overlap_blocks: 40,
                 remediation_blocks: 60,
-                hint_blocks: 0,
             }
         );
-        assert_eq!(RoutingOpportunity::new(100, 40, Some(100)).hint_blocks, 60);
-        assert_eq!(RoutingOpportunity::new(100, 40, Some(70)).hint_blocks, 30);
-        assert_eq!(
-            RoutingOpportunity::new(40, 100, Some(100)).remediation_blocks,
-            0
-        );
+        assert_eq!(RoutingOpportunity::new(40, 100).remediation_blocks, 0);
     }
 
     #[test]
     fn inventory_health_helpers_fail_closed() {
         assert_eq!(inventory_event_lag_seconds(10.0, 12.5), Some(2.5));
         assert_eq!(inventory_event_lag_seconds(13.0, 12.5), None);
+        assert_eq!(inventory_event_lag_seconds(-1.0, 12.5), None);
         assert_eq!(inventory_event_lag_seconds(f64::NAN, 12.5), None);
         assert_eq!(inventory_event_lag_seconds(10.0, f64::INFINITY), None);
 
@@ -1589,6 +1651,10 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
         assert_eq!(forward_sequence_gap(Some(10), 14), 3);
         assert_eq!(forward_sequence_gap(Some(14), 14), 0);
         assert_eq!(forward_sequence_gap(Some(14), 10), 0);
+        assert_eq!(sequence_anomaly(None, 10), None);
+        assert_eq!(sequence_anomaly(Some(10), 11), None);
+        assert_eq!(sequence_anomaly(Some(10), 10), Some("repeated"));
+        assert_eq!(sequence_anomaly(Some(10), 9), Some("out_of_order"));
     }
 
     #[test]
@@ -1602,5 +1668,73 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
                 "layout_mismatch",
             ]
         );
+        for reason in InventoryMismatchReason::ALL {
+            assert_eq!(
+                InventoryMismatchReason::from_label(reason.as_label()),
+                Some(reason)
+            );
+        }
+        assert_eq!(InventoryMismatchReason::from_label("request-123"), None);
+    }
+
+    #[test]
+    fn r3_metric_families_have_exact_identity_free_exposition() {
+        let registry = prometheus::Registry::new();
+        for name in [
+            router::MAX_OVERLAP_BLOCKS_TOTAL,
+            router::SELECTED_OVERLAP_BLOCKS_TOTAL,
+            router::REMEDIATION_BLOCKS_TOTAL,
+            router::HINT_BLOCKS_TOTAL,
+            router::INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL,
+            router::INVENTORY_SEQUENCE_GAP_TOTAL,
+        ] {
+            registry
+                .register(Box::new(prometheus::IntCounter::new(name, "test").unwrap()))
+                .unwrap();
+        }
+        registry
+            .register(Box::new(
+                prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
+                    router::INVENTORY_EVENT_LAG_SECONDS,
+                    "test",
+                ))
+                .unwrap(),
+            ))
+            .unwrap();
+        let mismatch = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(router::INVENTORY_MISMATCH_BLOCKS_TOTAL, "test"),
+            &["reason"],
+        )
+        .unwrap();
+        for reason in InventoryMismatchReason::ALL {
+            mismatch.with_label_values(&[reason.as_label()]);
+        }
+        registry.register(Box::new(mismatch)).unwrap();
+        let anomaly = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(router::INVENTORY_SEQUENCE_ANOMALY_TOTAL, "test"),
+            &["reason"],
+        )
+        .unwrap();
+        for reason in ["repeated", "out_of_order"] {
+            anomaly.with_label_values(&[reason]);
+        }
+        registry.register(Box::new(anomaly)).unwrap();
+
+        let output = gather_pef(&registry);
+        for name in [
+            router::MAX_OVERLAP_BLOCKS_TOTAL,
+            router::SELECTED_OVERLAP_BLOCKS_TOTAL,
+            router::REMEDIATION_BLOCKS_TOTAL,
+            router::HINT_BLOCKS_TOTAL,
+            router::INVENTORY_EVENT_LAG_SECONDS,
+            router::INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL,
+            router::INVENTORY_SEQUENCE_GAP_TOTAL,
+            router::INVENTORY_SEQUENCE_ANOMALY_TOTAL,
+            router::INVENTORY_MISMATCH_BLOCKS_TOTAL,
+        ] {
+            assert!(output.contains(name), "missing metric family {name}");
+        }
+        assert!(!output.contains("worker_id="));
+        assert!(!output.contains("router_id="));
     }
 }

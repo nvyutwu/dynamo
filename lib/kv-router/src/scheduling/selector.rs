@@ -49,35 +49,6 @@ fn oracle_cached_tokens<C: WorkerConfigLike>(
         .unwrap_or(0)
 }
 
-fn oracle_overlap_blocks<C: WorkerConfigLike>(
-    workers: &HashMap<WorkerId, C>,
-    request: &SchedulingRequest,
-    eligibility: RoutingEligibility<'_>,
-    block_size: u32,
-) -> u64 {
-    let request_blocks = request.request_blocks(block_size);
-    let overlap = if let Some(worker) = eligibility.pinned_worker() {
-        eligibility
-            .validate_worker_rank(workers, worker)
-            .ok()
-            .map_or(0.0, |_| request.effective_overlap_blocks_for(worker))
-    } else {
-        request
-            .overlap
-            .effective_overlap_blocks
-            .iter()
-            .filter(|(worker, _)| {
-                workers
-                    .get(&worker.worker_id)
-                    .is_some_and(|config| eligibility.allows_worker(worker.worker_id, config))
-            })
-            .map(|(_, overlap)| *overlap)
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0)
-    };
-    (overlap.round().max(0.0) as u64).min(request_blocks)
-}
-
 /// Helper function for softmax sampling.
 /// Returns the selected worker and its logit.
 fn softmax_sample(
@@ -323,8 +294,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         }
 
         let request_blocks = request.request_blocks(block_size);
-        let max_overlap_blocks =
-            oracle_overlap_blocks(workers, request, request.eligibility(), block_size);
         let resident_oracle_cached_tokens =
             oracle_cached_tokens(workers, request, request.eligibility());
         let eligible_oracle_cached_tokens = oracle_cached_tokens(workers, request, eligibility);
@@ -384,9 +353,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 worker,
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
-                selected_overlap_blocks: (effective_overlap_blocks.round().max(0.0) as u64)
-                    .min(request_blocks),
-                max_overlap_blocks,
                 cached_tokens,
                 eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens,
@@ -501,9 +467,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 worker: best_worker,
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
-                selected_overlap_blocks: (effective_overlap_blocks.round().max(0.0) as u64)
-                    .min(request_blocks),
-                max_overlap_blocks,
                 cached_tokens,
                 eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens,
@@ -534,8 +497,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             worker: best_worker,
             required_blocks: request_blocks,
             effective_overlap_blocks: best_overlap,
-            selected_overlap_blocks: (best_overlap.round().max(0.0) as u64).min(request_blocks),
-            max_overlap_blocks,
             cached_tokens: best_cached_tokens,
             eligible_oracle_cached_tokens,
             resident_oracle_cached_tokens,
@@ -832,8 +793,6 @@ mod tests {
         assert_eq!(result.cached_tokens, 0);
         assert_eq!(result.eligible_oracle_cached_tokens, 0);
         assert_eq!(result.resident_oracle_cached_tokens, 64);
-        assert_eq!(result.selected_overlap_blocks, 0);
-        assert_eq!(result.max_overlap_blocks, 4);
     }
 
     #[test]

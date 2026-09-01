@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use dynamo_kv_router::indexer::LocalKvIndexer;
 use dynamo_kv_router::protocols::*;
 
-use crate::kv_router::metrics::{forward_sequence_gap, kv_publisher_metrics};
+use crate::kv_router::metrics::{forward_sequence_gap, kv_publisher_metrics, sequence_anomaly};
 
 use super::DEFAULT_MAX_BATCH_BLOCKS;
 use super::batching::BatchingState;
@@ -54,6 +54,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                 for placement_event in event_batch {
                     let raw_event_id = placement_event.event.event_id;
                     let gap = forward_sequence_gap(last_raw_input_id, raw_event_id);
+                    let anomaly = sequence_anomaly(last_raw_input_id, raw_event_id);
                     if gap > 0 {
                         tracing::warn!(
                             worker_id,
@@ -72,6 +73,11 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                                 "Failed to record dropped events metric: metrics not initialized"
                             );
                         }
+                    }
+                    if let Some(reason) = anomaly
+                        && let Some(metrics) = kv_publisher_metrics()
+                    {
+                        metrics.increment_inventory_sequence_anomaly(reason);
                     }
                     if last_raw_input_id.is_none_or(|last_id| raw_event_id > last_id) {
                         last_raw_input_id = Some(raw_event_id);

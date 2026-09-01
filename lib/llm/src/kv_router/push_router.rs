@@ -258,6 +258,14 @@ impl KvPushRouter {
             !is_query_only,
             selection.lifecycle.take(),
         );
+        if !is_query_only {
+            guard
+                .request_metrics()
+                .observe_routing_opportunity(RoutingOpportunity::new(
+                    selection.max_overlap_blocks,
+                    selection.selected_overlap_blocks,
+                ));
+        }
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && self.chooser.indexer().records_routing_decisions() {
@@ -373,9 +381,13 @@ impl KvPushRouter {
 
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
-        let hinted_prefix_blocks = if let Some(router_hint) = selection.router_hint.as_ref() {
+        let hinted_blocks = if let Some(router_hint) = selection.router_hint.as_ref() {
             match backend_input.attach_router_hint(router_hint) {
-                Ok(()) => Some(router_hint.block_hashes.len() as u64),
+                Ok(()) => u64::from(router_hint.hinted_blocks).min(
+                    selection
+                        .max_overlap_blocks
+                        .saturating_sub(selection.selected_overlap_blocks),
+                ),
                 Err(error) => {
                     tracing::warn!(
                         request_id = %context_id,
@@ -383,19 +395,13 @@ impl KvPushRouter {
                         error = %error,
                         "Failed to attach router_hint to backend request"
                     );
-                    None
+                    0
                 }
             }
         } else {
-            None
+            0
         };
-        guard
-            .request_metrics()
-            .observe_routing_opportunity(RoutingOpportunity::new(
-                selection.max_overlap_blocks,
-                selection.selected_overlap_blocks,
-                hinted_prefix_blocks,
-            ));
+        guard.request_metrics().observe_hint_blocks(hinted_blocks);
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
 
@@ -604,12 +610,6 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         .resident_oracle_cached_tokens
                         .min(routing_parts.token_ids.len()) as u64,
                 );
-            self.request_metrics
-                .observe_routing_opportunity(RoutingOpportunity::new(
-                    selection.max_overlap_blocks,
-                    selection.selected_overlap_blocks,
-                    None,
-                ));
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker
@@ -743,7 +743,10 @@ mod tests {
     use dynamo_kv_router::{
         ActiveSequencesMultiWorker, DefaultWorkerSelector, SequencePublisher,
         config::{KvRouterConfig, RouterQueuePolicy},
-        protocols::{ActiveLoad, ActiveSequenceEvent, RoutingConstraints},
+        protocols::{
+            ActiveLoad, ActiveSequenceEvent, ExternalSequenceBlockHash, RoutingConstraints,
+        },
+        router_hint::RouterHint,
         scheduling::{
             AdmissionAction, AdmissionDecision, AdmissionEvent, AdmissionId, AdmissionRequest,
             LocalScheduler, NoopOverlapScoresRefresh, OverlapSignals, PolicyClassAdmissionPolicies,
@@ -1036,12 +1039,17 @@ mod tests {
     async fn track_request(
         router: &KvPushRouter,
         is_query_only: bool,
+        opportunity: Option<(u64, u64)>,
     ) -> (SingleIn<PreprocessedRequest>, WorkerSelection, RequestGuard) {
         let request = Context::new(request());
         let (mut selection, _) = router
             .select_with_affinity(&request, RequestPhase::Aggregated, is_query_only)
             .await
             .unwrap();
+        if let Some((max_overlap_blocks, selected_overlap_blocks)) = opportunity {
+            selection.max_overlap_blocks = max_overlap_blocks;
+            selection.selected_overlap_blocks = selected_overlap_blocks;
+        }
         let guard = router
             .track_selection(&request, &mut selection, is_query_only)
             .await
@@ -1065,6 +1073,10 @@ mod tests {
         let metrics = router.request_metrics.clone();
         let started_before = metrics.requests_started_total().get();
         let completed_before = metrics.requests_total.get();
+        let max_before = metrics.max_overlap_blocks_total.get();
+        let selected_before = metrics.selected_overlap_blocks_total.get();
+        let remediation_before = metrics.remediation_blocks_total.get();
+        let hint_before = metrics.hint_blocks_total.get();
 
         let controller = Controller::new("pre-admission-cancellation".to_string());
         controller.stop();
@@ -1077,15 +1089,27 @@ mod tests {
         );
         assert_eq!(metrics.requests_started_total().get(), started_before);
 
-        let (_, _, mut query_guard) = track_request(&router, true).await;
+        let (_, _, mut query_guard) = track_request(&router, true, Some((100, 40))).await;
         query_guard.abort().await;
         drop(query_guard);
         assert_eq!(metrics.requests_started_total().get(), started_before);
+        assert_eq!(metrics.max_overlap_blocks_total.get(), max_before);
+        assert_eq!(metrics.selected_overlap_blocks_total.get(), selected_before);
+        assert_eq!(metrics.remediation_blocks_total.get(), remediation_before);
 
-        let (_, _, mut cancelled_guard) = track_request(&router, false).await;
+        let (_, _, mut cancelled_guard) = track_request(&router, false, Some((100, 40))).await;
 
         assert_eq!(metrics.requests_started_total().get(), started_before + 1);
         assert_eq!(metrics.requests_total.get(), completed_before);
+        assert_eq!(metrics.max_overlap_blocks_total.get(), max_before + 100);
+        assert_eq!(
+            metrics.selected_overlap_blocks_total.get(),
+            selected_before + 40
+        );
+        assert_eq!(
+            metrics.remediation_blocks_total.get(),
+            remediation_before + 60
+        );
 
         // Admission remains counted even when the request aborts before dispatch.
         cancelled_guard.abort().await;
@@ -1093,8 +1117,15 @@ mod tests {
         assert_eq!(metrics.requests_started_total().get(), started_before + 1);
         assert_eq!(metrics.requests_total.get(), completed_before);
 
-        let (failed_request, failed_selection, failed_dispatch_guard) =
-            track_request(&router, false).await;
+        let (failed_request, mut failed_selection, failed_dispatch_guard) =
+            track_request(&router, false, Some((80, 30))).await;
+        failed_selection.router_hint = Some(RouterHint {
+            source_control_endpoint: "tcp://source:23280".to_string(),
+            source_inventory_epoch: 8,
+            start_block: 30,
+            hinted_blocks: 60,
+            block_hashes: (0..80).map(ExternalSequenceBlockHash).collect(),
+        });
         assert!(
             router
                 .dispatch_selection(
@@ -1108,14 +1139,33 @@ mod tests {
         );
         assert_eq!(metrics.requests_started_total().get(), started_before + 2);
         assert_eq!(metrics.requests_total.get(), completed_before);
+        assert_eq!(metrics.max_overlap_blocks_total.get(), max_before + 180);
+        assert_eq!(
+            metrics.selected_overlap_blocks_total.get(),
+            selected_before + 70
+        );
+        assert_eq!(
+            metrics.remediation_blocks_total.get(),
+            remediation_before + 110
+        );
+        assert_eq!(metrics.hint_blocks_total.get(), hint_before + 50);
 
-        let (_, _, mut completed_guard) = track_request(&router, false).await;
+        let (_, _, mut completed_guard) = track_request(&router, false, Some((5, 5))).await;
         completed_guard.start_dispatch("aggregated");
         completed_guard.mark_dispatched().await;
         completed_guard.finish().await;
         drop(completed_guard);
         assert_eq!(metrics.requests_started_total().get(), started_before + 3);
         assert_eq!(metrics.requests_total.get(), completed_before + 1);
+        assert_eq!(metrics.max_overlap_blocks_total.get(), max_before + 185);
+        assert_eq!(
+            metrics.selected_overlap_blocks_total.get(),
+            selected_before + 75
+        );
+        assert_eq!(
+            metrics.remediation_blocks_total.get(),
+            remediation_before + 110
+        );
 
         drop(router);
         runtime.shutdown();

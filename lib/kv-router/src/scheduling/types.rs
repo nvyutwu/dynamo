@@ -74,8 +74,6 @@ impl KvSchedulerError {
 pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
     pub effective_overlap_blocks: f64,
-    pub selected_overlap_blocks: u64,
-    pub max_overlap_blocks: u64,
     pub cached_tokens: usize,
     pub eligible_oracle_cached_tokens: usize,
     pub resident_oracle_cached_tokens: usize,
@@ -246,27 +244,6 @@ impl<'a, C: WorkerConfigLike> SchedulingContext<'a, C> {
                 .max()
                 .unwrap_or(0),
         }
-    }
-
-    pub fn best_overlap_blocks(&self, block_size: u32) -> u64 {
-        let request_blocks = self.request.request_blocks(block_size);
-        let overlap = match self.eligibility.pinned_worker() {
-            Some(worker) => self.request.effective_overlap_blocks_for(worker),
-            None => self
-                .request
-                .overlap
-                .effective_overlap_blocks
-                .iter()
-                .filter(|(worker, _)| {
-                    self.workers.get(&worker.worker_id).is_some_and(|config| {
-                        self.eligibility.allows_worker(worker.worker_id, config)
-                    })
-                })
-                .map(|(_, overlap)| *overlap)
-                .max_by(f64::total_cmp)
-                .unwrap_or(0.0),
-        };
-        (overlap.round().max(0.0) as u64).min(request_blocks)
     }
 }
 

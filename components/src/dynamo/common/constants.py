@@ -10,6 +10,7 @@ ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY = "router_hint_worker_type"
 ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY = (
     "router_hint_source_control_endpoints"
 )
+ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY = "router_hint_inventory_epoch"
 
 class DisaggregationMode(Enum):
     """Disaggregation mode for LLM workers."""

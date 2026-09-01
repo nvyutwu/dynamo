@@ -166,6 +166,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     m.add_function(wrap_pyfunction!(llm::kv::compute_block_hash_for_seq_py, m)?)?;
+    m.add_function(wrap_pyfunction!(llm::kv::record_kv_inventory_mismatch, m)?)?;
     m.add_function(wrap_pyfunction!(lora_name_to_id, m)?)?;
     #[cfg(feature = "mm-routing")]
     m.add_function(wrap_pyfunction!(resolve_routing_image_token_id, m)?)?;

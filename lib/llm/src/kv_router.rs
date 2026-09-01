@@ -90,6 +90,13 @@ pub enum FindBestMatchOutcome {
     },
 }
 
+#[derive(Debug)]
+struct RouterHintDecision {
+    max_overlap_blocks: u64,
+    selected_overlap_blocks: u64,
+    hint: Option<RouterHint>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct WorkerCacheHitEstimate {
     pub effective_overlap_blocks: f64,
@@ -427,44 +434,92 @@ where
         target: WorkerWithDpRank,
         target_cached_prefix_blocks: u32,
         candidates: Option<&RouterHintRootCandidates>,
-    ) -> Option<RouterHint> {
-        let candidates = candidates?;
+        allowed_worker_ids: Option<&HashSet<WorkerId>>,
+    ) -> RouterHintDecision {
+        let selected_overlap_blocks = u64::from(target_cached_prefix_blocks);
+        let Some(candidates) = candidates else {
+            return RouterHintDecision {
+                max_overlap_blocks: selected_overlap_blocks,
+                selected_overlap_blocks,
+                hint: None,
+            };
+        };
 
-        let (block_hashes, source_control_endpoint) = {
+        let decision = {
             let configs = self.workers_with_configs.borrow();
-            let target_config = configs.get(&target.worker_id)?;
-            let target_metadata = target_config.router_hint_metadata_for_dp_rank(target.dp_rank)?;
+            let Some(target_config) = configs.get(&target.worker_id) else {
+                return RouterHintDecision {
+                    max_overlap_blocks: selected_overlap_blocks,
+                    selected_overlap_blocks,
+                    hint: None,
+                };
+            };
+            let Some(target_metadata) =
+                target_config.router_hint_metadata_for_dp_rank(target.dp_rank)
+            else {
+                return RouterHintDecision {
+                    max_overlap_blocks: selected_overlap_blocks,
+                    selected_overlap_blocks,
+                    hint: None,
+                };
+            };
 
             let prefix_blocks_to_beat =
                 usize::try_from(target_cached_prefix_blocks).unwrap_or(usize::MAX);
-            let (source, block_hashes) =
-                candidates.best_source(prefix_blocks_to_beat, |worker| {
-                    worker != target
-                        && configs.get(&worker.worker_id).is_some_and(|config| {
-                            config
-                                .router_hint_metadata_for_dp_rank(worker.dp_rank)
-                                .is_some_and(|source_metadata| {
-                                    source_metadata.worker_type == target_metadata.worker_type
-                                        && source_metadata.source_control_endpoint.is_some()
-                                })
-                        })
-                })?;
-            let source_control_endpoint = configs
-                .get(&source.worker_id)?
-                .router_hint_metadata_for_dp_rank(source.dp_rank)?
-                .source_control_endpoint?
-                .to_string();
-            (block_hashes, source_control_endpoint)
+            let compatible_source = |worker: WorkerWithDpRank, require_endpoint: bool| {
+                worker != target
+                    && allowed_worker_ids.is_none_or(|allowed| allowed.contains(&worker.worker_id))
+                    && configs.get(&worker.worker_id).is_some_and(|config| {
+                        config
+                            .router_hint_metadata_for_dp_rank(worker.dp_rank)
+                            .is_some_and(|source_metadata| {
+                                source_metadata.worker_type == target_metadata.worker_type
+                                    && (!require_endpoint
+                                        || source_metadata.source_control_endpoint.is_some())
+                            })
+                    })
+            };
+
+            let max_overlap_blocks = candidates
+                .best_source(prefix_blocks_to_beat, |worker| {
+                    compatible_source(worker, false)
+                })
+                .map(|(_, block_hashes)| block_hashes.len() as u64)
+                .unwrap_or(selected_overlap_blocks)
+                .max(selected_overlap_blocks);
+
+            let hint = candidates
+                .best_source(prefix_blocks_to_beat, |worker| {
+                    compatible_source(worker, true)
+                })
+                .and_then(|(source, block_hashes)| {
+                    let source_metadata = configs
+                        .get(&source.worker_id)?
+                        .router_hint_metadata_for_dp_rank(source.dp_rank)?;
+                    let source_control_endpoint =
+                        source_metadata.source_control_endpoint?.to_string();
+                    let source_inventory_epoch = source_metadata.source_inventory_epoch?;
+                    let hinted_blocks = block_hashes
+                        .len()
+                        .saturating_sub(prefix_blocks_to_beat)
+                        .try_into()
+                        .ok()?;
+                    Some(RouterHint {
+                        source_control_endpoint,
+                        source_inventory_epoch,
+                        start_block: target_cached_prefix_blocks,
+                        hinted_blocks,
+                        block_hashes,
+                    })
+                });
+
+            RouterHintDecision {
+                max_overlap_blocks,
+                selected_overlap_blocks,
+                hint,
+            }
         };
-
-        if block_hashes.is_empty() {
-            return None;
-        }
-
-        Some(RouterHint {
-            source_control_endpoint,
-            block_hashes,
-        })
+        decision
     }
 
     pub async fn record_routing_decision(
@@ -742,6 +797,7 @@ where
             allowed_worker_ids,
             pinned_worker.as_ref(),
         );
+        let opportunity_allowed_worker_ids = allowed_worker_ids.clone();
 
         let response = match self
             .scheduler
@@ -783,10 +839,11 @@ where
             .get(&response.best_worker)
             .copied()
             .unwrap_or(0);
-        let router_hint = self.router_hint_for_selection(
+        let router_hint_decision = self.router_hint_for_selection(
             response.best_worker,
             target_cached_prefix_blocks,
             router_hint_candidates,
+            opportunity_allowed_worker_ids.as_ref(),
         );
 
         let total_elapsed = start.elapsed();
@@ -836,13 +893,13 @@ where
                 worker: response.best_worker,
                 overlap_blocks: response.effective_overlap_blocks.round() as u32,
                 effective_overlap_blocks: response.effective_overlap_blocks,
-                selected_overlap_blocks: response.selected_overlap_blocks,
-                max_overlap_blocks: response.max_overlap_blocks,
+                selected_overlap_blocks: router_hint_decision.selected_overlap_blocks,
+                max_overlap_blocks: router_hint_decision.max_overlap_blocks,
                 cached_tokens: response.cached_tokens,
                 eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                 routing_hashes,
-                router_hint,
+                router_hint: router_hint_decision.hint,
             },
             lifecycle,
         ))
@@ -1357,7 +1414,9 @@ mod tests {
     use async_trait::async_trait;
     use dynamo_kv_router::{
         indexer::{LowerTierMatchDetails, MatchDetails},
-        protocols::{OverlapScores, StorageTier, compute_seq_hash_for_block},
+        protocols::{
+            ExternalSequenceBlockHash, OverlapScores, StorageTier, compute_seq_hash_for_block,
+        },
     };
     use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
     use tokio::sync::watch;
@@ -1450,8 +1509,6 @@ mod tests {
                 worker: self.selected_worker,
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,
-                selected_overlap_blocks: 0,
-                max_overlap_blocks: 0,
                 cached_tokens: 0,
                 eligible_oracle_cached_tokens: 0,
                 resident_oracle_cached_tokens: 0,
@@ -1529,6 +1586,129 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn make_test_router_with_workers(
+        selector: impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>
+        + Send
+        + Sync
+        + 'static,
+        workers: HashMap<WorkerId, ModelRuntimeConfig>,
+    ) -> KvRouter<
+        impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
+    > {
+        let component = make_test_component("router-hint-decision").await;
+        let endpoint = component.endpoint("backend");
+        let client = endpoint.client().await.unwrap();
+        let (_tx, rx) = watch::channel(workers);
+        let config = KvRouterConfig {
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            skip_initial_worker_wait: true,
+            ..Default::default()
+        };
+        KvRouter::new(
+            endpoint,
+            client,
+            rx,
+            None,
+            16,
+            selector,
+            Some(config),
+            None,
+            "prefill",
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn router_hint_runtime_config(endpoint: Option<&str>, worker_type: &str) -> ModelRuntimeConfig {
+        let mut config = ModelRuntimeConfig::default();
+        config.runtime_data.insert(
+            dynamo_kv_router::router_hint::ROUTER_HINT_RUNTIME_CAPABILITY_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        config.runtime_data.insert(
+            dynamo_kv_router::router_hint::ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY.to_string(),
+            serde_json::json!(8008_u64),
+        );
+        config.runtime_data.insert(
+            dynamo_kv_router::router_hint::ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY.to_string(),
+            serde_json::Value::String(worker_type.to_string()),
+        );
+        if let Some(endpoint) = endpoint {
+            config.runtime_data.insert(
+                dynamo_kv_router::router_hint::ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY
+                    .to_string(),
+                serde_json::json!({"0": endpoint}),
+            );
+        }
+        config
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn router_hint_decision_uses_raw_prefix_blocks_and_explicit_suffix() {
+        let target = WorkerWithDpRank::new(7, 0);
+        let source = WorkerWithDpRank::new(8, 0);
+        let router = make_test_router_with_workers(
+            InspectingSelector {
+                expected_hits: None,
+                selected_worker: target,
+            },
+            HashMap::from([
+                (7, router_hint_runtime_config(None, "prefill")),
+                (
+                    8,
+                    router_hint_runtime_config(Some("tcp://source:23280"), "prefill"),
+                ),
+            ]),
+        )
+        .await;
+        let candidates = RouterHintRootCandidates {
+            block_hashes: (0..100).map(ExternalSequenceBlockHash).collect(),
+            owner_prefix_blocks: vec![(source, 100)],
+        };
+
+        let decision = router.router_hint_for_selection(target, 40, Some(&candidates), None);
+
+        assert_eq!(decision.max_overlap_blocks, 100);
+        assert_eq!(decision.selected_overlap_blocks, 40);
+        let hint = decision.hint.unwrap();
+        assert_eq!(hint.source_inventory_epoch, 8008);
+        assert_eq!(hint.start_block, 40);
+        assert_eq!(hint.hinted_blocks, 60);
+        assert_eq!(hint.block_hashes.len(), 100);
+
+        let allowed = HashSet::from([7]);
+        let excluded =
+            router.router_hint_for_selection(target, 40, Some(&candidates), Some(&allowed));
+        assert_eq!(excluded.max_overlap_blocks, 40);
+        assert!(excluded.hint.is_none());
+
+        let mut stale_source = router_hint_runtime_config(Some("tcp://source:23280"), "prefill");
+        stale_source
+            .runtime_data
+            .remove(dynamo_kv_router::router_hint::ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY);
+        let no_epoch_router = make_test_router_with_workers(
+            InspectingSelector {
+                expected_hits: None,
+                selected_worker: target,
+            },
+            HashMap::from([
+                (7, router_hint_runtime_config(None, "prefill")),
+                (8, stale_source),
+            ]),
+        )
+        .await;
+        let no_epoch =
+            no_epoch_router.router_hint_for_selection(target, 40, Some(&candidates), None);
+        assert_eq!(no_epoch.max_overlap_blocks, 100);
+        assert!(no_epoch.hint.is_none());
     }
 
     #[tokio::test]

@@ -177,6 +177,7 @@ pub fn compute_seq_hash_for_block(block_hashes: &[LocalBlockHash]) -> Vec<Sequen
 pub struct RouterHintWorkerMetadata<'a> {
     pub worker_type: &'a str,
     pub source_control_endpoint: Option<&'a str>,
+    pub source_inventory_epoch: Option<u64>,
 }
 
 /// Trait abstracting the worker configuration fields needed by the scheduling layer.
@@ -559,12 +560,6 @@ pub struct WorkerSelectionResult {
     /// Approximate effective cache hit on the selected worker in fractional blocks.
     /// Use `.round() as u32` for a block-count approximation.
     pub effective_overlap_blocks: f64,
-
-    /// Selected worker overlap, rounded and capped at the request block count.
-    pub selected_overlap_blocks: u64,
-
-    /// Greatest overlap among allowed resident workers, rounded and capped at the request size.
-    pub max_overlap_blocks: u64,
 
     /// Approximate cached-token count derived from the weighted cache hit.
     pub cached_tokens: usize,
