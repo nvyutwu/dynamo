@@ -659,6 +659,39 @@ pub mod router {
     /// Remediation blocks in compact hints accepted by the destination backend.
     pub const HINT_BLOCKS_TOTAL: &str = "kv_router_hint_blocks_total";
 
+    /// F2u: unweighted prefix tokens held by the best eligible worker across all tiers.
+    pub const ELIGIBLE_PREFIX_TOKENS_TOTAL: &str = "kv_router_eligible_prefix_tokens_total";
+
+    /// F3u: unweighted prefix tokens held by the selected worker across all tiers.
+    pub const SELECTED_PREFIX_TOKENS_TOTAL: &str = "kv_router_selected_prefix_tokens_total";
+
+    /// F1: prompt tokens whose KV identity a prior completed request computed.
+    pub const CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL: &str =
+        "kv_router_cache_loss_history_hit_tokens_total";
+
+    /// Complete sequence-hash records currently retained by the cache-loss ledger.
+    pub const CACHE_LOSS_HISTORY_BLOCK_RECORDS: &str = "kv_router_cache_loss_history_block_records";
+
+    /// Distinct sequence hashes currently retained by the cache-loss ledger.
+    pub const CACHE_LOSS_HISTORY_UNIQUE_HASHES: &str =
+        "kv_router_cache_loss_history_unique_hashes";
+
+    /// Full KV tokens represented by retained cache-loss ledger records.
+    pub const CACHE_LOSS_HISTORY_REPRESENTED_TOKENS: &str =
+        "kv_router_cache_loss_history_represented_tokens";
+
+    /// Conservative estimated bytes held by retained cache-loss ledger records.
+    pub const CACHE_LOSS_HISTORY_ESTIMATED_BYTES: &str =
+        "kv_router_cache_loss_history_estimated_bytes";
+
+    /// Configured byte budget for the cache-loss ledger.
+    pub const CACHE_LOSS_HISTORY_CAPACITY_BYTES: &str =
+        "kv_router_cache_loss_history_capacity_bytes";
+
+    /// Configured maximum records retained by the cache-loss ledger.
+    pub const CACHE_LOSS_HISTORY_CAPACITY_BLOCKS: &str =
+        "kv_router_cache_loss_history_capacity_blocks";
+
     /// Producer-to-router age of inventory events.
     pub const INVENTORY_EVENT_LAG_SECONDS: &str = "kv_router_inventory_event_lag_seconds";
 
@@ -671,9 +704,6 @@ pub mod router {
 
     /// Repeated or out-of-order inventory sequence identifiers by bounded reason.
     pub const INVENTORY_SEQUENCE_ANOMALY_TOTAL: &str = "kv_router_inventory_sequence_anomaly_total";
-
-    /// Inventory blocks rejected during reconciliation, partitioned by bounded reason.
-    pub const INVENTORY_MISMATCH_BLOCKS_TOTAL: &str = "kv_router_inventory_mismatch_blocks_total";
 
     /// Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
     pub const SHARED_CACHE_HIT_RATE: &str = "router_shared_cache_hit_rate";

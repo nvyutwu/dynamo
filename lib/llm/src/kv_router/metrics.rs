@@ -88,6 +88,20 @@ fn register_identity_free_histogram(
     histogram
 }
 
+fn register_identity_free_gauge(
+    component: &Component,
+    name: &str,
+    help: &str,
+) -> prometheus::IntGauge {
+    let gauge = prometheus::IntGauge::new(name, help)
+        .unwrap_or_else(|error| panic!("failed to create {name}: {error}"));
+    component
+        .get_metrics_registry()
+        .add_metric(Box::new(gauge.clone()))
+        .unwrap_or_else(|error| panic!("failed to register {name}: {error}"));
+    gauge
+}
+
 fn register_identity_free_counter_vec(
     component: &Component,
     name: &str,
@@ -145,48 +159,6 @@ pub(crate) struct KvPublisherMetrics {
     /// Missing sequence identifiers in either direct or ZMQ inventory streams.
     pub inventory_sequence_gap_total: IntCounter,
     pub inventory_sequence_anomaly_total: IntCounterVec,
-    /// Blocks rejected during inventory reconciliation by a bounded reason.
-    inventory_mismatch_blocks_total: IntCounterVec,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum InventoryMismatchReason {
-    SourceMissing,
-    SourceValidationTimeout,
-    EpochMismatch,
-    WorkerUnreachable,
-    LayoutMismatch,
-}
-
-impl InventoryMismatchReason {
-    const ALL: [Self; 5] = [
-        Self::SourceMissing,
-        Self::SourceValidationTimeout,
-        Self::EpochMismatch,
-        Self::WorkerUnreachable,
-        Self::LayoutMismatch,
-    ];
-
-    pub const fn as_label(self) -> &'static str {
-        match self {
-            Self::SourceMissing => "source_missing",
-            Self::SourceValidationTimeout => "source_validation_timeout",
-            Self::EpochMismatch => "epoch_mismatch",
-            Self::WorkerUnreachable => "worker_unreachable",
-            Self::LayoutMismatch => "layout_mismatch",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "source_missing" => Some(Self::SourceMissing),
-            "source_validation_timeout" => Some(Self::SourceValidationTimeout),
-            "epoch_mismatch" => Some(Self::EpochMismatch),
-            "worker_unreachable" => Some(Self::WorkerUnreachable),
-            "layout_mismatch" => Some(Self::LayoutMismatch),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) fn inventory_event_lag_seconds(producer_timestamp: f64, now: f64) -> Option<f64> {
@@ -287,16 +259,6 @@ impl KvPublisherMetrics {
                 for reason in ["repeated", "out_of_order"] {
                     inventory_sequence_anomaly_total.with_label_values(&[reason]);
                 }
-                let inventory_mismatch_blocks_total = register_identity_free_counter_vec(
-                    component,
-                    router::INVENTORY_MISMATCH_BLOCKS_TOTAL,
-                    "KV inventory blocks rejected during reconciliation",
-                    &["reason"],
-                );
-                for reason in InventoryMismatchReason::ALL {
-                    inventory_mismatch_blocks_total.with_label_values(&[reason.as_label()]);
-                }
-
                 Arc::new(Self {
                     engines_dropped_events_total,
                     zmq_events_total,
@@ -307,7 +269,6 @@ impl KvPublisherMetrics {
                     inventory_event_timestamp_invalid_total,
                     inventory_sequence_gap_total,
                     inventory_sequence_anomaly_total,
-                    inventory_mismatch_blocks_total,
                 })
             })
             .clone()
@@ -360,26 +321,10 @@ impl KvPublisherMetrics {
             .with_label_values(&[reason])
             .inc();
     }
-
-    fn record_inventory_mismatch(&self, reason: InventoryMismatchReason, blocks: u64) {
-        self.inventory_mismatch_blocks_total
-            .with_label_values(&[reason.as_label()])
-            .inc_by(blocks);
-    }
 }
 
 pub(crate) fn kv_publisher_metrics() -> Option<Arc<KvPublisherMetrics>> {
     KV_PUBLISHER_METRICS.get().cloned()
-}
-
-/// Record a bounded inventory reconciliation failure when publisher metrics are initialized.
-/// Returns false when no publisher component has registered the metric yet.
-pub fn record_inventory_mismatch(reason: InventoryMismatchReason, blocks: u64) -> bool {
-    let Some(metrics) = kv_publisher_metrics() else {
-        return false;
-    };
-    metrics.record_inventory_mismatch(reason, blocks);
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +965,18 @@ pub struct RouterRequestMetrics {
     pub selected_overlap_blocks_total: prometheus::IntCounter,
     pub remediation_blocks_total: prometheus::IntCounter,
     pub hint_blocks_total: prometheus::IntCounter,
+    /// F2u: unweighted all-tier prefix tokens on the best eligible worker.
+    pub eligible_prefix_tokens_total: prometheus::IntCounter,
+    /// F3u: unweighted all-tier prefix tokens on the selected worker.
+    pub selected_prefix_tokens_total: prometheus::IntCounter,
+    /// F1: prompt tokens a prior completed request had already computed.
+    pub cache_loss_history_hit_tokens_total: prometheus::IntCounter,
+    pub cache_loss_history_block_records: IntGauge,
+    pub cache_loss_history_unique_hashes: IntGauge,
+    pub cache_loss_history_represented_tokens: IntGauge,
+    pub cache_loss_history_estimated_bytes: IntGauge,
+    pub cache_loss_history_capacity_bytes: IntGauge,
+    pub cache_loss_history_capacity_blocks: IntGauge,
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
@@ -1180,6 +1137,51 @@ impl RouterRequestMetrics {
                     router::HINT_BLOCKS_TOTAL,
                     "Remediation blocks in compact router hints accepted by the destination backend",
                 );
+                let eligible_prefix_tokens_total = register_identity_free_counter(
+                    component,
+                    router::ELIGIBLE_PREFIX_TOKENS_TOTAL,
+                    "Unweighted prefix tokens held by the best eligible worker across all tiers",
+                );
+                let selected_prefix_tokens_total = register_identity_free_counter(
+                    component,
+                    router::SELECTED_PREFIX_TOKENS_TOTAL,
+                    "Unweighted prefix tokens held by the selected worker across all tiers",
+                );
+                let cache_loss_history_hit_tokens_total = register_identity_free_counter(
+                    component,
+                    router::CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL,
+                    "Prompt tokens whose KV identity a prior completed request computed",
+                );
+                let cache_loss_history_block_records = register_identity_free_gauge(
+                    component,
+                    router::CACHE_LOSS_HISTORY_BLOCK_RECORDS,
+                    "Complete sequence-hash records currently retained by the cache-loss ledger",
+                );
+                let cache_loss_history_unique_hashes = register_identity_free_gauge(
+                    component,
+                    router::CACHE_LOSS_HISTORY_UNIQUE_HASHES,
+                    "Distinct sequence hashes currently retained by the cache-loss ledger",
+                );
+                let cache_loss_history_represented_tokens = register_identity_free_gauge(
+                    component,
+                    router::CACHE_LOSS_HISTORY_REPRESENTED_TOKENS,
+                    "Full KV tokens represented by retained cache-loss ledger records",
+                );
+                let cache_loss_history_estimated_bytes = register_identity_free_gauge(
+                    component,
+                    router::CACHE_LOSS_HISTORY_ESTIMATED_BYTES,
+                    "Conservative estimated bytes held by retained cache-loss ledger records",
+                );
+                let cache_loss_history_capacity_bytes = register_identity_free_gauge(
+                    component,
+                    router::CACHE_LOSS_HISTORY_CAPACITY_BYTES,
+                    "Configured byte budget for the cache-loss ledger",
+                );
+                let cache_loss_history_capacity_blocks = register_identity_free_gauge(
+                    component,
+                    router::CACHE_LOSS_HISTORY_CAPACITY_BLOCKS,
+                    "Configured maximum records retained by the cache-loss ledger",
+                );
                 let kv_transfer_estimated_latency_seconds = metrics
                     .create_histogram(
                         &router_metric(frontend_service::KV_TRANSFER_ESTIMATED_LATENCY_SECONDS),
@@ -1219,6 +1221,15 @@ impl RouterRequestMetrics {
                     selected_overlap_blocks_total,
                     remediation_blocks_total,
                     hint_blocks_total,
+                    eligible_prefix_tokens_total,
+                    selected_prefix_tokens_total,
+                    cache_loss_history_hit_tokens_total,
+                    cache_loss_history_block_records,
+                    cache_loss_history_unique_hashes,
+                    cache_loss_history_represented_tokens,
+                    cache_loss_history_estimated_bytes,
+                    cache_loss_history_capacity_bytes,
+                    cache_loss_history_capacity_blocks,
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
                     shared_cache_beyond_blocks,
@@ -1238,6 +1249,46 @@ impl RouterRequestMetrics {
 
     pub(crate) fn observe_hint_blocks(&self, hint_blocks: u64) {
         self.hint_blocks_total.inc_by(hint_blocks);
+    }
+
+    /// F2u/F3u. Unweighted and tier-complete, so they compose with the
+    /// worker-side token attribution that supplies F4/F5. The weighted
+    /// `router_{eligible_oracle,selected}_cached_tokens_total` pair stays as the
+    /// scheduler's own view; the two are not interchangeable.
+    pub(crate) fn observe_prefix_tokens(&self, eligible_tokens: u64, selected_tokens: u64) {
+        self.eligible_prefix_tokens_total.inc_by(eligible_tokens);
+        self.selected_prefix_tokens_total.inc_by(selected_tokens);
+    }
+
+    /// F1.
+    pub(crate) fn observe_cache_loss_history_hit(&self, tokens: u64) {
+        self.cache_loss_history_hit_tokens_total.inc_by(tokens);
+    }
+
+    pub(crate) fn set_cache_loss_history_stats(
+        &self,
+        retained_records: usize,
+        retained_unique_hashes: usize,
+        represented_tokens: u64,
+        estimated_retained_bytes: usize,
+        capacity_bytes: usize,
+        capacity_blocks: usize,
+    ) {
+        fn as_i64(value: usize) -> i64 {
+            i64::try_from(value).unwrap_or(i64::MAX)
+        }
+        self.cache_loss_history_block_records
+            .set(as_i64(retained_records));
+        self.cache_loss_history_unique_hashes
+            .set(as_i64(retained_unique_hashes));
+        self.cache_loss_history_represented_tokens
+            .set(i64::try_from(represented_tokens).unwrap_or(i64::MAX));
+        self.cache_loss_history_estimated_bytes
+            .set(as_i64(estimated_retained_bytes));
+        self.cache_loss_history_capacity_bytes
+            .set(as_i64(capacity_bytes));
+        self.cache_loss_history_capacity_blocks
+            .set(as_i64(capacity_blocks));
     }
 }
 
@@ -1662,27 +1713,6 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
     }
 
     #[test]
-    fn inventory_mismatch_reasons_are_bounded() {
-        assert_eq!(
-            InventoryMismatchReason::ALL.map(InventoryMismatchReason::as_label),
-            [
-                "source_missing",
-                "source_validation_timeout",
-                "epoch_mismatch",
-                "worker_unreachable",
-                "layout_mismatch",
-            ]
-        );
-        for reason in InventoryMismatchReason::ALL {
-            assert_eq!(
-                InventoryMismatchReason::from_label(reason.as_label()),
-                Some(reason)
-            );
-        }
-        assert_eq!(InventoryMismatchReason::from_label("request-123"), None);
-    }
-
-    #[test]
     fn r3_metric_families_have_exact_identity_free_exposition() {
         let registry = prometheus::Registry::new();
         for name in [
@@ -1690,6 +1720,9 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
             router::SELECTED_OVERLAP_BLOCKS_TOTAL,
             router::REMEDIATION_BLOCKS_TOTAL,
             router::HINT_BLOCKS_TOTAL,
+            router::ELIGIBLE_PREFIX_TOKENS_TOTAL,
+            router::SELECTED_PREFIX_TOKENS_TOTAL,
+            router::CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL,
             router::INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL,
             router::INVENTORY_SEQUENCE_GAP_TOTAL,
         ] {
@@ -1706,15 +1739,6 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
                 .unwrap(),
             ))
             .unwrap();
-        let mismatch = prometheus::IntCounterVec::new(
-            prometheus::Opts::new(router::INVENTORY_MISMATCH_BLOCKS_TOTAL, "test"),
-            &["reason"],
-        )
-        .unwrap();
-        for reason in InventoryMismatchReason::ALL {
-            mismatch.with_label_values(&[reason.as_label()]);
-        }
-        registry.register(Box::new(mismatch)).unwrap();
         let anomaly = prometheus::IntCounterVec::new(
             prometheus::Opts::new(router::INVENTORY_SEQUENCE_ANOMALY_TOTAL, "test"),
             &["reason"],
@@ -1725,17 +1749,34 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
         }
         registry.register(Box::new(anomaly)).unwrap();
 
+        for name in [
+            router::CACHE_LOSS_HISTORY_BLOCK_RECORDS,
+            router::CACHE_LOSS_HISTORY_UNIQUE_HASHES,
+            router::CACHE_LOSS_HISTORY_REPRESENTED_TOKENS,
+            router::CACHE_LOSS_HISTORY_ESTIMATED_BYTES,
+            router::CACHE_LOSS_HISTORY_CAPACITY_BYTES,
+            router::CACHE_LOSS_HISTORY_CAPACITY_BLOCKS,
+        ] {
+            registry
+                .register(Box::new(prometheus::IntGauge::new(name, "test").unwrap()))
+                .unwrap();
+        }
+
         let output = gather_pef(&registry);
         for name in [
             router::MAX_OVERLAP_BLOCKS_TOTAL,
             router::SELECTED_OVERLAP_BLOCKS_TOTAL,
             router::REMEDIATION_BLOCKS_TOTAL,
             router::HINT_BLOCKS_TOTAL,
+            router::ELIGIBLE_PREFIX_TOKENS_TOTAL,
+            router::SELECTED_PREFIX_TOKENS_TOTAL,
+            router::CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL,
+            router::CACHE_LOSS_HISTORY_BLOCK_RECORDS,
+            router::CACHE_LOSS_HISTORY_CAPACITY_BLOCKS,
             router::INVENTORY_EVENT_LAG_SECONDS,
             router::INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL,
             router::INVENTORY_SEQUENCE_GAP_TOTAL,
             router::INVENTORY_SEQUENCE_ANOMALY_TOTAL,
-            router::INVENTORY_MISMATCH_BLOCKS_TOTAL,
         ] {
             assert!(output.contains(name), "missing metric family {name}");
         }

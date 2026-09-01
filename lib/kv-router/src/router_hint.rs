@@ -45,11 +45,46 @@ pub struct RouterHintRootCandidates {
 }
 
 impl RouterHintRootCandidates {
+    /// Longest eligible source prefix, without materializing its block hashes.
+    ///
+    /// Use this when only the prefix length is needed (the `M` counter); it
+    /// fails closed on the same invalid-prefix condition as [`Self::best_source`]
+    /// so the two can never disagree.
+    pub fn best_source_prefix_blocks<F>(
+        &self,
+        prefix_blocks_to_beat: usize,
+        is_eligible_source: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(WorkerWithDpRank) -> bool,
+    {
+        self.best_source_entry(prefix_blocks_to_beat, is_eligible_source)
+            .map(|(_, prefix_blocks)| prefix_blocks)
+    }
+
     pub fn best_source<F>(
         &self,
         prefix_blocks_to_beat: usize,
-        mut is_eligible_source: F,
+        is_eligible_source: F,
     ) -> Option<(WorkerWithDpRank, Vec<ExternalSequenceBlockHash>)>
+    where
+        F: FnMut(WorkerWithDpRank) -> bool,
+    {
+        let (source, prefix_blocks) =
+            self.best_source_entry(prefix_blocks_to_beat, is_eligible_source)?;
+        Some((source, self.block_hashes[..prefix_blocks].to_vec()))
+    }
+
+    /// Pick the longest eligible source and validate that the recorded prefix
+    /// length is representable by the retained chain. A winning candidate with
+    /// an out-of-range prefix fails closed rather than falling back to the
+    /// runner-up, so a corrupt inventory entry cannot silently downgrade the
+    /// hint to a shorter source.
+    fn best_source_entry<F>(
+        &self,
+        prefix_blocks_to_beat: usize,
+        mut is_eligible_source: F,
+    ) -> Option<(WorkerWithDpRank, usize)>
     where
         F: FnMut(WorkerWithDpRank) -> bool,
     {
@@ -66,7 +101,7 @@ impl RouterHintRootCandidates {
                     .then_with(|| right_worker.cmp(left_worker))
             })?;
 
-        Some((source, self.block_hashes.get(..prefix_blocks)?.to_vec()))
+        (prefix_blocks <= self.block_hashes.len()).then_some((source, prefix_blocks))
     }
 }
 
@@ -111,5 +146,33 @@ mod tests {
         };
 
         assert!(candidates.best_source(0, |_| true).is_none());
+        assert!(
+            candidates
+                .best_source_prefix_blocks(0, |_| true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn best_source_prefix_blocks_matches_best_source_length() {
+        let worker_a = WorkerWithDpRank::new(7, 0);
+        let worker_b = WorkerWithDpRank::new(8, 0);
+        let candidates = RouterHintRootCandidates {
+            block_hashes: vec![
+                ExternalSequenceBlockHash(101),
+                ExternalSequenceBlockHash(102),
+                ExternalSequenceBlockHash(103),
+            ],
+            owner_prefix_blocks: vec![(worker_b, 2), (worker_a, 3)],
+        };
+
+        assert_eq!(candidates.best_source_prefix_blocks(0, |_| true), Some(3));
+        assert_eq!(
+            candidates.best_source_prefix_blocks(0, |_| true),
+            candidates
+                .best_source(0, |_| true)
+                .map(|(_, hashes)| hashes.len())
+        );
+        assert_eq!(candidates.best_source_prefix_blocks(3, |_| true), None);
     }
 }

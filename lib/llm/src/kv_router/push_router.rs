@@ -19,6 +19,7 @@ use tracing::Instrument;
 use crate::{
     kv_router::{
         KvRouter,
+        cache_history::{CacheHistory, CacheHistoryRequest},
         metrics::{RouterRequestMetrics, RoutingOpportunity},
     },
     preprocessor::PreprocessedRequest,
@@ -111,6 +112,9 @@ pub struct KvPushRouter {
     pub chooser: Arc<KvRouter>,
     request_metrics: Arc<RouterRequestMetrics>,
     affinity: Option<AffinityCoordinator>,
+    /// Backs funnel stage F1. `None` unless cache-loss telemetry is enabled, in
+    /// which case nothing is allocated and F1 stays at zero.
+    cache_history: Option<Arc<parking_lot::Mutex<CacheHistory>>>,
 }
 
 impl KvPushRouter {
@@ -136,12 +140,25 @@ impl KvPushRouter {
         // and the standalone router create KvPushRouter, so this covers both.
         let request_metrics =
             RouterRequestMetrics::from_component(chooser.client().endpoint.component());
+        let cache_history = CacheHistory::from_env(chooser.block_size());
+        if let Some(history) = cache_history.as_ref() {
+            let stats = history.lock().stats();
+            request_metrics.set_cache_loss_history_stats(
+                stats.retained_records,
+                stats.retained_unique_hashes,
+                stats.represented_tokens,
+                stats.estimated_retained_bytes,
+                stats.capacity_bytes,
+                stats.capacity_blocks,
+            );
+        }
 
         KvPushRouter {
             inner,
             chooser,
             request_metrics,
             affinity,
+            cache_history,
         }
     }
 
@@ -265,6 +282,29 @@ impl KvPushRouter {
                     selection.max_overlap_blocks,
                     selection.selected_overlap_blocks,
                 ));
+            let block_tokens = self.chooser.block_size() as u64;
+            guard.request_metrics().observe_prefix_tokens(
+                selection.eligible_prefix_blocks.saturating_mul(block_tokens),
+                selection.selected_prefix_blocks.saturating_mul(block_tokens),
+            );
+            if let Some(history) = self.cache_history.as_ref() {
+                let routing = request.routing.as_ref();
+                let tracked = CacheHistoryRequest::new(
+                    routing_parts.token_ids.to_vec(),
+                    routing_parts.block_mm_infos.map(|infos| infos.to_vec()),
+                    routing.and_then(|routing| routing.lora_name.clone()),
+                    routing.and_then(|routing| routing.cache_namespace.clone()),
+                    self.chooser.block_size(),
+                    self.chooser.is_eagle(),
+                );
+                // Query before the guard admits this request's own hashes at
+                // finish, otherwise every request would score as a full F1 hit.
+                let previously_computed = tracked.previously_computed_tokens(&history.lock());
+                guard
+                    .request_metrics()
+                    .observe_cache_loss_history_hit(previously_computed);
+                guard.attach_cache_history(history.clone(), tracked);
+            }
         }
 
         let record_result: Result<(), Error> = async {

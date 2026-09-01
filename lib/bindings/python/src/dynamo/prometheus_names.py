@@ -393,6 +393,19 @@ class router:
     REMEDIATION_BLOCKS_TOTAL = "kv_router_remediation_blocks_total"
     # Remediation blocks in compact hints accepted by the destination backend.
     HINT_BLOCKS_TOTAL = "kv_router_hint_blocks_total"
+    # F2u: unweighted prefix tokens held by the best eligible worker across all tiers.
+    ELIGIBLE_PREFIX_TOKENS_TOTAL = "kv_router_eligible_prefix_tokens_total"
+    # F3u: unweighted prefix tokens held by the selected worker across all tiers.
+    SELECTED_PREFIX_TOKENS_TOTAL = "kv_router_selected_prefix_tokens_total"
+    # F1: prompt tokens whose KV identity a prior completed request computed.
+    CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL = "kv_router_cache_loss_history_hit_tokens_total"
+    # Cache-loss ledger occupancy and budget.
+    CACHE_LOSS_HISTORY_BLOCK_RECORDS = "kv_router_cache_loss_history_block_records"
+    CACHE_LOSS_HISTORY_UNIQUE_HASHES = "kv_router_cache_loss_history_unique_hashes"
+    CACHE_LOSS_HISTORY_REPRESENTED_TOKENS = "kv_router_cache_loss_history_represented_tokens"
+    CACHE_LOSS_HISTORY_ESTIMATED_BYTES = "kv_router_cache_loss_history_estimated_bytes"
+    CACHE_LOSS_HISTORY_CAPACITY_BYTES = "kv_router_cache_loss_history_capacity_bytes"
+    CACHE_LOSS_HISTORY_CAPACITY_BLOCKS = "kv_router_cache_loss_history_capacity_blocks"
     # Producer-to-router age of inventory events.
     INVENTORY_EVENT_LAG_SECONDS = "kv_router_inventory_event_lag_seconds"
     # Inventory batches rejected because their producer timestamp is invalid.
@@ -401,8 +414,6 @@ class router:
     INVENTORY_SEQUENCE_GAP_TOTAL = "kv_router_inventory_sequence_gap_total"
     # Repeated or out-of-order inventory sequence identifiers by bounded reason.
     INVENTORY_SEQUENCE_ANOMALY_TOTAL = "kv_router_inventory_sequence_anomaly_total"
-    # Inventory blocks rejected during reconciliation, partitioned by bounded reason.
-    INVENTORY_MISMATCH_BLOCKS_TOTAL = "kv_router_inventory_mismatch_blocks_total"
     # Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
     SHARED_CACHE_HIT_RATE = "router_shared_cache_hit_rate"
     # Shared cache blocks beyond device overlap for the selected worker

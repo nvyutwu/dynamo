@@ -38,10 +38,6 @@ def run_kv_indexer(args: List[str]) -> None:
     """Run the KV indexer with the given arguments."""
     ...
 
-def record_kv_inventory_mismatch(reason: str, blocks: int) -> bool:
-    """Record rejected KV inventory blocks for a bounded reconciliation reason."""
-    ...
-
 def run_slot_tracker(args: List[str]) -> None:
     """Run the KV router slot tracker with the given arguments."""
     ...

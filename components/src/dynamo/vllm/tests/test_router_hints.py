@@ -110,15 +110,6 @@ def test_enable_router_hint_support_normalizes_aggregated_and_ipv6():
             (4, 2),
             "exactly 2 entries",
         ),
-        (
-            {
-                "router_capabilities": ["router_hint"],
-                "control_advertise_host": "0.0.0.0",
-                "control_ports": [23280],
-            },
-            (0, 1),
-            "advertisable source control endpoints",
-        ),
     ],
 )
 def test_enable_router_hint_support_rejects_incomplete_endpoint_maps(
@@ -130,6 +121,36 @@ def test_enable_router_hint_support_rejects_incomplete_endpoint_maps(
             runtime_config, engine_args([tier]), WorkerType.Prefill, dp_range
         )
     runtime_config.set_engine_specific.assert_not_called()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_enable_router_hint_support_registers_target_only_without_advertisable_host(
+    host,
+):
+    """A wildcard bind host disables the source role, it does not fail the worker."""
+    runtime_config = MagicMock()
+    tier = {
+        "router_capabilities": ["router_hint"],
+        "control_advertise_host": host,
+        "control_ports": [23280],
+    }
+
+    enable_router_hint_support(
+        runtime_config, engine_args([tier]), WorkerType.Prefill, (0, 1)
+    )
+
+    registered = {
+        call.args[0] for call in runtime_config.set_engine_specific.call_args_list
+    }
+    assert ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY not in registered
+    assert registered == {
+        ROUTER_HINT_RUNTIME_CAPABILITY_KEY,
+        ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
+        ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
+    }
+    runtime_config.set_engine_specific.assert_any_call(
+        ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY, json.dumps("prefill")
+    )
 
 
 def test_enable_router_hint_support_skips_without_capability_or_supported_role():

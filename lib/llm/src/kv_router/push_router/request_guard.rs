@@ -10,7 +10,11 @@ use dynamo_runtime::{
 };
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter,
+        cache_history::{CacheHistory, CacheHistoryRequest},
+        metrics::RouterRequestMetrics,
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
@@ -283,6 +287,8 @@ pub(super) struct RequestGuard {
     observability: RequestObservability,
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
+    /// Funnel stage F1. Present only when cache-loss telemetry is enabled.
+    cache_history: Option<(Arc<parking_lot::Mutex<CacheHistory>>, CacheHistoryRequest)>,
 }
 
 impl RequestGuard {
@@ -320,7 +326,19 @@ impl RequestGuard {
                 expected_output_tokens,
             ),
             prefill_marked: false,
+            cache_history: None,
         }
+    }
+
+    /// Admit this request's computed context to the F1 ledger when it completes.
+    /// Only a request that reaches `finish` is recorded: an aborted request may
+    /// never have produced the KV it would otherwise claim.
+    pub(super) fn attach_cache_history(
+        &mut self,
+        history: Arc<parking_lot::Mutex<CacheHistory>>,
+        tracked: CacheHistoryRequest,
+    ) {
+        self.cache_history = Some((history, tracked));
     }
 
     pub(super) fn request_metrics(&self) -> &RouterRequestMetrics {
@@ -347,6 +365,13 @@ impl RequestGuard {
 
     pub(super) async fn on_item(&mut self, item: &Annotated<LLMEngineOutput>) {
         self.observability.observe_response();
+
+        if let Some((_history, tracked)) = self.cache_history.as_mut()
+            && let Some(data) = item.data.as_ref()
+            && !data.token_ids.is_empty()
+        {
+            tracked.observe_output(data.index.unwrap_or(0), &data.token_ids);
+        }
 
         if let Some(usage) = item
             .data
@@ -414,6 +439,22 @@ impl RequestGuard {
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
         self.observability.record_metrics();
+        // Scoped so the ledger borrow ends before `request_metrics()` reborrows self.
+        let history_stats = self.cache_history.as_mut().map(|(history, tracked)| {
+            let mut ledger = history.lock();
+            tracked.finalize(&mut ledger);
+            ledger.stats()
+        });
+        if let Some(stats) = history_stats {
+            self.request_metrics().set_cache_loss_history_stats(
+                stats.retained_records,
+                stats.retained_unique_hashes,
+                stats.represented_tokens,
+                stats.estimated_retained_bytes,
+                stats.capacity_bytes,
+                stats.capacity_blocks,
+            );
+        }
         self.mark_completed_terminal();
         self.cleanup.finish().await;
     }

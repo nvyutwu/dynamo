@@ -43,6 +43,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod cache_history;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
@@ -79,6 +80,9 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         selected_overlap_blocks: u64,
         max_overlap_blocks: u64,
+        /// F2u/F3u: unweighted all-tier prefix blocks, best-eligible and selected.
+        eligible_prefix_blocks: u64,
+        selected_prefix_blocks: u64,
         cached_tokens: usize,
         eligible_oracle_cached_tokens: usize,
         resident_oracle_cached_tokens: usize,
@@ -481,10 +485,10 @@ where
             };
 
             let max_overlap_blocks = candidates
-                .best_source(prefix_blocks_to_beat, |worker| {
+                .best_source_prefix_blocks(prefix_blocks_to_beat, |worker| {
                     compatible_source(worker, false)
                 })
-                .map(|(_, block_hashes)| block_hashes.len() as u64)
+                .map(|prefix_blocks| prefix_blocks as u64)
                 .unwrap_or(selected_overlap_blocks)
                 .max(selected_overlap_blocks);
 
@@ -892,6 +896,8 @@ where
                 effective_overlap_blocks: response.effective_overlap_blocks,
                 selected_overlap_blocks: router_hint_decision.selected_overlap_blocks,
                 max_overlap_blocks: router_hint_decision.max_overlap_blocks,
+                eligible_prefix_blocks: u64::from(response.eligible_total_prefix_blocks),
+                selected_prefix_blocks: u64::from(response.selected_worker_tiers.disk_blocks),
                 cached_tokens: response.cached_tokens,
                 eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,

@@ -1421,6 +1421,11 @@ impl<
                 .as_ref()
                 .and_then(|provider| provider());
             let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+            // Taken before `select_worker` consumes `eligibility`, and from the
+            // same overlap snapshot, so F2u and F3u describe one decision.
+            let eligible_total_prefix_blocks = request
+                .overlap
+                .best_eligible_total_prefix_blocks(&workers, &eligibility);
             self.selector
                 .select_worker(&workers, &request, eligibility, self.block_size)
                 .map(|selection| {
@@ -1430,11 +1435,11 @@ impl<
                     let selected_worker_tiers = request
                         .overlap
                         .selected_worker_tiers(selection.worker, config);
-                    (selection, selected_worker_tiers)
+                    (selection, selected_worker_tiers, eligible_total_prefix_blocks)
                 })
         };
 
-        let (selection, selected_worker_tiers) = match selection {
+        let (selection, selected_worker_tiers, eligible_total_prefix_blocks) = match selection {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scheduling failed: {e}");
@@ -1463,6 +1468,7 @@ impl<
             eligible_oracle_cached_tokens: selection.eligible_oracle_cached_tokens,
             resident_oracle_cached_tokens: selection.resident_oracle_cached_tokens,
             selected_worker_tiers,
+            eligible_total_prefix_blocks,
             router_hint_root_candidates: request.overlap.router_hint_root_candidates.take(),
             request_progress,
             lifecycle_lease: None,

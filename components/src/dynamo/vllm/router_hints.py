@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import secrets
 from collections.abc import Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,8 @@ from dynamo.common.constants import (
 )
 from dynamo.llm import ModelRuntimeConfig, WorkerType
 
+
+logger = logging.getLogger(__name__)
 
 # One random generation per backend process. A restarted process advertises a new
 # value even when it reuses the same stable worker identity or control endpoint.
@@ -143,16 +146,26 @@ def enable_router_hint_support(
         return
     router_hint_tiers = _router_hint_tiers(engine_args)
 
+    # A tier whose control endpoint is not advertisable (the common case is a
+    # wildcard `control_advertise_host` such as 0.0.0.0 or ::) cannot serve as a
+    # remote source. That is not a reason to fail registration: the router
+    # requires an endpoint only for the source side, so the worker still
+    # advertises the capability, its worker type, and its inventory epoch and
+    # remains usable as a hint *target*. A malformed `control_ports` list is a
+    # different matter and still raises out of the helper below.
     endpoints = _router_hint_source_control_endpoints(router_hint_tiers[0], dp_range)
     if endpoints is None:
-        raise ValueError(
-            "router_hint support requires advertisable source control endpoints "
-            "for all managed DP ranks"
+        logger.warning(
+            "router_hint: no advertisable source control endpoint for DP ranks "
+            "%s..%s (check control_advertise_host and control_ports); this worker "
+            "will consume router hints but will not be offered as a KVCR source",
+            dp_range[0],
+            dp_range[0] + dp_range[1] - 1,
         )
-
-    runtime_config.set_engine_specific(
-        ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, json.dumps(endpoints)
-    )
+    else:
+        runtime_config.set_engine_specific(
+            ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, json.dumps(endpoints)
+        )
     runtime_config.set_engine_specific(
         ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
         json.dumps(_ROUTER_HINT_INVENTORY_EPOCH),

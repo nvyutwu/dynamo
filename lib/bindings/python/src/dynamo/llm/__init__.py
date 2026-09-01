@@ -46,7 +46,6 @@ from dynamo._core import fetch_model as fetch_model
 from dynamo._core import lora_name_to_id as lora_name_to_id
 from dynamo._core import make_engine
 from dynamo._core import register_model as register_model
-from dynamo._core import record_kv_inventory_mismatch as record_kv_inventory_mismatch
 from dynamo._core import run_input
 from dynamo._core import run_kv_indexer as run_kv_indexer
 from dynamo._core import run_select_service as run_select_service

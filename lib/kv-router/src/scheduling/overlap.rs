@@ -9,6 +9,7 @@ use crate::protocols::{
     DpRank, SharedCacheHits, StorageTier, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
 use crate::router_hint::RouterHintRootCandidates;
+use crate::scheduling::filter::RoutingEligibility;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
@@ -31,6 +32,30 @@ pub struct OverlapSignals {
 }
 
 impl OverlapSignals {
+    /// F2u: longest unweighted prefix in blocks, across device + host + disk,
+    /// held by any eligible worker.
+    ///
+    /// This is deliberately NOT `oracle_cached_tokens`. That one is a
+    /// tier-*weighted* scheduling score dominated by device overlap, so it does
+    /// not compose with the worker-side token attribution that supplies F4/F5 --
+    /// a funnel mixing the two is not monotone. Both are exported; they answer
+    /// different questions.
+    pub fn best_eligible_total_prefix_blocks<C: WorkerConfigLike>(
+        &self,
+        workers: &HashMap<WorkerId, C>,
+        eligibility: &RoutingEligibility<'_>,
+    ) -> u32 {
+        workers
+            .iter()
+            .filter(|(worker_id, config)| eligibility.allows_worker(**worker_id, *config))
+            .map(|(worker_id, config)| {
+                self.selected_worker_tiers(WorkerWithDpRank::new(*worker_id, 0), config)
+                    .disk_blocks
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn selected_worker_tiers<C: WorkerConfigLike>(
         &self,
         worker: WorkerWithDpRank,

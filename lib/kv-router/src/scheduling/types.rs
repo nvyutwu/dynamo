@@ -79,6 +79,9 @@ pub struct SchedulingResponse {
     pub eligible_oracle_cached_tokens: usize,
     pub resident_oracle_cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    /// F2u: unweighted all-tier prefix blocks on the best eligible worker,
+    /// from the same overlap snapshot that produced `selected_worker_tiers`.
+    pub eligible_total_prefix_blocks: u32,
     /// Host-pinned source candidates captured with the final scheduling overlap snapshot.
     pub router_hint_root_candidates: Option<RouterHintRootCandidates>,
     pub request_progress: Option<RequestProgressUpdater>,

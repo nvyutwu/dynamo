@@ -428,6 +428,39 @@ The established request metrics carry the standard hierarchy labels (`dynamo_nam
 | `kv_router_remediation_blocks_total` | Counter | `R = max(0, M-L)`: routing opportunity missing on the selected worker |
 | `kv_router_hint_blocks_total` | Counter | `H`: remediation suffix in compact hints accepted by the destination backend |
 
+| `kv_router_eligible_prefix_tokens_total` | Counter | **F2u**: unweighted prefix tokens on the best eligible worker, summed across device + host + disk |
+| `kv_router_selected_prefix_tokens_total` | Counter | **F3u**: unweighted prefix tokens on the selected worker, same tier scope |
+| `kv_router_cache_loss_history_hit_tokens_total` | Counter | **F1**: prompt tokens whose KV identity a prior completed request computed |
+| `kv_router_cache_loss_history_block_records` | Gauge | Records currently retained by the cache-loss ledger |
+| `kv_router_cache_loss_history_unique_hashes` | Gauge | Distinct sequence hashes retained |
+| `kv_router_cache_loss_history_represented_tokens` | Gauge | Full KV tokens represented by retained records |
+| `kv_router_cache_loss_history_estimated_bytes` | Gauge | Conservative estimated bytes held |
+| `kv_router_cache_loss_history_capacity_bytes` | Gauge | Configured byte budget |
+| `kv_router_cache_loss_history_capacity_blocks` | Gauge | Configured maximum retained records |
+
+#### Cache-loss funnel (F0-F5)
+
+`F0` is `dynamo_component_router_input_tokens_total`; `F4`/`F5` come from the
+backend's own token attribution. Only `F1` needs router state that nothing else
+carries, so only `F1` is a new counter here.
+
+`F2u`/`F3u` are **unweighted and tier-complete**, unlike
+`router_{eligible_oracle,selected}_cached_tokens_total`, which are the
+scheduler's tier-*weighted* score. Use the `*_prefix_tokens_total` pair when
+composing a funnel with backend-side token counts -- mixing the weighted pair
+with backend attribution yields a non-monotone funnel. Both pairs are exported;
+they answer different questions.
+
+The **F1 ledger is off by default** and allocates nothing unless
+`DYN_CACHE_LOSS_ENABLED` is truthy. Size it with
+`DYN_CACHE_LOSS_HISTORY_BLOCKS` (default 5,000,000 records) and
+`DYN_CACHE_LOSS_HISTORY_BYTES` (default 256 MiB); the smaller bound wins. The
+ledger is **per frontend process**, so with N frontend replicas behind a
+non-KV-aware load balancer each replica sees roughly 1/N of the history and F1
+is a lower bound. Read the `history_*` gauges alongside F1: a low F1 with
+`block_records == capacity_blocks` means the ledger is too small, not that
+there was no reuse.
+
 The block counters are identity-free metric families: worker IDs, router IDs, endpoints, and request IDs are not labels. They use raw integer prefix blocks rather than weighted scheduling credit, are recorded from one routing snapshot, and are capped at the request block count. `H` is also capped at `R`, so `0 <= H <= R` remains true when only part of an opportunity is represented by a hint.
 
 #### KV Inventory Health (`kv_router_inventory_*`)
@@ -440,7 +473,24 @@ These worker-side metrics are registered with the KV event publisher. They measu
 | `kv_router_inventory_event_timestamp_invalid_total` | Counter | Non-finite, negative, or future producer timestamps excluded from the lag histogram |
 | `kv_router_inventory_sequence_gap_total` | Counter | Missing ZMQ envelope sequence numbers plus missing direct-publisher event IDs |
 | `kv_router_inventory_sequence_anomaly_total{reason}` | Counter | Repeated or out-of-order sequence IDs, with a bounded `reason` |
-| `kv_router_inventory_mismatch_blocks_total{reason}` | Counter | Rejected inventory blocks; `reason` is bounded to `source_missing`, `epoch_mismatch`, `worker_unreachable`, or `layout_mismatch` |
+
+Inventory *reconciliation* faults are not in this family. They are raised by the
+backend, which for vLLM runs in a separate EngineCore process with no Dynamo KV
+publisher, so a Dynamo-side counter could never be incremented. They are exported
+by the backend instead, partitioned by which side can account for them:
+
+| Metric | Owner | Reasons |
+|--------|-------|---------|
+| `vllm:kvcr_source_blocks_missing_total{reason}` | KVCR source | `source_missing`, `source_validation_timeout`, `epoch_mismatch` — each implies a source attempt |
+| `vllm:kvcr_target_inventory_mismatch_total{reason}` | Target vLLM | `layout_mismatch`, `worker_unreachable` — target-observed, no source attempt implied |
+
+The two partition; they do not overlap, so they may be summed for a total
+reconciliation-fault rate.
+
+`M`, `L`, `R`, and `H` are only populated when the router owns a local lower-tier
+index. A router backed by a remote indexer receives no root-aligned source chain
+over the wire, so it reports `M == L` and `R == 0`. That zero means "not
+observable here", not "no opportunity".
 
 #### Per-Request Routing Overhead (`dynamo_router_overhead_*`)
 
