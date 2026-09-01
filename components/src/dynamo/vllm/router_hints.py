@@ -113,6 +113,22 @@ def _router_hint_worker_type(worker_type: WorkerType) -> str | None:
     return role if role in {"aggregated", "prefill", "decode"} else None
 
 
+def configure_router_hint_inventory_epoch(engine_args: AsyncEngineArgs) -> bool:
+    """Inject the source generation before vLLM constructs secondary tiers."""
+    router_hint_tiers = _router_hint_tiers(engine_args)
+    if not router_hint_tiers:
+        return False
+    if len(router_hint_tiers) > 1:
+        raise ValueError(
+            "router_hint support requires exactly one router-hint-capable secondary tier"
+        )
+    tier = router_hint_tiers[0]
+    if not isinstance(tier, MutableMapping):
+        raise ValueError("router_hint support requires a mutable tier configuration")
+    tier["inventory_epoch"] = _ROUTER_HINT_INVENTORY_EPOCH
+    return True
+
+
 def enable_router_hint_support(
     runtime_config: ModelRuntimeConfig,
     engine_args: AsyncEngineArgs,
@@ -123,13 +139,9 @@ def enable_router_hint_support(
     if router_hint_worker_type is None:
         return
 
-    router_hint_tiers = _router_hint_tiers(engine_args)
-    if not router_hint_tiers:
+    if not configure_router_hint_inventory_epoch(engine_args):
         return
-    if len(router_hint_tiers) > 1:
-        raise ValueError(
-            "router_hint support requires exactly one router-hint-capable secondary tier"
-        )
+    router_hint_tiers = _router_hint_tiers(engine_args)
 
     endpoints = _router_hint_source_control_endpoints(router_hint_tiers[0], dp_range)
     if endpoints is None:
@@ -137,13 +149,6 @@ def enable_router_hint_support(
             "router_hint support requires advertisable source control endpoints "
             "for all managed DP ranks"
         )
-
-    tier = router_hint_tiers[0]
-    if not isinstance(tier, MutableMapping):
-        raise ValueError("router_hint support requires a mutable tier configuration")
-    # The same process generation is advertised to the router and supplied to
-    # KVCR. The source validates it on every start_write before touching data.
-    tier["inventory_epoch"] = _ROUTER_HINT_INVENTORY_EPOCH
 
     runtime_config.set_engine_specific(
         ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, json.dumps(endpoints)

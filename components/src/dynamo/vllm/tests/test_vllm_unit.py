@@ -538,6 +538,80 @@ def test_setup_vllm_engine_reuses_engine_config_model_config(monkeypatch):
     assert default_sampling_params == {"temperature": 0.7}
 
 
+def test_setup_vllm_engine_configures_router_epoch_before_engine_config(monkeypatch):
+    from dynamo.vllm import main as vllm_main
+
+    events = []
+
+    class FakeModelConfig:
+        def get_diff_sampling_param(self):
+            return {}
+
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        cache_config=SimpleNamespace(block_size=None),
+        model_config=FakeModelConfig(),
+    )
+
+    class FakeEngineArgs:
+        enable_log_requests = False
+        enable_lora = False
+        disable_log_stats = True
+        load_format = "modelexpress"
+
+        def create_engine_config(self, usage_context):
+            events.append("create_engine_config")
+            return vllm_config
+
+    engine_client = SimpleNamespace(vllm_config=vllm_config)
+
+    class FakeAsyncLLM:
+        @staticmethod
+        def from_vllm_config(**_kwargs):
+            events.append("construct_engine")
+            return engine_client
+
+    class FakeMetrics:
+        def __init__(self, **_kwargs):
+            pass
+
+        def set_model_load_time(self, _load_time):
+            pass
+
+    monkeypatch.setattr(vllm_main, "setup_multiprocess_prometheus", lambda: None)
+    monkeypatch.setattr(vllm_main, "LLMBackendMetrics", FakeMetrics)
+    monkeypatch.setattr(vllm_main, "_uses_dynamo_connector", lambda _args: False)
+    monkeypatch.setattr(vllm_main, "AsyncLLM", FakeAsyncLLM)
+    monkeypatch.setattr(
+        vllm_main,
+        "configure_router_hint_inventory_epoch",
+        lambda _args: events.append("configure_epoch"),
+    )
+    monkeypatch.setattr(
+        vllm_main,
+        "get_engine_cache_info",
+        lambda _engine: {"block_size": 16},
+    )
+
+    config = SimpleNamespace(
+        component="backend",
+        namespace="dynamo",
+        engine_args=FakeEngineArgs(),
+        gms_shadow_mode=False,
+        multimodal_embedding_cache_capacity_gb=0,
+        route_to_encoder=False,
+        served_model_name="Qwen/Qwen3-0.6B",
+    )
+
+    vllm_main.setup_vllm_engine(config)
+
+    assert events == [
+        "configure_epoch",
+        "create_engine_config",
+        "construct_engine",
+    ]
+
+
 # --disaggregation-mode tests
 
 

@@ -46,7 +46,10 @@ from dynamo.llm import (
 )
 from dynamo.runtime import Endpoint
 from dynamo.runtime.logging import configure_dynamo_logging
-from dynamo.vllm.router_hints import enable_router_hint_support
+from dynamo.vllm.router_hints import (
+    configure_router_hint_inventory_epoch,
+    enable_router_hint_support,
+)
 from dynamo.vllm.worker_factory import WorkerFactory
 
 from . import envs
@@ -562,6 +565,11 @@ def setup_vllm_engine(
         namespace=config.namespace,
         component=config.component,
     )
+
+    # KVCR reads secondary-tier options while vLLM constructs its engine
+    # config. Inject the same generation later advertised to the router before
+    # that construction, or all remote hints will look stale to the source.
+    configure_router_hint_inventory_epoch(engine_args)
 
     # Taken from build_async_engine_client_from_engine_args()
     usage_context = UsageContext.OPENAI_API_SERVER

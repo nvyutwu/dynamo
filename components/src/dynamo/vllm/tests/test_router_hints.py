@@ -14,8 +14,9 @@ from dynamo.common.constants import (
     ROUTER_HINT_WORKER_TYPE_RUNTIME_KEY,
 )
 from dynamo.llm import WorkerType
-from dynamo.vllm.router_hints import enable_router_hint_support
 from dynamo.vllm.router_hints import _ROUTER_HINT_INVENTORY_EPOCH
+from dynamo.vllm.router_hints import configure_router_hint_inventory_epoch
+from dynamo.vllm.router_hints import enable_router_hint_support
 
 
 def engine_args(tiers):
@@ -52,6 +53,18 @@ def test_enable_router_hint_support_maps_explicit_ports_to_global_dp_ranks():
         ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
         json.dumps(_ROUTER_HINT_INVENTORY_EPOCH),
     )
+    assert tier["inventory_epoch"] == _ROUTER_HINT_INVENTORY_EPOCH
+
+
+def test_configure_router_hint_inventory_epoch_runs_before_engine_config():
+    tier = {
+        "router_capabilities": ["router_hint"],
+        "control_advertise_host": "worker-a",
+        "control_ports": [24000],
+    }
+    args = engine_args([tier])
+
+    assert configure_router_hint_inventory_epoch(args)
     assert tier["inventory_epoch"] == _ROUTER_HINT_INVENTORY_EPOCH
 
 
