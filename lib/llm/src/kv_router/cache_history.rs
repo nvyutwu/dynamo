@@ -130,11 +130,21 @@ impl CacheHistory {
     /// Takes already-hashed input on purpose: the ledger mutex is
     /// process-global, and hashing a long prompt plus every output branch under
     /// it would serialize every request completion in the process.
+    ///
+    /// Each chain is inserted **head-last**. Eviction is FIFO and
+    /// [`Self::previously_computed_tokens`] walks from block 0, so the head is
+    /// the only part of a chain that can answer a query — retaining a chain's
+    /// tail answers nothing. Inserting in order would make a ledger smaller
+    /// than one prompt keep exactly the wrong end and report F1 = 0 while full
+    /// of the right hashes. Head-last insertion makes an undersized ledger
+    /// degrade proportionally instead: it retains the longest prefix it can
+    /// afford. Output chains go in before the prompt so the prompt's head, the
+    /// most reusable span, is the most protected record in the ledger.
     pub fn record_completed_request(&mut self, completed: &CompletedHashes) {
-        self.record_completed(completed.prompt.iter().copied());
         for chain in &completed.outputs {
-            self.record_completed(chain.iter().copied());
+            self.record_completed(chain.iter().rev().copied());
         }
+        self.record_completed(completed.prompt.iter().rev().copied());
     }
 
     pub fn stats(&self) -> CacheHistoryStats {
@@ -353,6 +363,35 @@ mod tests {
         // Prompt has two complete blocks; prompt plus the first two generated
         // tokens has three. The final sampled token is deliberately absent.
         assert_eq!(history.stats().retained_records, 5);
+    }
+
+    #[test]
+    fn an_undersized_ledger_retains_the_head_so_f1_degrades_instead_of_collapsing() {
+        // Four records of capacity against a ten-block chain.
+        let mut history = CacheHistory::new(4, 8);
+        let chain: Vec<u64> = (100..110).collect();
+        history.record_completed_request(&CompletedHashes {
+            prompt: chain.clone(),
+            outputs: vec![],
+        });
+
+        // In-order insertion would have retained the tail (106..109) and
+        // answered 0, because the walk starts at 100 and stops immediately.
+        // Head-last insertion retains 100..103 and answers the longest prefix
+        // the ledger can afford.
+        assert_eq!(history.previously_computed_tokens(&chain), 4 * 8);
+        assert_eq!(history.stats().retained_records, 4);
+    }
+
+    #[test]
+    fn a_ledger_larger_than_the_chain_still_answers_in_full() {
+        let mut history = CacheHistory::new(64, 8);
+        let chain: Vec<u64> = (100..110).collect();
+        history.record_completed_request(&CompletedHashes {
+            prompt: chain.clone(),
+            outputs: vec![],
+        });
+        assert_eq!(history.previously_computed_tokens(&chain), 10 * 8);
     }
 
     #[test]
