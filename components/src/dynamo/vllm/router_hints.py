@@ -6,7 +6,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -45,7 +45,9 @@ def _supports_router_hint(tier: Mapping[str, Any]) -> bool:
 
 
 def _router_hint_tiers(engine_args: AsyncEngineArgs) -> list[Mapping[str, Any]]:
-    return [tier for tier in _secondary_tiers(engine_args) if _supports_router_hint(tier)]
+    return [
+        tier for tier in _secondary_tiers(engine_args) if _supports_router_hint(tier)
+    ]
 
 
 def _router_hint_source_host(host: str | None) -> str | None:
@@ -135,6 +137,13 @@ def enable_router_hint_support(
             "router_hint support requires advertisable source control endpoints "
             "for all managed DP ranks"
         )
+
+    tier = router_hint_tiers[0]
+    if not isinstance(tier, MutableMapping):
+        raise ValueError("router_hint support requires a mutable tier configuration")
+    # The same process generation is advertised to the router and supplied to
+    # KVCR. The source validates it on every start_write before touching data.
+    tier["inventory_epoch"] = _ROUTER_HINT_INVENTORY_EPOCH
 
     runtime_config.set_engine_specific(
         ROUTER_HINT_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY, json.dumps(endpoints)

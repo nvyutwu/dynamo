@@ -52,6 +52,7 @@ def test_enable_router_hint_support_maps_explicit_ports_to_global_dp_ranks():
         ROUTER_HINT_INVENTORY_EPOCH_RUNTIME_KEY,
         json.dumps(_ROUTER_HINT_INVENTORY_EPOCH),
     )
+    assert tier["inventory_epoch"] == _ROUTER_HINT_INVENTORY_EPOCH
 
 
 def test_enable_router_hint_support_normalizes_aggregated_and_ipv6():
