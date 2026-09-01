@@ -152,14 +152,16 @@ pub(crate) struct KvPublisherMetrics {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InventoryMismatchReason {
     SourceMissing,
+    SourceValidationTimeout,
     EpochMismatch,
     WorkerUnreachable,
     LayoutMismatch,
 }
 
 impl InventoryMismatchReason {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::SourceMissing,
+        Self::SourceValidationTimeout,
         Self::EpochMismatch,
         Self::WorkerUnreachable,
         Self::LayoutMismatch,
@@ -168,6 +170,7 @@ impl InventoryMismatchReason {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::SourceMissing => "source_missing",
+            Self::SourceValidationTimeout => "source_validation_timeout",
             Self::EpochMismatch => "epoch_mismatch",
             Self::WorkerUnreachable => "worker_unreachable",
             Self::LayoutMismatch => "layout_mismatch",
@@ -177,6 +180,7 @@ impl InventoryMismatchReason {
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "source_missing" => Some(Self::SourceMissing),
+            "source_validation_timeout" => Some(Self::SourceValidationTimeout),
             "epoch_mismatch" => Some(Self::EpochMismatch),
             "worker_unreachable" => Some(Self::WorkerUnreachable),
             "layout_mismatch" => Some(Self::LayoutMismatch),
@@ -1663,6 +1667,7 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
             InventoryMismatchReason::ALL.map(InventoryMismatchReason::as_label),
             [
                 "source_missing",
+                "source_validation_timeout",
                 "epoch_mismatch",
                 "worker_unreachable",
                 "layout_mismatch",
