@@ -647,7 +647,7 @@ pub mod router {
     pub const RESIDENT_ORACLE_CACHED_TOKENS_TOTAL: &str =
         "router_resident_oracle_cached_tokens_total";
 
-    /// Best compatible integer source prefix advertised to the router, in blocks.
+    /// Best integer prefix among the selected device and compatible source advertisements.
     pub const MAX_OVERLAP_BLOCKS_TOTAL: &str = "kv_router_max_overlap_blocks_total";
 
     /// Integer device prefix on the selected worker, in blocks.

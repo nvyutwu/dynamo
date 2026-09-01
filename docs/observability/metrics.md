@@ -423,7 +423,7 @@ The established request metrics carry the standard hierarchy labels (`dynamo_nam
 | `dynamo_component_router_selected_cached_tokens_total` | Counter | Predicted cached tokens on the selected worker |
 | `dynamo_component_router_eligible_oracle_cached_tokens_total` | Counter | Best cached tokens after overload filtering |
 | `dynamo_component_router_resident_oracle_cached_tokens_total` | Counter | Best cached tokens before overload filtering |
-| `kv_router_max_overlap_blocks_total` | Counter | `M`: best compatible integer source prefix advertised to the router |
+| `kv_router_max_overlap_blocks_total` | Counter | `M`: best integer prefix among the selected device and compatible source advertisements |
 | `kv_router_selected_overlap_blocks_total` | Counter | `L`: integer device prefix on the selected worker |
 | `kv_router_remediation_blocks_total` | Counter | `R = max(0, M-L)`: routing opportunity missing on the selected worker |
 | `kv_router_hint_blocks_total` | Counter | `H`: remediation suffix represented by successfully attached compact hints |

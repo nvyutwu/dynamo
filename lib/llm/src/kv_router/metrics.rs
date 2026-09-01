@@ -1159,7 +1159,7 @@ impl RouterRequestMetrics {
                 let max_overlap_blocks_total = register_identity_free_counter(
                     component,
                     router::MAX_OVERLAP_BLOCKS_TOTAL,
-                    "Best compatible integer source prefix advertised to the router, in blocks",
+                    "Best integer prefix among the selected device and compatible source advertisements, in blocks",
                 );
                 let selected_overlap_blocks_total = register_identity_free_counter(
                     component,
