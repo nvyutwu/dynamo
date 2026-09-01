@@ -1459,6 +1459,8 @@ impl<
         let response = SchedulingResponse {
             best_worker: selection.worker,
             effective_overlap_blocks: selection.effective_overlap_blocks,
+            selected_overlap_blocks: selection.selected_overlap_blocks,
+            max_overlap_blocks: selection.max_overlap_blocks,
             cached_tokens: selection.cached_tokens,
             eligible_oracle_cached_tokens: selection.eligible_oracle_cached_tokens,
             resident_oracle_cached_tokens: selection.resident_oracle_cached_tokens,
@@ -1827,6 +1829,13 @@ mod tests {
                 worker,
                 required_blocks: request.request_blocks(block_size),
                 effective_overlap_blocks: request.effective_overlap_blocks_for(worker),
+                selected_overlap_blocks: (request
+                    .effective_overlap_blocks_for(worker)
+                    .round()
+                    .max(0.0) as u64)
+                    .min(request.request_blocks(block_size)),
+                max_overlap_blocks: SchedulingContext::new(request, workers)
+                    .best_overlap_blocks(block_size),
                 cached_tokens: request.effective_cached_tokens_for(worker),
                 eligible_oracle_cached_tokens: SchedulingContext::new(request, workers)
                     .best_cached_tokens(),

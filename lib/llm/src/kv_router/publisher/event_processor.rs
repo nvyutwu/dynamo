@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use dynamo_kv_router::indexer::LocalKvIndexer;
 use dynamo_kv_router::protocols::*;
 
-use crate::kv_router::metrics::kv_publisher_metrics;
+use crate::kv_router::metrics::{forward_sequence_gap, kv_publisher_metrics};
 
 use super::DEFAULT_MAX_BATCH_BLOCKS;
 use super::batching::BatchingState;
@@ -53,19 +53,18 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                 // another channel item, the timeout, or cancellation cannot split it.
                 for placement_event in event_batch {
                     let raw_event_id = placement_event.event.event_id;
-                    if let Some(last_id) = last_raw_input_id
-                        && raw_event_id > last_id + 1
-                    {
-                        let gap = raw_event_id - last_id - 1;
+                    let gap = forward_sequence_gap(last_raw_input_id, raw_event_id);
+                    if gap > 0 {
                         tracing::warn!(
                             worker_id,
-                            last_raw_input_id = last_id,
+                            last_raw_input_id = ?last_raw_input_id,
                             raw_event_id,
                             gap,
                             "Input event gap detected: raw events dropped before batching"
                         );
                         if let Some(metrics) = kv_publisher_metrics() {
                             metrics.increment_engines_dropped_events(gap);
+                            metrics.increment_inventory_sequence_gap(gap);
                         } else {
                             tracing::warn!(
                                 worker_id,
@@ -74,7 +73,9 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                             );
                         }
                     }
-                    last_raw_input_id = Some(raw_event_id);
+                    if last_raw_input_id.is_none_or(|last_id| raw_event_id > last_id) {
+                        last_raw_input_id = Some(raw_event_id);
+                    }
 
                     let storage_tier = placement_event.placement.tier;
                     let event = placement_event.event;

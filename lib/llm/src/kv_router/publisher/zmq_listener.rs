@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -11,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 use dynamo_kv_router::protocols::*;
 use dynamo_kv_router::zmq_wire::*;
 
-use crate::kv_router::metrics::kv_publisher_metrics;
+use crate::kv_router::metrics::{
+    forward_sequence_gap, inventory_event_lag_seconds, kv_publisher_metrics,
+};
 use crate::utils::zmq::{connect_sub_socket, multipart_message};
 
 #[allow(clippy::too_many_arguments)]
@@ -47,6 +50,7 @@ pub(super) async fn start_zmq_listener(
     }
 
     let mut messages_processed = 0u64;
+    let mut last_engine_seq = None;
 
     let exit_reason = 'main: loop {
         tokio::select! {
@@ -95,6 +99,23 @@ pub(super) async fn start_zmq_listener(
                     tracing::warn!("Failed to decode KVEventBatch msgpack: {e}");
                     continue;
                 };
+
+                if let Some(metrics) = &metrics {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_secs_f64())
+                        .ok();
+                    if let Some(lag) = now.and_then(|now| inventory_event_lag_seconds(batch.ts, now)) {
+                        metrics.observe_inventory_event_lag(lag);
+                    }
+                    let gap = forward_sequence_gap(last_engine_seq, engine_seq);
+                    if gap > 0 {
+                        metrics.increment_inventory_sequence_gap(gap);
+                    }
+                }
+                if last_engine_seq.is_none_or(|previous| engine_seq > previous) {
+                    last_engine_seq = Some(engine_seq);
+                }
 
                 tracing::trace!(
                     "ZMQ listener on {} received batch with {} events (engine_seq={}, dp_rank={})",

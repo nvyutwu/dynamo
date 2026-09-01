@@ -385,6 +385,20 @@ class router:
     ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL = "router_eligible_oracle_cached_tokens_total"
     # Best cached tokens among allowed workers before overload filtering
     RESIDENT_ORACLE_CACHED_TOKENS_TOTAL = "router_resident_oracle_cached_tokens_total"
+    # Best useful prefix overlap among allowed resident workers, in blocks.
+    MAX_OVERLAP_BLOCKS_TOTAL = "kv_router_max_overlap_blocks_total"
+    # Useful prefix overlap on the selected worker, in blocks.
+    SELECTED_OVERLAP_BLOCKS_TOTAL = "kv_router_selected_overlap_blocks_total"
+    # Routing opportunity not resident on the selected worker, in blocks.
+    REMEDIATION_BLOCKS_TOTAL = "kv_router_remediation_blocks_total"
+    # Remediation blocks represented by attached compact router hints.
+    HINT_BLOCKS_TOTAL = "kv_router_hint_blocks_total"
+    # Producer-to-router age of inventory events.
+    INVENTORY_EVENT_LAG_SECONDS = "kv_router_inventory_event_lag_seconds"
+    # Missing inventory sequence identifiers observed by the router.
+    INVENTORY_SEQUENCE_GAP_TOTAL = "kv_router_inventory_sequence_gap_total"
+    # Inventory blocks rejected during reconciliation, partitioned by bounded reason.
+    INVENTORY_MISMATCH_BLOCKS_TOTAL = "kv_router_inventory_mismatch_blocks_total"
     # Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
     SHARED_CACHE_HIT_RATE = "router_shared_cache_hit_rate"
     # Shared cache blocks beyond device overlap for the selected worker

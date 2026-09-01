@@ -17,7 +17,10 @@ use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter,
+        metrics::{RouterRequestMetrics, RoutingOpportunity},
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         FinishReason,
@@ -370,16 +373,29 @@ impl KvPushRouter {
 
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
-        if let Some(router_hint) = selection.router_hint.as_ref()
-            && let Err(error) = backend_input.attach_router_hint(router_hint)
-        {
-            tracing::warn!(
-                request_id = %context_id,
-                worker_id = selection.instance_id,
-                error = %error,
-                "Failed to attach router_hint to backend request"
-            );
-        }
+        let hinted_prefix_blocks = if let Some(router_hint) = selection.router_hint.as_ref() {
+            match backend_input.attach_router_hint(router_hint) {
+                Ok(()) => Some(router_hint.block_hashes.len() as u64),
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %context_id,
+                        worker_id = selection.instance_id,
+                        error = %error,
+                        "Failed to attach router_hint to backend request"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        guard
+            .request_metrics()
+            .observe_routing_opportunity(RoutingOpportunity::new(
+                selection.max_overlap_blocks,
+                selection.selected_overlap_blocks,
+                hinted_prefix_blocks,
+            ));
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
 
@@ -588,6 +604,12 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         .resident_oracle_cached_tokens
                         .min(routing_parts.token_ids.len()) as u64,
                 );
+            self.request_metrics
+                .observe_routing_opportunity(RoutingOpportunity::new(
+                    selection.max_overlap_blocks,
+                    selection.selected_overlap_blocks,
+                    None,
+                ));
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker

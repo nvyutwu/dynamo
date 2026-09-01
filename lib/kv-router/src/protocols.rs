@@ -560,6 +560,12 @@ pub struct WorkerSelectionResult {
     /// Use `.round() as u32` for a block-count approximation.
     pub effective_overlap_blocks: f64,
 
+    /// Selected worker overlap, rounded and capped at the request block count.
+    pub selected_overlap_blocks: u64,
+
+    /// Greatest overlap among allowed resident workers, rounded and capped at the request size.
+    pub max_overlap_blocks: u64,
+
     /// Approximate cached-token count derived from the weighted cache hit.
     pub cached_tokens: usize,
 

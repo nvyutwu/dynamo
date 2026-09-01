@@ -94,6 +94,53 @@ pub(crate) struct KvPublisherMetrics {
     pub zmq_conversion_issues_total: IntCounterVec,
     /// Total number of suspicious-but-forwarded ZMQ KV events.
     pub zmq_suspicious_events_total: IntCounterVec,
+    /// Producer-to-router age for decoded KV inventory batches.
+    pub inventory_event_lag_seconds: prometheus::Histogram,
+    /// Missing sequence identifiers in either direct or ZMQ inventory streams.
+    pub inventory_sequence_gap_total: IntCounter,
+    /// Blocks rejected during inventory reconciliation by a bounded reason.
+    inventory_mismatch_blocks_total: IntCounterVec,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InventoryMismatchReason {
+    SourceMissing,
+    EpochMismatch,
+    WorkerUnreachable,
+    LayoutMismatch,
+}
+
+impl InventoryMismatchReason {
+    const ALL: [Self; 4] = [
+        Self::SourceMissing,
+        Self::EpochMismatch,
+        Self::WorkerUnreachable,
+        Self::LayoutMismatch,
+    ];
+
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::SourceMissing => "source_missing",
+            Self::EpochMismatch => "epoch_mismatch",
+            Self::WorkerUnreachable => "worker_unreachable",
+            Self::LayoutMismatch => "layout_mismatch",
+        }
+    }
+}
+
+pub(crate) fn inventory_event_lag_seconds(producer_timestamp: f64, now: f64) -> Option<f64> {
+    if !producer_timestamp.is_finite() || !now.is_finite() {
+        return None;
+    }
+    let lag = now - producer_timestamp;
+    (lag >= 0.0).then_some(lag)
+}
+
+pub(crate) fn forward_sequence_gap(previous: Option<u64>, current: u64) -> u64 {
+    previous
+        .and_then(|previous| current.checked_sub(previous))
+        .and_then(|distance| distance.checked_sub(1))
+        .unwrap_or(0)
 }
 
 static KV_PUBLISHER_METRICS: OnceLock<Arc<KvPublisherMetrics>> = OnceLock::new();
@@ -146,6 +193,32 @@ impl KvPublisherMetrics {
                         &[],
                     )
                     .expect("failed to create kv_publisher_zmq_suspicious_events_total");
+                let inventory_event_lag_seconds = metrics
+                    .create_histogram(
+                        router::INVENTORY_EVENT_LAG_SECONDS,
+                        "Producer-to-router age of decoded KV inventory batches",
+                        &[],
+                        Some(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]),
+                    )
+                    .expect("failed to create kv_router_inventory_event_lag_seconds");
+                let inventory_sequence_gap_total = metrics
+                    .create_intcounter(
+                        router::INVENTORY_SEQUENCE_GAP_TOTAL,
+                        "Missing sequence identifiers in KV inventory streams",
+                        &[],
+                    )
+                    .expect("failed to create kv_router_inventory_sequence_gap_total");
+                let inventory_mismatch_blocks_total = metrics
+                    .create_intcountervec(
+                        router::INVENTORY_MISMATCH_BLOCKS_TOTAL,
+                        "KV inventory blocks rejected during reconciliation",
+                        &["reason"],
+                        &[],
+                    )
+                    .expect("failed to create kv_router_inventory_mismatch_blocks_total");
+                for reason in InventoryMismatchReason::ALL {
+                    inventory_mismatch_blocks_total.with_label_values(&[reason.as_label()]);
+                }
 
                 Arc::new(Self {
                     engines_dropped_events_total,
@@ -153,6 +226,9 @@ impl KvPublisherMetrics {
                     zmq_filtered_events_total,
                     zmq_conversion_issues_total,
                     zmq_suspicious_events_total,
+                    inventory_event_lag_seconds,
+                    inventory_sequence_gap_total,
+                    inventory_mismatch_blocks_total,
                 })
             })
             .clone()
@@ -186,10 +262,34 @@ impl KvPublisherMetrics {
             .with_label_values(&[event_type, reason])
             .inc();
     }
+
+    pub fn observe_inventory_event_lag(&self, lag_seconds: f64) {
+        self.inventory_event_lag_seconds.observe(lag_seconds);
+    }
+
+    pub fn increment_inventory_sequence_gap(&self, count: u64) {
+        self.inventory_sequence_gap_total.inc_by(count);
+    }
+
+    fn record_inventory_mismatch(&self, reason: InventoryMismatchReason, blocks: u64) {
+        self.inventory_mismatch_blocks_total
+            .with_label_values(&[reason.as_label()])
+            .inc_by(blocks);
+    }
 }
 
 pub(crate) fn kv_publisher_metrics() -> Option<Arc<KvPublisherMetrics>> {
     KV_PUBLISHER_METRICS.get().cloned()
+}
+
+/// Record a bounded inventory reconciliation failure when publisher metrics are initialized.
+/// Returns false when no publisher component has registered the metric yet.
+pub fn record_inventory_mismatch(reason: InventoryMismatchReason, blocks: u64) -> bool {
+    let Some(metrics) = kv_publisher_metrics() else {
+        return false;
+    };
+    metrics.record_inventory_mismatch(reason, blocks);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -829,9 +929,41 @@ pub struct RouterRequestMetrics {
     pub selected_cached_tokens_total: prometheus::IntCounter,
     pub eligible_oracle_cached_tokens_total: prometheus::IntCounter,
     pub resident_oracle_cached_tokens_total: prometheus::IntCounter,
+    pub max_overlap_blocks_total: prometheus::IntCounter,
+    pub selected_overlap_blocks_total: prometheus::IntCounter,
+    pub remediation_blocks_total: prometheus::IntCounter,
+    pub hint_blocks_total: prometheus::IntCounter,
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RoutingOpportunity {
+    pub max_overlap_blocks: u64,
+    pub selected_overlap_blocks: u64,
+    pub remediation_blocks: u64,
+    pub hint_blocks: u64,
+}
+
+impl RoutingOpportunity {
+    pub(crate) fn new(
+        max_overlap_blocks: u64,
+        selected_overlap_blocks: u64,
+        hinted_prefix_blocks: Option<u64>,
+    ) -> Self {
+        let remediation_blocks = max_overlap_blocks.saturating_sub(selected_overlap_blocks);
+        let hint_blocks = hinted_prefix_blocks
+            .map(|prefix| prefix.saturating_sub(selected_overlap_blocks))
+            .unwrap_or(0)
+            .min(remediation_blocks);
+        Self {
+            max_overlap_blocks,
+            selected_overlap_blocks,
+            remediation_blocks,
+            hint_blocks,
+        }
+    }
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -952,6 +1084,34 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_resident_oracle_cached_tokens_total");
+                let max_overlap_blocks_total = metrics
+                    .create_intcounter(
+                        router::MAX_OVERLAP_BLOCKS_TOTAL,
+                        "Best useful prefix overlap among allowed resident workers, in blocks",
+                        extra_labels,
+                    )
+                    .expect("failed to create kv_router_max_overlap_blocks_total");
+                let selected_overlap_blocks_total = metrics
+                    .create_intcounter(
+                        router::SELECTED_OVERLAP_BLOCKS_TOTAL,
+                        "Useful prefix overlap on the selected worker, in blocks",
+                        extra_labels,
+                    )
+                    .expect("failed to create kv_router_selected_overlap_blocks_total");
+                let remediation_blocks_total = metrics
+                    .create_intcounter(
+                        router::REMEDIATION_BLOCKS_TOTAL,
+                        "Routing opportunity not resident on the selected worker, in blocks",
+                        extra_labels,
+                    )
+                    .expect("failed to create kv_router_remediation_blocks_total");
+                let hint_blocks_total = metrics
+                    .create_intcounter(
+                        router::HINT_BLOCKS_TOTAL,
+                        "Remediation blocks represented by attached compact router hints",
+                        extra_labels,
+                    )
+                    .expect("failed to create kv_router_hint_blocks_total");
                 let kv_transfer_estimated_latency_seconds = metrics
                     .create_histogram(
                         &router_metric(frontend_service::KV_TRANSFER_ESTIMATED_LATENCY_SECONDS),
@@ -987,12 +1147,26 @@ impl RouterRequestMetrics {
                     selected_cached_tokens_total,
                     eligible_oracle_cached_tokens_total,
                     resident_oracle_cached_tokens_total,
+                    max_overlap_blocks_total,
+                    selected_overlap_blocks_total,
+                    remediation_blocks_total,
+                    hint_blocks_total,
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
                     shared_cache_beyond_blocks,
                 })
             })
             .clone()
+    }
+
+    pub(crate) fn observe_routing_opportunity(&self, opportunity: RoutingOpportunity) {
+        self.max_overlap_blocks_total
+            .inc_by(opportunity.max_overlap_blocks);
+        self.selected_overlap_blocks_total
+            .inc_by(opportunity.selected_overlap_blocks);
+        self.remediation_blocks_total
+            .inc_by(opportunity.remediation_blocks);
+        self.hint_blocks_total.inc_by(opportunity.hint_blocks);
     }
 }
 
@@ -1381,6 +1555,52 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
         assert!(
             output.contains("router_kv_transfer_estimated_latency_seconds_sum 0.005"),
             "PEF missing observation sum. Got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn routing_opportunity_obeys_r3_conservation() {
+        assert_eq!(
+            RoutingOpportunity::new(100, 40, None),
+            RoutingOpportunity {
+                max_overlap_blocks: 100,
+                selected_overlap_blocks: 40,
+                remediation_blocks: 60,
+                hint_blocks: 0,
+            }
+        );
+        assert_eq!(RoutingOpportunity::new(100, 40, Some(100)).hint_blocks, 60);
+        assert_eq!(RoutingOpportunity::new(100, 40, Some(70)).hint_blocks, 30);
+        assert_eq!(
+            RoutingOpportunity::new(40, 100, Some(100)).remediation_blocks,
+            0
+        );
+    }
+
+    #[test]
+    fn inventory_health_helpers_fail_closed() {
+        assert_eq!(inventory_event_lag_seconds(10.0, 12.5), Some(2.5));
+        assert_eq!(inventory_event_lag_seconds(13.0, 12.5), None);
+        assert_eq!(inventory_event_lag_seconds(f64::NAN, 12.5), None);
+        assert_eq!(inventory_event_lag_seconds(10.0, f64::INFINITY), None);
+
+        assert_eq!(forward_sequence_gap(None, 10), 0);
+        assert_eq!(forward_sequence_gap(Some(10), 11), 0);
+        assert_eq!(forward_sequence_gap(Some(10), 14), 3);
+        assert_eq!(forward_sequence_gap(Some(14), 14), 0);
+        assert_eq!(forward_sequence_gap(Some(14), 10), 0);
+    }
+
+    #[test]
+    fn inventory_mismatch_reasons_are_bounded() {
+        assert_eq!(
+            InventoryMismatchReason::ALL.map(InventoryMismatchReason::as_label),
+            [
+                "source_missing",
+                "epoch_mismatch",
+                "worker_unreachable",
+                "layout_mismatch",
+            ]
         );
     }
 }
