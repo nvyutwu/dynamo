@@ -1463,6 +1463,7 @@ impl<
             eligible_oracle_cached_tokens: selection.eligible_oracle_cached_tokens,
             resident_oracle_cached_tokens: selection.resident_oracle_cached_tokens,
             selected_worker_tiers,
+            router_hint_root_candidates: request.overlap.router_hint_root_candidates.take(),
             request_progress,
             lifecycle_lease: None,
         };
@@ -1702,14 +1703,16 @@ mod tests {
 
     use super::*;
     use crate::protocols::{
-        ActiveLoad, ActiveSequenceEvent, WorkerSelectionResult, WorkerWithDpRank,
+        ActiveLoad, ActiveSequenceEvent, ExternalSequenceBlockHash, WorkerSelectionResult,
+        WorkerWithDpRank,
     };
-    use crate::scheduling::OverlapSignals;
+    use crate::router_hint::RouterHintRootCandidates;
     use crate::scheduling::types::{KvSchedulerError, ScheduleMode};
     use crate::scheduling::{
         AdmissionEvent, AdmissionId, AdmissionRequest, PolicyClassAdmissionPolicy,
         RefreshedOverlap, RequestProgress, RouterPolicyConfig,
     };
+    use crate::scheduling::{OverlapSignals, TierOverlapBlocks};
     use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher};
     use crate::test_utils::{NoopSequencePublisher, SimpleWorkerConfig};
     use crate::{DefaultWorkerSelector, WorkerSelector};
@@ -4312,7 +4315,7 @@ policy_classes:
         let refresher = Arc::new(CountingRefresher {
             calls: AtomicUsize::new(0),
             response: RefreshedOverlap {
-                tier_overlap_blocks: Default::default(),
+                tier_overlap_blocks: TierOverlapBlocks::default(),
                 effective_overlap_blocks: HashMap::from([
                     (WorkerWithDpRank::new(0, 0), 1.0),
                     (WorkerWithDpRank::new(1, 0), 9.0),
@@ -4321,6 +4324,10 @@ policy_classes:
                     (WorkerWithDpRank::new(0, 0), 16),
                     (WorkerWithDpRank::new(1, 0), 144),
                 ]),
+                router_hint_root_candidates: Some(RouterHintRootCandidates {
+                    block_hashes: (0..4).map(ExternalSequenceBlockHash).collect(),
+                    owner_prefix_blocks: vec![(WorkerWithDpRank::new(0, 0), 4)],
+                }),
             },
         });
         let (queue, slots) =
@@ -4378,6 +4385,15 @@ policy_classes:
         assert_eq!(resp3.best_worker, WorkerWithDpRank::new(1, 0));
         assert_eq!(resp3.effective_overlap_blocks, 9.0);
         assert_eq!(resp3.cached_tokens, 144);
+        assert_eq!(resp3.selected_worker_tiers.dp_device_blocks, vec![(0, 0)]);
+        assert_eq!(
+            resp3
+                .router_hint_root_candidates
+                .as_ref()
+                .unwrap()
+                .owner_prefix_blocks,
+            vec![(WorkerWithDpRank::new(0, 0), 4)]
+        );
         assert_eq!(queue.pending_count(), 0);
     }
 
@@ -4390,6 +4406,7 @@ policy_classes:
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks: HashMap::from([(worker, 7.0)]),
             effective_cached_tokens: HashMap::from([(worker, 56)]),
+            router_hint_root_candidates: None,
         }));
         let (queue, slots) = make_queue_with_blocking_refresher(
             1,

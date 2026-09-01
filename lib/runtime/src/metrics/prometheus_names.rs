@@ -656,7 +656,7 @@ pub mod router {
     /// Routing opportunity not resident on the selected worker, in blocks.
     pub const REMEDIATION_BLOCKS_TOTAL: &str = "kv_router_remediation_blocks_total";
 
-    /// Remediation blocks represented by attached compact router hints.
+    /// Remediation blocks in compact hints accepted by the destination backend.
     pub const HINT_BLOCKS_TOTAL: &str = "kv_router_hint_blocks_total";
 
     /// Producer-to-router age of inventory events.

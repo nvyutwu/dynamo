@@ -391,7 +391,7 @@ class router:
     SELECTED_OVERLAP_BLOCKS_TOTAL = "kv_router_selected_overlap_blocks_total"
     # Routing opportunity not resident on the selected worker, in blocks.
     REMEDIATION_BLOCKS_TOTAL = "kv_router_remediation_blocks_total"
-    # Remediation blocks represented by attached compact router hints.
+    # Remediation blocks in compact hints accepted by the destination backend.
     HINT_BLOCKS_TOTAL = "kv_router_hint_blocks_total"
     # Producer-to-router age of inventory events.
     INVENTORY_EVENT_LAG_SECONDS = "kv_router_inventory_event_lag_seconds"

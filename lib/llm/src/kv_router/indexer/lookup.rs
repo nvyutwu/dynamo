@@ -162,7 +162,13 @@ impl TieredMatchProvider for Indexer {
         &self,
         sequence: &[LocalBlockHash],
     ) -> Result<TieredMatchDetails, KvRouterError> {
-        self.find_matches_by_tier_ref(sequence).await
+        self.find_matches_by_tier_ref_with_options(
+            sequence,
+            dynamo_kv_router::indexer::LowerTierQueryOptions {
+                retain_router_hint_chain: true,
+            },
+        )
+        .await
     }
 }
 

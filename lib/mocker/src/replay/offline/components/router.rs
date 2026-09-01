@@ -170,6 +170,7 @@ impl PendingRequest {
                 tier_overlap_blocks: TierOverlapBlocks::default(),
                 effective_overlap_blocks,
                 effective_cached_tokens,
+                router_hint_root_candidates: None,
             },
             worker_loads,
             track_prefill_tokens: self.track_prefill_tokens,

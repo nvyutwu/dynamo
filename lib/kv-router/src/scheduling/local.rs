@@ -436,6 +436,7 @@ where
                 tier_overlap_blocks,
                 effective_overlap_blocks,
                 effective_cached_tokens,
+                router_hint_root_candidates: None,
             },
             routing_constraints,
             router_config_override: router_config_override.cloned(),

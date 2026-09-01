@@ -426,7 +426,7 @@ The established request metrics carry the standard hierarchy labels (`dynamo_nam
 | `kv_router_max_overlap_blocks_total` | Counter | `M`: best integer prefix among the selected device and compatible source advertisements |
 | `kv_router_selected_overlap_blocks_total` | Counter | `L`: integer device prefix on the selected worker |
 | `kv_router_remediation_blocks_total` | Counter | `R = max(0, M-L)`: routing opportunity missing on the selected worker |
-| `kv_router_hint_blocks_total` | Counter | `H`: remediation suffix represented by successfully attached compact hints |
+| `kv_router_hint_blocks_total` | Counter | `H`: remediation suffix in compact hints accepted by the destination backend |
 
 The block counters are identity-free metric families: worker IDs, router IDs, endpoints, and request IDs are not labels. They use raw integer prefix blocks rather than weighted scheduling credit, are recorded from one routing snapshot, and are capped at the request block count. `H` is also capped at `R`, so `0 <= H <= R` remains true when only part of an opportunity is represented by a hint.
 

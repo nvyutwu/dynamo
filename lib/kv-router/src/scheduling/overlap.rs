@@ -8,6 +8,7 @@ use crate::indexer::TieredMatchDetails;
 use crate::protocols::{
     DpRank, SharedCacheHits, StorageTier, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
+use crate::router_hint::RouterHintRootCandidates;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
@@ -25,6 +26,8 @@ pub struct OverlapSignals {
     pub tier_overlap_blocks: TierOverlapBlocks,
     pub effective_overlap_blocks: HashMap<WorkerWithDpRank, f64>,
     pub effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
+    /// Root-aligned host-pinned source chain from the same index snapshot.
+    pub router_hint_root_candidates: Option<RouterHintRootCandidates>,
 }
 
 impl OverlapSignals {
@@ -143,6 +146,11 @@ impl<'a> OverlapAnalysis<'a> {
             tier_overlap_blocks: tier_overlap_blocks_from_tiered_matches(self.tiered),
             effective_overlap_blocks: estimates.effective_overlap_blocks.into_iter().collect(),
             effective_cached_tokens: estimates.cached_tokens.into_iter().collect(),
+            router_hint_root_candidates: self
+                .tiered
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|details| details.router_hint_root_candidates.clone()),
         }
     }
 

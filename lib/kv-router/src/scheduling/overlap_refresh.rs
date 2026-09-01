@@ -178,8 +178,11 @@ impl OverlapScoresRefresh for NoopOverlapScoresRefresh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::{KvRouterError, MatchDetails, TieredMatchDetails};
-    use crate::protocols::{OverlapScores, WorkerWithDpRank};
+    use crate::indexer::{KvRouterError, LowerTierMatchDetails, MatchDetails, TieredMatchDetails};
+    use crate::protocols::{
+        ExternalSequenceBlockHash, OverlapScores, StorageTier, WorkerWithDpRank,
+    };
+    use crate::router_hint::RouterHintRootCandidates;
     use std::{
         collections::HashMap,
         sync::{
@@ -211,12 +214,22 @@ mod tests {
             let worker = WorkerWithDpRank::new(4, 0);
             let mut scores = OverlapScores::new();
             scores.scores.insert(worker, 2);
+            let source = WorkerWithDpRank::new(5, 0);
             Ok(TieredMatchDetails {
                 device: MatchDetails {
                     overlap_scores: scores,
                     ..Default::default()
                 },
-                lower_tier: HashMap::new(),
+                lower_tier: HashMap::from([(
+                    StorageTier::HostPinned,
+                    LowerTierMatchDetails {
+                        router_hint_root_candidates: Some(RouterHintRootCandidates {
+                            block_hashes: vec![ExternalSequenceBlockHash(10)],
+                            owner_prefix_blocks: vec![(source, 1)],
+                        }),
+                        ..Default::default()
+                    },
+                )]),
             })
         }
     }
@@ -229,6 +242,7 @@ mod tests {
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::new(),
                 effective_cached_tokens: HashMap::new(),
+                router_hint_root_candidates: None,
             })
         }
     }
@@ -294,6 +308,13 @@ mod tests {
         let refreshed = refresher.refresh(&[LocalBlockHash(1)]).await.unwrap();
         assert_eq!(refreshed.tier_overlap_blocks.device[&worker], 2);
         assert_eq!(refreshed.effective_cached_tokens[&worker], 32);
+        assert_eq!(
+            refreshed
+                .router_hint_root_candidates
+                .unwrap()
+                .owner_prefix_blocks,
+            vec![(WorkerWithDpRank::new(5, 0), 1)]
+        );
 
         let failing = TieredOverlapRefresher::new(
             FakeProvider { calls, fail: true },

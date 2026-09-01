@@ -828,21 +828,18 @@ where
             }
             Err(error) => return Err(map_scheduler_error(error)),
         };
-        let router_hint_candidates = tiered_matches
-            .lower_tier
-            .get(&dynamo_kv_router::protocols::StorageTier::HostPinned)
-            .and_then(|details| details.router_hint_root_candidates.as_ref());
-        let target_cached_prefix_blocks = tiered_matches
-            .device
-            .overlap_scores
-            .scores
-            .get(&response.best_worker)
-            .copied()
+        let target_cached_prefix_blocks = response
+            .selected_worker_tiers
+            .dp_device_blocks
+            .iter()
+            .find_map(|(dp_rank, blocks)| {
+                (*dp_rank == response.best_worker.dp_rank).then_some(*blocks)
+            })
             .unwrap_or(0);
         let router_hint_decision = self.router_hint_for_selection(
             response.best_worker,
             target_cached_prefix_blocks,
-            router_hint_candidates,
+            response.router_hint_root_candidates.as_ref(),
             opportunity_allowed_worker_ids.as_ref(),
         );
 

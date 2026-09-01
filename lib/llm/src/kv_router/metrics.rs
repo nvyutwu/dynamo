@@ -1174,7 +1174,7 @@ impl RouterRequestMetrics {
                 let hint_blocks_total = register_identity_free_counter(
                     component,
                     router::HINT_BLOCKS_TOTAL,
-                    "Remediation blocks represented by attached compact router hints",
+                    "Remediation blocks in compact router hints accepted by the destination backend",
                 );
                 let kv_transfer_estimated_latency_seconds = metrics
                     .create_histogram(

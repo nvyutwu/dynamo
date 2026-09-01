@@ -401,7 +401,6 @@ impl KvPushRouter {
         } else {
             0
         };
-        guard.request_metrics().observe_hint_blocks(hinted_blocks);
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
 
@@ -437,6 +436,9 @@ impl KvPushRouter {
             }
         };
 
+        // H represents blocks actually presented to KVCR. A locally serialized
+        // hint on a request rejected by the backend cannot enter A/N accounting.
+        guard.request_metrics().observe_hint_blocks(hinted_blocks);
         guard.mark_dispatched().await;
         let stream_context = response_stream.context();
         let wrapped_stream = Box::pin(monitor_response_stream(
@@ -1148,7 +1150,7 @@ mod tests {
             metrics.remediation_blocks_total.get(),
             remediation_before + 110
         );
-        assert_eq!(metrics.hint_blocks_total.get(), hint_before + 50);
+        assert_eq!(metrics.hint_blocks_total.get(), hint_before);
 
         let (_, _, mut completed_guard) = track_request(&router, false, Some((5, 5))).await;
         completed_guard.start_dispatch("aggregated");

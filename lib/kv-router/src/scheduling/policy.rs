@@ -211,6 +211,7 @@ mod tests {
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks,
                 effective_cached_tokens,
+                router_hint_root_candidates: None,
             },
             worker_loads: FxHashMap::default(),
             track_prefill_tokens: true,

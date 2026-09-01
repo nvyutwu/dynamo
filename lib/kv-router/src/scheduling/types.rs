@@ -17,6 +17,7 @@ use crate::protocols::{
     LocalBlockHash, RoutingConstraints, SharedCacheHits, WorkerConfigLike, WorkerId,
     WorkerWithDpRank,
 };
+use crate::router_hint::RouterHintRootCandidates;
 use crate::scheduling::policy_queue::QueueRejection;
 use crate::scheduling::queue_admission::RequestProgressUpdater;
 use crate::sequences::WorkerLoadProjection;
@@ -78,6 +79,8 @@ pub struct SchedulingResponse {
     pub eligible_oracle_cached_tokens: usize,
     pub resident_oracle_cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    /// Host-pinned source candidates captured with the final scheduling overlap snapshot.
+    pub router_hint_root_candidates: Option<RouterHintRootCandidates>,
     pub request_progress: Option<RequestProgressUpdater>,
     pub lifecycle_lease: Option<super::queue::RequestLifecycleLease>,
 }
