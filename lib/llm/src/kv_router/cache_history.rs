@@ -125,6 +125,18 @@ impl CacheHistory {
         }
     }
 
+    /// Admit a request's pre-computed identity chains.
+    ///
+    /// Takes already-hashed input on purpose: the ledger mutex is
+    /// process-global, and hashing a long prompt plus every output branch under
+    /// it would serialize every request completion in the process.
+    pub fn record_completed_request(&mut self, completed: &CompletedHashes) {
+        self.record_completed(completed.prompt.iter().copied());
+        for chain in &completed.outputs {
+            self.record_completed(chain.iter().copied());
+        }
+    }
+
     pub fn stats(&self) -> CacheHistoryStats {
         CacheHistoryStats {
             capacity_blocks: self.capacity_blocks,
@@ -138,6 +150,14 @@ impl CacheHistory {
                 .saturating_mul(ESTIMATED_BYTES_PER_HISTORY_RECORD),
         }
     }
+}
+
+/// One request's canonical identity chains: the prompt, plus one chain per
+/// output branch. Produced outside the ledger lock, consumed inside it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompletedHashes {
+    pub prompt: Vec<u64>,
+    pub outputs: Vec<Vec<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,15 +261,30 @@ impl CacheHistoryRequest {
             .collect()
     }
 
-    /// Admit this request's computed context. Idempotent.
-    pub fn finalize(&mut self, history: &mut CacheHistory) {
+    /// Compute this request's identity chains, ready to be admitted to the
+    /// ledger. Call this **before** taking the ledger lock — it walks the full
+    /// prompt and every output branch.
+    ///
+    /// Idempotent: returns `None` once the request has been finalized, so the
+    /// hashing happens at most once even if the guard is finished twice.
+    pub fn take_completed_hashes(&mut self) -> Option<CompletedHashes> {
         if self.finalized {
-            return;
+            return None;
         }
         self.finalized = true;
-        history.record_completed(self.prompt_hashes());
-        for hashes in self.output_hashes() {
-            history.record_completed(hashes);
+        Some(CompletedHashes {
+            prompt: self.prompt_hashes(),
+            outputs: self.output_hashes(),
+        })
+    }
+
+    /// Single-threaded convenience. Deliberately test-only: it takes
+    /// `&mut CacheHistory`, which in production means the lock is already held,
+    /// and hashing there is exactly what `take_completed_hashes` exists to avoid.
+    #[cfg(test)]
+    fn finalize(&mut self, history: &mut CacheHistory) {
+        if let Some(completed) = self.take_completed_hashes() {
+            history.record_completed_request(&completed);
         }
     }
 
@@ -328,6 +363,22 @@ mod tests {
         let after_first = history.stats().retained_records;
         request.finalize(&mut history);
         assert_eq!(history.stats().retained_records, after_first);
+    }
+
+    #[test]
+    fn take_completed_hashes_yields_once_so_hashing_is_never_repeated() {
+        let mut request = CacheHistoryRequest::new(vec![1, 2, 3, 4], None, None, None, 2, false);
+        request.observe_output(0, &[5, 6, 7]);
+
+        let first = request.take_completed_hashes().expect("first call yields");
+        assert_eq!(first.prompt.len(), 2);
+        assert_eq!(first.outputs.len(), 1);
+        assert!(request.take_completed_hashes().is_none());
+
+        // Recording the taken chains matches what the convenience path produces.
+        let mut history = CacheHistory::new(32, 2);
+        history.record_completed_request(&first);
+        assert_eq!(history.stats().retained_records, 5);
     }
 
     #[test]

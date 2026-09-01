@@ -439,11 +439,16 @@ impl RequestGuard {
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
         self.observability.record_metrics();
+        // Hash first, lock second. `take_completed_hashes` walks the whole prompt
+        // and every output branch; the ledger mutex is process-global, so doing
+        // that under the lock would serialize every request completion in the
+        // process. The lock is held only for the insert and the stats read.
         // Scoped so the ledger borrow ends before `request_metrics()` reborrows self.
-        let history_stats = self.cache_history.as_mut().map(|(history, tracked)| {
+        let history_stats = self.cache_history.as_mut().and_then(|(history, tracked)| {
+            let completed = tracked.take_completed_hashes()?;
             let mut ledger = history.lock();
-            tracked.finalize(&mut ledger);
-            ledger.stats()
+            ledger.record_completed_request(&completed);
+            Some(ledger.stats())
         });
         if let Some(stats) = history_stats {
             self.request_metrics().set_cache_loss_history_stats(
