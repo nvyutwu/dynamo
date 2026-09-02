@@ -45,6 +45,11 @@ pub struct ZmqEventNormalizer {
     /// Lets `convert_event` normalize vLLM BlockStored events to the canonical
     /// pad_value scheme. `None` for text-only models / non-MM deployments.
     image_token_id: Option<u32>,
+    /// Finest token granularity the engine hashes at, i.e. vLLM's
+    /// `hash_block_size` / `--prefix-match-unit`. The host tier publishes at
+    /// exactly this size and device partial blocks are multiples of it, so it
+    /// is what makes those events indexable rather than discarded.
+    hash_block_size: u32,
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
@@ -89,6 +94,10 @@ impl ZmqEventNormalizer {
     pub fn new(kv_block_size: u32) -> Self {
         Self {
             kv_block_size,
+            // Default preserves pre-fix behaviour: only full blocks pass.
+            // Callers that know the engine's hash granularity should override
+            // via with_hash_block_size so host-tier and partial events index.
+            hash_block_size: kv_block_size,
             image_token_id: None,
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
@@ -99,11 +108,58 @@ impl ZmqEventNormalizer {
     pub fn with_warning_count(kv_block_size: u32, warning_count: Arc<AtomicU32>) -> Self {
         Self {
             kv_block_size,
+            hash_block_size: kv_block_size,
             image_token_id: None,
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
         }
+    }
+
+    /// Read the engine's hash granularity from `DYN_KV_HASH_BLOCK_SIZE`.
+    ///
+    /// vLLM does not yet advertise `hash_block_size` alongside its KV-event
+    /// block size, so this env var is the seam until it does. Unset or invalid
+    /// leaves full-blocks-only behaviour, which is what shipped before.
+    ///
+    /// Set it to the engine's `--prefix-match-unit` (equivalently the
+    /// `hash_block_size` resolved by `resolve_kv_cache_block_sizes`). Without
+    /// it every host-tier event and every device partial block is discarded,
+    /// the HostPinned index stays empty, and no router hint is ever produced.
+    pub fn with_hash_block_size_from_env(self) -> Self {
+        match std::env::var("DYN_KV_HASH_BLOCK_SIZE") {
+            Ok(raw) => match raw.trim().parse::<u32>() {
+                Ok(value) if value > 0 => {
+                    tracing::info!(
+                        hash_block_size = value,
+                        kv_block_size = self.kv_block_size,
+                        "KV hash block size set from DYN_KV_HASH_BLOCK_SIZE; \
+                         host-tier and partial blocks will be indexed"
+                    );
+                    self.with_hash_block_size(value)
+                }
+                _ => {
+                    tracing::warn!(
+                        value = %raw,
+                        "DYN_KV_HASH_BLOCK_SIZE is not a positive integer; \
+                         falling back to full-blocks-only indexing"
+                    );
+                    self
+                }
+            },
+            Err(_) => self,
+        }
+    }
+
+    /// Set the engine's finest hash granularity. Without this the normalizer
+    /// only accepts full cache blocks, which silently discards every host-tier
+    /// event and every device partial block. Feed it the value the worker
+    /// advertises alongside its KV-event block size.
+    pub fn with_hash_block_size(mut self, hash_block_size: u32) -> Self {
+        if hash_block_size > 0 {
+            self.hash_block_size = hash_block_size;
+        }
+        self
     }
 
     /// Set the model's image placeholder token id so vLLM BlockStored events
@@ -148,6 +204,7 @@ impl ZmqEventNormalizer {
             raw,
             event_id,
             self.kv_block_size,
+            self.hash_block_size,
             worker,
             &self.warning_count,
             self.image_token_id,

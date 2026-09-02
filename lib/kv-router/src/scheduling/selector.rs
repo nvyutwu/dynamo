@@ -181,20 +181,36 @@ impl DefaultWorkerSelector {
             0
         } as f64;
 
+        // Lower tiers are indexed at the engine's hash granularity while the
+        // device tier is indexed at the full cache block, so their block counts
+        // are not the same unit. For Kimi-K3 a host block is 128 tokens against
+        // a device block of 12288, so an unscaled sum would over-credit the
+        // host tier by 96x and bias every decision toward whichever worker has
+        // anything in CPU. Scale lower tiers into device-block units first.
+        let lower_tier_scale = {
+            let hash_block_size = self.kv_router_config.kv_hash_block_size;
+            if hash_block_size > 0 && block_size > 0 && hash_block_size < block_size {
+                hash_block_size as f64 / block_size as f64
+            } else {
+                1.0
+            }
+        };
         let host_overlap_blocks = request
             .overlap
             .tier_overlap_blocks
             .host_pinned
             .get(&worker)
             .copied()
-            .unwrap_or(0) as f64;
+            .unwrap_or(0) as f64
+            * lower_tier_scale;
         let disk_overlap_blocks = request
             .overlap
             .tier_overlap_blocks
             .disk
             .get(&worker)
             .copied()
-            .unwrap_or(0) as f64;
+            .unwrap_or(0) as f64
+            * lower_tier_scale;
 
         // Credit shared cache hits beyond this worker's device prefix.
         let (shared_overlap_blocks, shared_beyond) =

@@ -9,7 +9,8 @@ use serde::Serialize;
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
+    KvCacheEventData, PlacementEvent, StorageTier, WorkerWithDpRank,
+    compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -737,6 +738,8 @@ fn test_convert_event_bigram_emits_eagle_windows() {
         raw_event,
         7,
         2,
+        // hash_block_size == kv_block_size preserves full-blocks-only behaviour
+        2,
         WorkerWithDpRank::new(3, 0),
         &warning_count,
         None,
@@ -820,6 +823,8 @@ fn cpu_event_with_placeholder_payload_is_dropped_safely() {
         raw,
         42,
         16,
+        // hash_block_size == kv_block_size preserves full-blocks-only behaviour
+        16,
         WorkerWithDpRank::new(7, 0),
         &warning_count,
         None,
@@ -850,6 +855,8 @@ fn cpu_event_with_full_payload_is_indexable() {
         raw,
         43,
         4,
+        // hash_block_size == kv_block_size preserves full-blocks-only behaviour
+        4,
         WorkerWithDpRank::new(7, 0),
         &warning_count,
         None,
@@ -873,4 +880,168 @@ fn cpu_event_with_full_payload_is_indexable() {
         other => panic!("expected Stored event, got {other:?}"),
     }
     assert_eq!(warning_count.load(Ordering::Relaxed), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Per-tier and partial-block acceptance.
+//
+// vLLM emits three legitimate BlockStored shapes, all self-consistent in that
+// token_ids.len() == block_hashes.len() * block_size:
+//   1. device FULL      block_size == kv_block_size          (block_pool.py:361)
+//   2. device PARTIAL   block_size < kv_block_size, hash-aligned
+//                                                            (block_pool.py:531)
+//   3. host tier        block_size == hash_block_size        (offloading/events.py:308)
+//
+// The router previously required block_size == kv_block_size, which discarded
+// shapes 2 and 3 outright. Shape 3 is why the HostPinned index stayed empty,
+// and overlap.rs:174-178 draws router-hint candidates only from HostPinned, so
+// no hint was ever built and KVCR P2P never fired.
+//
+// NOTE: `break` vs `continue` is irrelevant to this check. convert.rs builds
+// num_block_tokens as vec![block_size; block_hashes.len()], i.e. uniform, so
+// the comparison is all-or-nothing within an event.
+// ---------------------------------------------------------------------------
+
+/// Kimi-K3 shape: main attention block 1536 x decode_context_parallel_size 8.
+const K3_DEVICE_BLOCK: u32 = 12288;
+/// vLLM's hash_block_size, i.e. --prefix-match-unit. Measured: the host tier
+/// emits exactly this, for every group, independent of the KDA block size.
+const K3_HASH_BLOCK: u32 = 128;
+
+#[derive(serde::Serialize)]
+struct MapStoredEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    block_hashes: Vec<u64>,
+    parent_block_hash: Option<u64>,
+    token_ids: Vec<u32>,
+    block_size: usize,
+    medium: Option<&'static str>,
+    group_idx: Option<u32>,
+    kv_cache_spec_kind: Option<&'static str>,
+}
+
+/// Build a BlockStored with an explicit span, tier medium and spec kind.
+/// Map-serialized so it does not depend on wire field order.
+fn stored_event(
+    block_size: usize,
+    num_blocks: usize,
+    medium: Option<&'static str>,
+    kv_cache_spec_kind: &'static str,
+) -> RawKvEvent {
+    let event = MapStoredEvent {
+        event_type: "BlockStored",
+        block_hashes: (0..num_blocks as u64).map(|i| 11 + i).collect(),
+        parent_block_hash: None,
+        token_ids: (0..(block_size * num_blocks) as u32).collect(),
+        block_size,
+        medium,
+        group_idx: Some(0),
+        kv_cache_spec_kind: Some(kv_cache_spec_kind),
+    };
+    let encoded = rmp_serde::to_vec_named(&(0.0, vec![event], Some(0_i32)))
+        .expect("serialize raw event batch");
+    let mut batch = decode_event_batch(&encoded).expect("deserialize raw event batch");
+    batch.events.pop().expect("batch should contain event")
+}
+
+fn stored_block_count(event: &PlacementEvent) -> usize {
+    match &event.event.data {
+        KvCacheEventData::Stored(data) => data.blocks.len(),
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+/// Shape 1. Device full blocks match kv_block_size and were always published.
+#[test]
+fn test_device_full_block_is_published() {
+    let raw = stored_event(K3_DEVICE_BLOCK as usize, 1, None, "mla_attention");
+    let mut normalizer = ZmqEventNormalizer::new(K3_DEVICE_BLOCK);
+
+    let event = normalizer
+        .normalize(raw, 1, WorkerWithDpRank::new(1, 0))
+        .expect("device full block should convert");
+    assert_eq!(stored_block_count(&event), 1);
+}
+
+/// Shape 3, pre-fix. Without a hash block size the normalizer only accepts
+/// full blocks, so a host-tier event passes the kind filter and then loses
+/// every block. This is what the live counter
+/// zmq_suspicious_events_total{reason="empty_store_blocks"} records.
+#[test]
+fn test_host_tier_block_is_emptied_without_hash_block_size() {
+    let raw = stored_event(K3_HASH_BLOCK as usize, 2, Some("CPU"), "mla_attention");
+    let mut normalizer = ZmqEventNormalizer::new(K3_DEVICE_BLOCK);
+
+    let event = normalizer
+        .normalize(raw, 2, WorkerWithDpRank::new(1, 0))
+        .expect("host-tier event passes the kind filter");
+    assert_eq!(stored_block_count(&event), 0);
+}
+
+/// Shape 3, fixed. Told the engine's hash granularity, the normalizer indexes
+/// host-tier blocks. This is the change that lets the HostPinned index fill,
+/// which is the precondition for any router hint and therefore for KVCR P2P.
+#[test]
+fn test_host_tier_block_is_published_with_hash_block_size() {
+    let raw = stored_event(K3_HASH_BLOCK as usize, 2, Some("CPU"), "mla_attention");
+    let mut normalizer =
+        ZmqEventNormalizer::new(K3_DEVICE_BLOCK).with_hash_block_size(K3_HASH_BLOCK);
+
+    let event = normalizer
+        .normalize(raw, 3, WorkerWithDpRank::new(1, 0))
+        .expect("host-tier event should convert");
+    assert_eq!(
+        stored_block_count(&event),
+        2,
+        "host-tier blocks must be indexed once the hash granularity is known"
+    );
+    assert_eq!(event.placement.tier, StorageTier::HostPinned);
+}
+
+/// Shape 2, fixed. Device partial blocks carry a ragged span
+/// (block_pool.py:531 `block_size=block_end - block_start`) that is always a
+/// positive multiple of hash_block_size. 6784 = 53 x 128, one of the spans
+/// observed being rejected on the live shadow.
+#[test]
+fn test_device_partial_block_is_published_with_hash_block_size() {
+    let raw = stored_event(6784, 1, None, "mla_attention");
+    let mut normalizer =
+        ZmqEventNormalizer::new(K3_DEVICE_BLOCK).with_hash_block_size(K3_HASH_BLOCK);
+
+    let event = normalizer
+        .normalize(raw, 4, WorkerWithDpRank::new(1, 0))
+        .expect("device partial block should convert");
+    assert_eq!(stored_block_count(&event), 1);
+}
+
+/// A span that is not hash-aligned is still rejected. Guards against the fix
+/// degenerating into "accept anything".
+#[test]
+fn test_unaligned_span_is_still_rejected() {
+    let raw = stored_event(100, 1, None, "mla_attention");
+    let mut normalizer =
+        ZmqEventNormalizer::new(K3_DEVICE_BLOCK).with_hash_block_size(K3_HASH_BLOCK);
+
+    let event = normalizer
+        .normalize(raw, 5, WorkerWithDpRank::new(1, 0))
+        .expect("event converts");
+    assert_eq!(stored_block_count(&event), 0, "100 is not a multiple of 128");
+}
+
+/// The existing group filter must keep working. KDA events are dropped by kind
+/// before the size check, ~39,954 of them on the live shadow. The per-tier
+/// change must not let them through.
+#[test]
+fn test_mamba_event_is_filtered_by_kind_before_size_check() {
+    let raw = stored_event(K3_HASH_BLOCK as usize, 1, Some("CPU"), "mamba");
+    let mut normalizer =
+        ZmqEventNormalizer::new(K3_DEVICE_BLOCK).with_hash_block_size(K3_HASH_BLOCK);
+
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(raw, WorkerWithDpRank::new(1, 0))
+            .unwrap_err(),
+        ZmqEventFilterReason::NonMainAttentionKind
+    );
 }

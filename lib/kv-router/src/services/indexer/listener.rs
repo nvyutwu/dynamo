@@ -176,7 +176,7 @@ impl ListenerLoop {
             live_socket,
             replay_socket,
             watermark,
-            normalizer: ZmqEventNormalizer::new(block_size),
+            normalizer: ZmqEventNormalizer::new(block_size).with_hash_block_size_from_env(),
             messages_processed: 0,
         }
     }

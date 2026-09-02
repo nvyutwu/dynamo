@@ -18,6 +18,9 @@ pub fn convert_event(
     raw: RawKvEvent,
     event_id: u64,
     kv_block_size: u32,
+    // Finest granularity the engine hashes at. The host tier publishes at
+    // exactly this size and device partial blocks are multiples of it.
+    hash_block_size: u32,
     worker: WorkerWithDpRank,
     warning_count: &Arc<AtomicU32>,
     image_token_id: Option<u32>,
@@ -87,6 +90,8 @@ pub fn convert_event(
                     start_position: None,
                     blocks: create_stored_blocks(
                         kv_block_size,
+                        hash_block_size,
+                        storage_tier,
                         &token_ids,
                         &num_block_tokens,
                         &block_hashes_u64,
@@ -254,6 +259,8 @@ pub fn create_stored_block_from_parts(
 #[allow(clippy::too_many_arguments)]
 pub fn create_stored_blocks(
     kv_block_size: u32,
+    hash_block_size: u32,
+    storage_tier: StorageTier,
     token_ids: &[u32],
     num_block_tokens: &[u64],
     block_hashes: &[u64],
@@ -272,12 +279,39 @@ pub fn create_stored_blocks(
     for (block_idx, (num_tokens_it, block_hash_it)) in
         num_block_tokens.iter().zip(block_hashes.iter()).enumerate()
     {
-        if *num_tokens_it != kv_block_size as u64 {
-            if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+        // A block is publishable when its span is a positive, hash-aligned
+        // number of tokens that fits inside one full cache block. This admits
+        // three shapes that vLLM legitimately emits:
+        //   - device full blocks, span == kv_block_size
+        //   - device PARTIAL blocks, span < kv_block_size, from
+        //     block_pool.py cache_partial_block, which guarantees the span is
+        //     a positive multiple of hash_block_size
+        //   - host-tier blocks, span == hash_block_size, since the offloading
+        //     connector publishes at hash granularity
+        // Requiring span == kv_block_size rejected the latter two outright and
+        // left the HostPinned index empty, which is why no router hint was
+        // ever built and KVCR P2P never fired.
+        let span = *num_tokens_it;
+        let is_aligned = hash_block_size > 0 && span % hash_block_size as u64 == 0;
+        let publishable = span > 0 && span <= kv_block_size as u64 && is_aligned;
+        if !publishable {
+            let is_partial = span > 0 && span < kv_block_size as u64;
+            // Key the sample cap per (tier, partial, aligned) so one failure
+            // shape cannot mask the others. A single shared cap previously hid
+            // the host-tier rejections behind the first three device ones.
+            let bucket = (storage_tier as u32) * 4
+                + (is_partial as u32) * 2
+                + (is_aligned as u32);
+            if warning_count.fetch_add(1, Ordering::Relaxed) < 3 * (bucket + 1) {
                 tracing::warn!(
-                    "Block not published. Block size must be {} tokens to be published. Block size is: {}",
+                    tier = ?storage_tier,
+                    is_partial,
+                    is_aligned,
                     kv_block_size,
-                    *num_tokens_it
+                    hash_block_size,
+                    span,
+                    "Block not published: span is not a positive hash-aligned \
+                     span within one cache block"
                 );
             }
             break;
@@ -301,7 +335,7 @@ pub fn create_stored_blocks(
             .and_then(|opt| opt.clone());
 
         blocks.push(create_stored_block_from_parts(
-            kv_block_size,
+            span as u32,
             *block_hash_it,
             tokens,
             StoredBlockOptions {

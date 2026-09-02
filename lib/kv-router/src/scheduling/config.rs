@@ -145,6 +145,13 @@ fn kv_router_config_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> KvR
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_PREFILL_LOAD_SCALE") {
         config.prefill_load_scale = value;
     }
+    // Same variable that lets the wire layer accept host-tier and partial
+    // blocks. Kept in one place so indexing and credit can never disagree.
+    if let Some(value) = parse_f64(&get_env, "DYN_KV_HASH_BLOCK_SIZE")
+        && value > 0.0
+    {
+        config.kv_hash_block_size = value as u32;
+    }
     for key in [
         "DYN_ROUTER_KV_OVERLAP_SCORE_WEIGHT",
         "DYN_OVERLAP_SCORE_WEIGHT",
@@ -560,6 +567,14 @@ pub struct KvRouterConfig {
 
     #[serde(default = "default_host_cache_hit_weight")]
     pub host_cache_hit_weight: f64,
+    /// Engine hash granularity, i.e. `--prefix-match-unit`. Lower tiers are
+    /// indexed at this size while the device tier is indexed at the full cache
+    /// block, so their block counts are NOT commensurable. When set, lower-tier
+    /// overlap is scaled by `kv_hash_block_size / block_size` before being
+    /// combined with device overlap. 0 means "same as device", i.e. no scaling,
+    /// which is correct only when lower tiers are not indexed.
+    #[serde(default)]
+    pub kv_hash_block_size: u32,
 
     #[serde(default = "default_disk_cache_hit_weight")]
     pub disk_cache_hit_weight: f64,
@@ -698,6 +713,9 @@ impl Default for KvRouterConfig {
             overlap_score_credit: 1.0,
             overlap_score_credit_decay: default_overlap_score_credit_decay(),
             prefill_load_scale: default_prefill_load_scale(),
+            // 0 = lower tiers not indexed, so no scaling. Set via
+            // DYN_KV_HASH_BLOCK_SIZE when the host tier is indexed.
+            kv_hash_block_size: 0,
             host_cache_hit_weight: default_host_cache_hit_weight(),
             disk_cache_hit_weight: default_disk_cache_hit_weight(),
             router_temperature: 0.0,
@@ -751,6 +769,8 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             overlap_score_credit,
             overlap_score_credit_decay: compat.overlap_score_credit_decay,
             prefill_load_scale,
+            // Not part of the legacy compat schema; env-driven only.
+            kv_hash_block_size: 0,
             host_cache_hit_weight: compat.host_cache_hit_weight,
             disk_cache_hit_weight: compat.disk_cache_hit_weight,
             router_temperature: compat.router_temperature,
