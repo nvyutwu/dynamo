@@ -141,10 +141,21 @@ impl CacheHistory {
     /// afford. Output chains go in before the prompt so the prompt's head, the
     /// most reusable span, is the most protected record in the ledger.
     pub fn record_completed_request(&mut self, completed: &CompletedHashes) {
+        // An output chain is hashed over prompt-then-generated tokens, so its
+        // leading block hashes ARE the prompt chain -- recording both stores
+        // every prompt block twice and buys nothing. Measured on the v46
+        // compact: 12,880 records for 1,616 unique hashes, i.e. the ledger's
+        // effective reach was halved, which is the difference between answering
+        // F1 and reporting zero at a given capacity. Record the output chains,
+        // which subsume the prompt, and fall back to the prompt only when the
+        // request produced no complete generated block.
+        if completed.outputs.is_empty() {
+            self.record_completed(completed.prompt.iter().rev().copied());
+            return;
+        }
         for chain in &completed.outputs {
             self.record_completed(chain.iter().rev().copied());
         }
-        self.record_completed(completed.prompt.iter().rev().copied());
     }
 
     pub fn stats(&self) -> CacheHistoryStats {
@@ -358,11 +369,16 @@ mod tests {
         let mut request = CacheHistoryRequest::new(vec![1, 2, 3, 4], None, None, None, 2, false);
         request.observe_output(0, &[5, 6, 7]);
         let mut history = CacheHistory::new(32, 2);
+        let prompt_chain = request.prompt_hashes();
         request.finalize(&mut history);
 
-        // Prompt has two complete blocks; prompt plus the first two generated
-        // tokens has three. The final sampled token is deliberately absent.
-        assert_eq!(history.stats().retained_records, 5);
+        // Prompt is two complete blocks; prompt plus the first two generated
+        // tokens is three. The final sampled token is deliberately absent.
+        // Only the output chain is stored -- it already contains the prompt
+        // chain -- so three records, not five.
+        assert_eq!(history.stats().retained_records, 3);
+        // ...and the prompt is still fully answerable from it.
+        assert_eq!(history.previously_computed_tokens(&prompt_chain), 2 * 2);
     }
 
     #[test]
