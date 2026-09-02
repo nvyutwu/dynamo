@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 use dynamo_kv_router::protocols::{BlockExtraInfo, TokensWithHashes};
 
@@ -59,7 +59,7 @@ pub struct CacheHistory {
 
 impl CacheHistory {
     /// Build from the environment, or `None` when cache-loss telemetry is off.
-    pub fn from_env(block_tokens: u32) -> Option<Arc<Mutex<Self>>> {
+    pub fn from_env(block_tokens: u32) -> Option<Arc<RwLock<Self>>> {
         if !cache_loss_enabled() || block_tokens == 0 {
             return None;
         }
@@ -69,7 +69,7 @@ impl CacheHistory {
         let capacity_bytes = requested_bytes.max(ESTIMATED_BYTES_PER_HISTORY_RECORD);
         let byte_limited_blocks = capacity_bytes / ESTIMATED_BYTES_PER_HISTORY_RECORD;
         let capacity_blocks = requested_blocks.min(byte_limited_blocks.max(1));
-        Some(Arc::new(Mutex::new(Self::new_with_budget(
+        Some(Arc::new(RwLock::new(Self::new_with_budget(
             capacity_blocks,
             block_tokens,
             capacity_bytes,
@@ -223,6 +223,10 @@ pub struct CacheHistoryRequest {
     block_size: u32,
     is_eagle: bool,
     output_branches: HashMap<u32, Vec<u32>>,
+    /// Memoized prompt chain. Rolling-hashing a 6k-token prompt is not free and
+    /// the same chain is needed twice per request -- once to answer F1 at
+    /// routing, once to record at completion.
+    prompt_chain: Option<Vec<u64>>,
     finalized: bool,
 }
 
@@ -243,13 +247,15 @@ impl CacheHistoryRequest {
             block_size,
             is_eagle,
             output_branches: HashMap::new(),
+            prompt_chain: None,
             finalized: false,
         }
     }
 
     /// F1 for this request, against the ledger as it stands before the request runs.
-    pub fn previously_computed_tokens(&self, history: &CacheHistory) -> u64 {
-        history.previously_computed_tokens(&self.sequence_hashes(&self.prompt_tokens))
+    pub fn previously_computed_tokens(&mut self, history: &CacheHistory) -> u64 {
+        let chain = self.prompt_hashes().to_vec();
+        history.previously_computed_tokens(&chain)
     }
 
     pub fn observe_output(&mut self, output_index: u32, token_ids: &[u32]) {
@@ -261,8 +267,11 @@ impl CacheHistoryRequest {
         }
     }
 
-    pub fn prompt_hashes(&self) -> Vec<u64> {
-        self.sequence_hashes(&self.prompt_tokens)
+    pub fn prompt_hashes(&mut self) -> &[u64] {
+        if self.prompt_chain.is_none() {
+            self.prompt_chain = Some(self.sequence_hashes(&self.prompt_tokens));
+        }
+        self.prompt_chain.as_deref().expect("just populated")
     }
 
     /// One hash chain per output branch, over prompt + generated-minus-newest.
@@ -293,9 +302,10 @@ impl CacheHistoryRequest {
             return None;
         }
         self.finalized = true;
+        let outputs = self.output_hashes();
         Some(CompletedHashes {
-            prompt: self.prompt_hashes(),
-            outputs: self.output_hashes(),
+            prompt: self.prompt_hashes().to_vec(),
+            outputs,
         })
     }
 
@@ -369,7 +379,7 @@ mod tests {
         let mut request = CacheHistoryRequest::new(vec![1, 2, 3, 4], None, None, None, 2, false);
         request.observe_output(0, &[5, 6, 7]);
         let mut history = CacheHistory::new(32, 2);
-        let prompt_chain = request.prompt_hashes();
+        let prompt_chain = request.prompt_hashes().to_vec();
         request.finalize(&mut history);
 
         // Prompt is two complete blocks; prompt plus the first two generated
@@ -445,7 +455,7 @@ mod tests {
         assert_eq!(first.previously_computed_tokens(&history), 0);
         first.finalize(&mut history);
 
-        let second = CacheHistoryRequest::new(vec![1, 2, 3, 4, 5, 6], None, None, None, 2, false);
+        let mut second = CacheHistoryRequest::new(vec![1, 2, 3, 4, 5, 6], None, None, None, 2, false);
         assert_eq!(second.previously_computed_tokens(&history), 4);
     }
 

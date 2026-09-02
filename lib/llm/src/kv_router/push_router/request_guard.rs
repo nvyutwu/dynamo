@@ -288,7 +288,7 @@ pub(super) struct RequestGuard {
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
     /// Funnel stage F1. Present only when cache-loss telemetry is enabled.
-    cache_history: Option<(Arc<parking_lot::Mutex<CacheHistory>>, CacheHistoryRequest)>,
+    cache_history: Option<(Arc<parking_lot::RwLock<CacheHistory>>, CacheHistoryRequest)>,
 }
 
 impl RequestGuard {
@@ -335,7 +335,7 @@ impl RequestGuard {
     /// never have produced the KV it would otherwise claim.
     pub(super) fn attach_cache_history(
         &mut self,
-        history: Arc<parking_lot::Mutex<CacheHistory>>,
+        history: Arc<parking_lot::RwLock<CacheHistory>>,
         tracked: CacheHistoryRequest,
     ) {
         self.cache_history = Some((history, tracked));
@@ -446,7 +446,7 @@ impl RequestGuard {
         // Scoped so the ledger borrow ends before `request_metrics()` reborrows self.
         let history_stats = self.cache_history.as_mut().and_then(|(history, tracked)| {
             let completed = tracked.take_completed_hashes()?;
-            let mut ledger = history.lock();
+            let mut ledger = history.write();
             ledger.record_completed_request(&completed);
             Some(ledger.stats())
         });

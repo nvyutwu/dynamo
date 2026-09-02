@@ -114,7 +114,7 @@ pub struct KvPushRouter {
     affinity: Option<AffinityCoordinator>,
     /// Backs funnel stage F1. `None` unless cache-loss telemetry is enabled, in
     /// which case nothing is allocated and F1 stays at zero.
-    cache_history: Option<Arc<parking_lot::Mutex<CacheHistory>>>,
+    cache_history: Option<Arc<parking_lot::RwLock<CacheHistory>>>,
 }
 
 impl KvPushRouter {
@@ -142,7 +142,7 @@ impl KvPushRouter {
             RouterRequestMetrics::from_component(chooser.client().endpoint.component());
         let cache_history = CacheHistory::from_env(chooser.block_size());
         if let Some(history) = cache_history.as_ref() {
-            let stats = history.lock().stats();
+            let stats = history.read().stats();
             request_metrics.set_cache_loss_history_stats(
                 stats.retained_records,
                 stats.retained_unique_hashes,
@@ -289,7 +289,7 @@ impl KvPushRouter {
             );
             if let Some(history) = self.cache_history.as_ref() {
                 let routing = request.routing.as_ref();
-                let tracked = CacheHistoryRequest::new(
+                let mut tracked = CacheHistoryRequest::new(
                     routing_parts.token_ids.to_vec(),
                     routing_parts.block_mm_infos.map(|infos| infos.to_vec()),
                     routing.and_then(|routing| routing.lora_name.clone()),
@@ -299,7 +299,10 @@ impl KvPushRouter {
                 );
                 // Query before the guard admits this request's own hashes at
                 // finish, otherwise every request would score as a full F1 hit.
-                let previously_computed = tracked.previously_computed_tokens(&history.lock());
+                // Read lock: the F1 query is a read-only prefix walk, so under
+                // concurrency it must not exclude other requests. Only the
+                // insert at completion needs exclusivity.
+                let previously_computed = tracked.previously_computed_tokens(&history.read());
                 guard
                     .request_metrics()
                     .observe_cache_loss_history_hit(previously_computed);
