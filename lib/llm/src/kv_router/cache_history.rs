@@ -430,10 +430,12 @@ mod tests {
         assert_eq!(first.outputs.len(), 1);
         assert!(request.take_completed_hashes().is_none());
 
-        // Recording the taken chains matches what the convenience path produces.
+        // Recording the taken chains matches what the convenience path produces:
+        // three records, because the output chain already contains the prompt.
         let mut history = CacheHistory::new(32, 2);
         history.record_completed_request(&first);
-        assert_eq!(history.stats().retained_records, 5);
+        assert_eq!(history.stats().retained_records, 3);
+        assert_eq!(history.previously_computed_tokens(&first.prompt), 2 * 2);
     }
 
     #[test]
