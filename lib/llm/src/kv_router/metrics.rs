@@ -971,6 +971,7 @@ pub struct RouterRequestMetrics {
     pub selected_prefix_tokens_total: prometheus::IntCounter,
     /// F1: prompt tokens a prior completed request had already computed.
     pub cache_loss_history_hit_tokens_total: prometheus::IntCounter,
+    pub cache_loss_events_dropped_total: prometheus::IntCounter,
     pub cache_loss_history_block_records: IntGauge,
     pub cache_loss_history_unique_hashes: IntGauge,
     pub cache_loss_history_represented_tokens: IntGauge,
@@ -1152,6 +1153,11 @@ impl RouterRequestMetrics {
                     router::CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL,
                     "Prompt tokens whose KV identity a prior completed request computed",
                 );
+                let cache_loss_events_dropped_total = register_identity_free_counter(
+                    component,
+                    router::CACHE_LOSS_EVENTS_DROPPED_TOTAL,
+                    "Cache-loss samples dropped because the bounded publish queue was full",
+                );
                 let cache_loss_history_block_records = register_identity_free_gauge(
                     component,
                     router::CACHE_LOSS_HISTORY_BLOCK_RECORDS,
@@ -1224,6 +1230,7 @@ impl RouterRequestMetrics {
                     eligible_prefix_tokens_total,
                     selected_prefix_tokens_total,
                     cache_loss_history_hit_tokens_total,
+                    cache_loss_events_dropped_total,
                     cache_loss_history_block_records,
                     cache_loss_history_unique_hashes,
                     cache_loss_history_represented_tokens,
@@ -1263,6 +1270,12 @@ impl RouterRequestMetrics {
     /// F1.
     pub(crate) fn observe_cache_loss_history_hit(&self, tokens: u64) {
         self.cache_loss_history_hit_tokens_total.inc_by(tokens);
+    }
+
+    /// A dropped sample makes F1 an undercount. It never makes serving worse:
+    /// shedding is what keeps the telemetry off the critical path.
+    pub(crate) fn observe_cache_loss_event_dropped(&self) {
+        self.cache_loss_events_dropped_total.inc();
     }
 
     pub(crate) fn set_cache_loss_history_stats(
@@ -1723,6 +1736,7 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
             router::ELIGIBLE_PREFIX_TOKENS_TOTAL,
             router::SELECTED_PREFIX_TOKENS_TOTAL,
             router::CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL,
+            router::CACHE_LOSS_EVENTS_DROPPED_TOTAL,
             router::INVENTORY_EVENT_TIMESTAMP_INVALID_TOTAL,
             router::INVENTORY_SEQUENCE_GAP_TOTAL,
         ] {
@@ -1771,6 +1785,7 @@ dynamo_frontend_router_queue_pending_requests{model=\"model\",policy_class=\"def
             router::ELIGIBLE_PREFIX_TOKENS_TOTAL,
             router::SELECTED_PREFIX_TOKENS_TOTAL,
             router::CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL,
+            router::CACHE_LOSS_EVENTS_DROPPED_TOTAL,
             router::CACHE_LOSS_HISTORY_BLOCK_RECORDS,
             router::CACHE_LOSS_HISTORY_CAPACITY_BLOCKS,
             router::INVENTORY_EVENT_LAG_SECONDS,

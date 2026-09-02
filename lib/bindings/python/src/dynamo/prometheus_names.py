@@ -399,6 +399,8 @@ class router:
     SELECTED_PREFIX_TOKENS_TOTAL = "kv_router_selected_prefix_tokens_total"
     # F1: prompt tokens whose KV identity a prior completed request computed.
     CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL = "kv_router_cache_loss_history_hit_tokens_total"
+    # Cache-loss samples dropped by the bounded publish queue (F1 undercount).
+    CACHE_LOSS_EVENTS_DROPPED_TOTAL = "kv_router_cache_loss_events_dropped_total"
     # Cache-loss ledger occupancy and budget.
     CACHE_LOSS_HISTORY_BLOCK_RECORDS = "kv_router_cache_loss_history_block_records"
     CACHE_LOSS_HISTORY_UNIQUE_HASHES = "kv_router_cache_loss_history_unique_hashes"

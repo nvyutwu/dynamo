@@ -12,7 +12,7 @@ use dynamo_runtime::{
 use crate::{
     kv_router::{
         KvRouter,
-        cache_history::{CacheHistory, CacheHistoryRequest},
+        cache_history::{CacheHistoryPublisher, CacheHistoryRequest},
         metrics::RouterRequestMetrics,
     },
     preprocessor::PreprocessedRequest,
@@ -288,7 +288,7 @@ pub(super) struct RequestGuard {
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
     /// Funnel stage F1. Present only when cache-loss telemetry is enabled.
-    cache_history: Option<(Arc<parking_lot::RwLock<CacheHistory>>, CacheHistoryRequest)>,
+    cache_history: Option<(CacheHistoryPublisher, CacheHistoryRequest)>,
 }
 
 impl RequestGuard {
@@ -335,10 +335,10 @@ impl RequestGuard {
     /// never have produced the KV it would otherwise claim.
     pub(super) fn attach_cache_history(
         &mut self,
-        history: Arc<parking_lot::RwLock<CacheHistory>>,
+        publisher: CacheHistoryPublisher,
         tracked: CacheHistoryRequest,
     ) {
-        self.cache_history = Some((history, tracked));
+        self.cache_history = Some((publisher, tracked));
     }
 
     pub(super) fn request_metrics(&self) -> &RouterRequestMetrics {
@@ -439,26 +439,13 @@ impl RequestGuard {
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
         self.observability.record_metrics();
-        // Hash first, lock second. `take_completed_hashes` walks the whole prompt
-        // and every output branch; the ledger mutex is process-global, so doing
-        // that under the lock would serialize every request completion in the
-        // process. The lock is held only for the insert and the stats read.
-        // Scoped so the ledger borrow ends before `request_metrics()` reborrows self.
-        let history_stats = self.cache_history.as_mut().and_then(|(history, tracked)| {
-            let completed = tracked.take_completed_hashes()?;
-            let mut ledger = history.write();
-            ledger.record_completed_request(&completed);
-            Some(ledger.stats())
-        });
-        if let Some(stats) = history_stats {
-            self.request_metrics().set_cache_loss_history_stats(
-                stats.retained_records,
-                stats.retained_unique_hashes,
-                stats.represented_tokens,
-                stats.estimated_retained_bytes,
-                stats.capacity_bytes,
-                stats.capacity_blocks,
-            );
+        // Hand the request to the ledger owner and move on. This is a bounded
+        // try_send of a value the guard already owns: no hash, no lock, no
+        // await. A full queue drops the sample rather than slowing the request.
+        if let Some((publisher, tracked)) = self.cache_history.take()
+            && !publisher.try_publish(tracked)
+        {
+            self.request_metrics().observe_cache_loss_event_dropped();
         }
         self.mark_completed_terminal();
         self.cleanup.finish().await;

@@ -669,6 +669,11 @@ pub mod router {
     pub const CACHE_LOSS_HISTORY_HIT_TOKENS_TOTAL: &str =
         "kv_router_cache_loss_history_hit_tokens_total";
 
+    /// Cache-loss samples dropped because the bounded publish queue was full.
+    /// Telemetry is shed here rather than applying backpressure to inference,
+    /// so a nonzero value means F1 is an undercount, not that serving suffered.
+    pub const CACHE_LOSS_EVENTS_DROPPED_TOTAL: &str = "kv_router_cache_loss_events_dropped_total";
+
     /// Complete sequence-hash records currently retained by the cache-loss ledger.
     pub const CACHE_LOSS_HISTORY_BLOCK_RECORDS: &str = "kv_router_cache_loss_history_block_records";
 
