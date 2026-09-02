@@ -41,6 +41,7 @@ use tracing;
 
 use llm_rs::kv_router::KvPushRouter as RsKvPushRouter;
 use llm_rs::kv_router::publisher::{KvEventSourceConfig, create_stored_blocks};
+use llm_rs::kv_router::protocols::StorageTier;
 use llm_rs::protocols::common::timing::RequestTracker;
 use llm_rs::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 
@@ -1081,6 +1082,11 @@ impl KvEventPublisher {
                     start_position: None,
                     blocks: create_stored_blocks(
                         kv_block_size,
+                        // This direct-publish path (TRT-LLM, sample engine) only ever
+                        // emits whole device blocks, so hashing at kv_block_size keeps
+                        // the pre-existing accept-only-full-blocks behaviour exactly.
+                        kv_block_size,
+                        StorageTier::Device,
                         &token_ids,
                         &num_block_tokens,
                         &block_hashes_u64,
