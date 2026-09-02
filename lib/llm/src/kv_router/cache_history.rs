@@ -272,6 +272,9 @@ pub struct CacheHistoryRequest {
     cache_namespace: Option<String>,
     block_size: u32,
     is_eagle: bool,
+    /// Branch 0 kept out of the map: it is the only branch for virtually every
+    /// request, and this is touched once per streamed chunk.
+    primary_output: Vec<u32>,
     output_branches: HashMap<u32, Vec<u32>>,
     /// Memoized prompt chain. Rolling-hashing a 6k-token prompt is not free and
     /// the same chain is needed twice per request -- once to answer F1 at
@@ -296,19 +299,32 @@ impl CacheHistoryRequest {
             cache_namespace,
             block_size,
             is_eagle,
+            primary_output: Vec::new(),
             output_branches: HashMap::new(),
             prompt_chain: None,
             finalized: false,
         }
     }
 
+    /// Accumulate generated tokens. This runs on the response path, once per
+    /// streamed chunk, so it takes a fast path for the overwhelmingly common
+    /// single-branch case rather than hashing an index into a map every time.
     pub fn observe_output(&mut self, output_index: u32, token_ids: &[u32]) {
-        if !token_ids.is_empty() {
-            self.output_branches
-                .entry(output_index)
-                .or_default()
-                .extend_from_slice(token_ids);
+        if token_ids.is_empty() {
+            return;
         }
+        if output_index == 0 {
+            if self.primary_output.is_empty() {
+                // One reservation instead of a realloc every few chunks.
+                self.primary_output.reserve(token_ids.len() * 64);
+            }
+            self.primary_output.extend_from_slice(token_ids);
+            return;
+        }
+        self.output_branches
+            .entry(output_index)
+            .or_default()
+            .extend_from_slice(token_ids);
     }
 
     pub fn prompt_hashes(&mut self) -> &[u64] {
@@ -320,8 +336,9 @@ impl CacheHistoryRequest {
 
     /// One hash chain per output branch, over prompt + generated-minus-newest.
     pub fn output_hashes(&self) -> Vec<Vec<u64>> {
-        self.output_branches
-            .values()
+        std::iter::once(&self.primary_output)
+            .filter(|o| !o.is_empty())
+            .chain(self.output_branches.values())
             .filter_map(|output| {
                 let computed_output = &output[..output.len().saturating_sub(1)];
                 (!computed_output.is_empty()).then(|| {
