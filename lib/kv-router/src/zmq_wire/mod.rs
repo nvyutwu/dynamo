@@ -50,6 +50,9 @@ pub struct ZmqEventNormalizer {
     /// exactly this size and device partial blocks are multiples of it, so it
     /// is what makes those events indexable rather than discarded.
     hash_block_size: u32,
+    /// The wire schema does not advertise `mamba_cache_mode`; preserve the
+    /// historical fail-closed policy unless a known-align deployment opts in.
+    mamba_align_indexing_enabled: bool,
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
@@ -98,6 +101,7 @@ impl ZmqEventNormalizer {
             // Callers that know the engine's hash granularity should override
             // via with_hash_block_size so host-tier and partial events index.
             hash_block_size: kv_block_size,
+            mamba_align_indexing_enabled: false,
             image_token_id: None,
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
@@ -109,6 +113,7 @@ impl ZmqEventNormalizer {
         Self {
             kv_block_size,
             hash_block_size: kv_block_size,
+            mamba_align_indexing_enabled: false,
             image_token_id: None,
             warning_count,
             group_metadata: FxHashMap::default(),
@@ -160,6 +165,38 @@ impl ZmqEventNormalizer {
             self.hash_block_size = hash_block_size;
         }
         self
+    }
+
+    /// Admit Mamba events only when the deployment explicitly asserts vLLM's
+    /// reusable `--mamba-cache-mode align` representation.
+    pub fn with_mamba_align_indexing(mut self, enabled: bool) -> Self {
+        self.mamba_align_indexing_enabled = enabled;
+        self
+    }
+
+    /// Read the Mamba-align admission gate from the environment. The default
+    /// is fail-closed because this property is not represented on the wire.
+    pub fn with_mamba_align_indexing_from_env(self) -> Self {
+        match std::env::var("DYN_KV_INDEX_MAMBA_ALIGN") {
+            Ok(raw) if matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "YES") => {
+                tracing::warn!(
+                    "Mamba KV events admitted to the router index by \
+                     DYN_KV_INDEX_MAMBA_ALIGN; this requires \
+                     --mamba-cache-mode align"
+                );
+                self.with_mamba_align_indexing(true)
+            }
+            Ok(raw) if matches!(raw.trim(), "0" | "false" | "FALSE" | "no" | "NO") => self,
+            Ok(raw) => {
+                tracing::warn!(
+                    value = %raw,
+                    "DYN_KV_INDEX_MAMBA_ALIGN is not a boolean; leaving Mamba \
+                     KV events out of the router index"
+                );
+                self
+            }
+            Err(_) => self,
+        }
     }
 
     /// Set the model's image placeholder token id so vLLM BlockStored events
@@ -342,7 +379,7 @@ impl ZmqEventNormalizer {
         dp_rank: DpRank,
     ) -> Option<ZmqEventFilterReason> {
         if let Some(kind) = metadata.kv_cache_spec_kind {
-            if kind.is_main_attention() {
+            if kind.is_indexable(self.mamba_align_indexing_enabled) {
                 return None;
             }
             if kind == KvCacheSpecKind::Unknown {
@@ -355,7 +392,7 @@ impl ZmqEventNormalizer {
 
         if let Some(metadata) = self.group_metadata.get(&(dp_rank, group_idx)) {
             let _sliding_window = metadata.sliding_window;
-            if metadata.kind.is_main_attention() {
+            if metadata.kind.is_indexable(self.mamba_align_indexing_enabled) {
                 return None;
             }
             if metadata.kind == KvCacheSpecKind::Unknown {

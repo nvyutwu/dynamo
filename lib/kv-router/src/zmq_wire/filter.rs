@@ -78,6 +78,13 @@ impl KvCacheSpecKind {
             Self::FullAttention | Self::MlaAttention | Self::SinkFullAttention
         )
     }
+
+    /// Mamba is deliberately opt-in: the wire event does not carry vLLM's
+    /// `mamba_cache_mode`, so only an operator running the reusable `align`
+    /// representation may allow it into the router index.
+    pub(crate) fn is_indexable(self, mamba_align_enabled: bool) -> bool {
+        self.is_main_attention() || (mamba_align_enabled && self == Self::Mamba)
+    }
 }
 
 impl Serialize for KvCacheSpecKind {

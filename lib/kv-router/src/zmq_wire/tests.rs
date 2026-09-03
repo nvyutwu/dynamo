@@ -718,6 +718,28 @@ fn test_normalizer_ignores_non_main_attention_kind_with_group_idx_zero() {
 }
 
 #[test]
+fn test_normalizer_indexes_mamba_only_with_explicit_align_opt_in() {
+    let worker = WorkerWithDpRank::new(3, 0);
+    let raw = stored_event(K3_HASH_BLOCK as usize, 1, Some("CPU"), "mamba");
+    let mut disabled =
+        ZmqEventNormalizer::new(K3_DEVICE_BLOCK).with_hash_block_size(K3_HASH_BLOCK);
+    assert!(matches!(
+        disabled.preprocess_with_reason(raw, worker),
+        Err(ZmqEventFilterReason::NonMainAttentionKind)
+    ));
+
+    let raw = stored_event(K3_HASH_BLOCK as usize, 1, Some("CPU"), "mamba");
+    let mut enabled = ZmqEventNormalizer::new(K3_DEVICE_BLOCK)
+        .with_hash_block_size(K3_HASH_BLOCK)
+        .with_mamba_align_indexing(true);
+    let event = enabled
+        .normalize(raw, 1, worker)
+        .expect("Mamba CPU event should be indexed when align is explicitly enabled");
+    assert_eq!(event.placement.tier, StorageTier::HostPinned);
+    assert_eq!(stored_block_count(&event), 1);
+}
+
+#[test]
 fn test_convert_event_bigram_emits_eagle_windows() {
     let raw_event = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
