@@ -79,6 +79,7 @@ pub(crate) fn emit_request_end(
         worker: tracker.get_worker_info().map(Into::into),
         replay: Some(replay),
         finish_reason_metadata: None,
+        routing_decision: tracker.routing_decision_trace(),
     };
     sanitize_request(&mut request);
 

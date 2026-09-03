@@ -32,6 +32,7 @@ pub(super) struct WorkerSelection {
     pub(super) eligible_oracle_cached_tokens: usize,
     pub(super) resident_oracle_cached_tokens: usize,
     pub(super) selected_worker_tiers: SelectedWorkerTierSnapshot,
+    pub(super) eligible_oracle_worker: Option<WorkerWithDpRank>,
     pub(super) eligible_oracle_tiers: SelectedWorkerTierSnapshot,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
@@ -110,6 +111,7 @@ impl KvPushRouter {
                 eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens,
                 selected_worker_tiers,
+                eligible_oracle_worker,
                 eligible_oracle_tiers,
                 routing_hashes,
             } => Ok(WorkerSelection {
@@ -121,6 +123,7 @@ impl KvPushRouter {
                 eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens,
                 selected_worker_tiers,
+                eligible_oracle_worker,
                 eligible_oracle_tiers,
                 routing_hashes,
                 lifecycle,
