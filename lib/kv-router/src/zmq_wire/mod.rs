@@ -53,6 +53,11 @@ pub struct ZmqEventNormalizer {
     /// The wire schema does not advertise `mamba_cache_mode`; preserve the
     /// historical fail-closed policy unless a known-align deployment opts in.
     mamba_align_indexing_enabled: bool,
+    /// Host offload events can be emitted at a finer granularity than the
+    /// request router's device cache blocks. This guarded compatibility mode
+    /// coalesces complete lower-tier groups back to the device granularity so
+    /// their token hashes are queryable by the router.
+    lower_tier_aggregate_to_device: bool,
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
@@ -102,6 +107,7 @@ impl ZmqEventNormalizer {
             // via with_hash_block_size so host-tier and partial events index.
             hash_block_size: kv_block_size,
             mamba_align_indexing_enabled: false,
+            lower_tier_aggregate_to_device: false,
             image_token_id: None,
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
@@ -114,6 +120,7 @@ impl ZmqEventNormalizer {
             kv_block_size,
             hash_block_size: kv_block_size,
             mamba_align_indexing_enabled: false,
+            lower_tier_aggregate_to_device: false,
             image_token_id: None,
             warning_count,
             group_metadata: FxHashMap::default(),
@@ -199,6 +206,38 @@ impl ZmqEventNormalizer {
         }
     }
 
+    /// Opt into coalescing lower-tier hash-sized entries into device-sized
+    /// routing blocks. This is needed only when the engine emits a complete
+    /// host chunk at a finer granularity than the router's device cache block.
+    /// It defaults off because partial lower-tier residency must not be rounded
+    /// up to a whole device block.
+    pub fn with_lower_tier_aggregation(mut self, enabled: bool) -> Self {
+        self.lower_tier_aggregate_to_device = enabled;
+        self
+    }
+
+    /// Read the lower-tier aggregation compatibility switch from the
+    /// environment. Only an explicit true value enables it.
+    pub fn with_lower_tier_aggregation_from_env(self) -> Self {
+        match std::env::var("DYN_KV_LOWER_TIER_AGGREGATE_TO_DEVICE") {
+            Ok(raw) if matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "YES") => {
+                tracing::warn!(
+                    "Lower-tier KV events will be aggregated to device cache-block granularity"
+                );
+                self.with_lower_tier_aggregation(true)
+            }
+            Ok(raw) if matches!(raw.trim(), "0" | "false" | "FALSE" | "no" | "NO") => self,
+            Ok(raw) => {
+                tracing::warn!(
+                    value = %raw,
+                    "DYN_KV_LOWER_TIER_AGGREGATE_TO_DEVICE is not a boolean; leaving lower-tier aggregation disabled"
+                );
+                self
+            }
+            Err(_) => self,
+        }
+    }
+
     /// Set the model's image placeholder token id so vLLM BlockStored events
     /// get normalized to the canonical pad_value scheme. No-op for text-only
     /// models (leave unset).
@@ -237,7 +276,7 @@ impl ZmqEventNormalizer {
         event_id: u64,
         worker: WorkerWithDpRank,
     ) -> Option<PlacementEvent> {
-        convert_event(
+        convert::convert_event_with_lower_tier_aggregation(
             raw,
             event_id,
             self.kv_block_size,
@@ -245,6 +284,7 @@ impl ZmqEventNormalizer {
             worker,
             &self.warning_count,
             self.image_token_id,
+            self.lower_tier_aggregate_to_device,
         )
     }
 

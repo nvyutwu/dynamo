@@ -25,6 +25,35 @@ pub fn convert_event(
     warning_count: &Arc<AtomicU32>,
     image_token_id: Option<u32>,
 ) -> Option<PlacementEvent> {
+    convert_event_with_lower_tier_aggregation(
+        raw,
+        event_id,
+        kv_block_size,
+        hash_block_size,
+        worker,
+        warning_count,
+        image_token_id,
+        false,
+    )
+}
+
+/// Convert a raw event with an explicit lower-tier aggregation policy.
+///
+/// The public [`convert_event`] API preserves the historical no-aggregation
+/// behavior.  The ZMQ normalizer calls this internal variant only when an
+/// operator opts a deployment into matching host-tier events at device-block
+/// granularity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_event_with_lower_tier_aggregation(
+    raw: RawKvEvent,
+    event_id: u64,
+    kv_block_size: u32,
+    hash_block_size: u32,
+    worker: WorkerWithDpRank,
+    warning_count: &Arc<AtomicU32>,
+    image_token_id: Option<u32>,
+    lower_tier_aggregate_to_device: bool,
+) -> Option<PlacementEvent> {
     let storage_tier = match &raw {
         RawKvEvent::BlockStored { medium, .. } | RawKvEvent::BlockRemoved { medium, .. } => {
             StorageTier::from_kv_medium_or_default(medium.as_deref())
@@ -88,7 +117,7 @@ pub fn convert_event(
                         .map(BlockHashValue::into_u64)
                         .map(ExternalSequenceBlockHash::from),
                     start_position: None,
-                    blocks: create_stored_blocks(
+                    blocks: create_stored_blocks_with_lower_tier_aggregation(
                         kv_block_size,
                         hash_block_size,
                         storage_tier,
@@ -101,6 +130,7 @@ pub fn convert_event(
                         block_mm_infos.as_deref(),
                         is_eagle,
                         image_token_id,
+                        lower_tier_aggregate_to_device,
                     ),
                 }),
                 dp_rank,
@@ -271,6 +301,67 @@ pub fn create_stored_blocks(
     is_eagle: Option<bool>,
     image_token_id: Option<u32>,
 ) -> Vec<KvCacheStoredBlockData> {
+    create_stored_blocks_with_lower_tier_aggregation(
+        kv_block_size,
+        hash_block_size,
+        storage_tier,
+        token_ids,
+        num_block_tokens,
+        block_hashes,
+        lora_name,
+        cache_namespace,
+        warning_count,
+        block_mm_infos,
+        is_eagle,
+        image_token_id,
+        false,
+    )
+}
+
+/// Construct index blocks from a KV event, optionally coalescing host-tier
+/// hash-sized entries into device-sized blocks.
+///
+/// vLLM can publish a host offload chunk as many `hash_block_size` entries
+/// while the request router hashes queries at `kv_block_size`.  Without
+/// coalescing, those key spaces are disjoint.  Coalescing is deliberately
+/// opt-in and only applies to complete, non-device, non-EAGLE groups.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_stored_blocks_with_lower_tier_aggregation(
+    kv_block_size: u32,
+    hash_block_size: u32,
+    storage_tier: StorageTier,
+    token_ids: &[u32],
+    num_block_tokens: &[u64],
+    block_hashes: &[u64],
+    lora_name: Option<&str>,
+    cache_namespace: Option<&str>,
+    warning_count: &Arc<AtomicU32>,
+    block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+    is_eagle: Option<bool>,
+    image_token_id: Option<u32>,
+    lower_tier_aggregate_to_device: bool,
+) -> Vec<KvCacheStoredBlockData> {
+    if should_aggregate_lower_tier(
+        kv_block_size,
+        hash_block_size,
+        storage_tier,
+        is_eagle,
+        lower_tier_aggregate_to_device,
+    ) {
+        return create_aggregated_lower_tier_blocks(
+            kv_block_size,
+            hash_block_size,
+            token_ids,
+            num_block_tokens,
+            block_hashes,
+            lora_name,
+            cache_namespace,
+            warning_count,
+            block_mm_infos,
+            image_token_id,
+        );
+    }
+
     let mut blocks: Vec<KvCacheStoredBlockData> = Vec::new();
 
     let mut token_offset: usize = 0;
@@ -352,10 +443,255 @@ pub fn create_stored_blocks(
     blocks
 }
 
+fn should_aggregate_lower_tier(
+    kv_block_size: u32,
+    hash_block_size: u32,
+    storage_tier: StorageTier,
+    is_eagle: Option<bool>,
+    enabled: bool,
+) -> bool {
+    enabled
+        && !storage_tier.is_gpu()
+        && !is_eagle.unwrap_or(false)
+        && hash_block_size > 0
+        && hash_block_size < kv_block_size
+        && kv_block_size % hash_block_size == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_aggregated_lower_tier_blocks(
+    kv_block_size: u32,
+    hash_block_size: u32,
+    token_ids: &[u32],
+    num_block_tokens: &[u64],
+    block_hashes: &[u64],
+    lora_name: Option<&str>,
+    cache_namespace: Option<&str>,
+    warning_count: &Arc<AtomicU32>,
+    block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+    image_token_id: Option<u32>,
+) -> Vec<KvCacheStoredBlockData> {
+    let ratio = (kv_block_size / hash_block_size) as usize;
+    let complete_groups = num_block_tokens.len().min(block_hashes.len()) / ratio;
+    let mut blocks = Vec::with_capacity(complete_groups);
+    let mut token_offset = 0usize;
+
+    for group_start in (0..complete_groups * ratio).step_by(ratio) {
+        let group_end = group_start + ratio;
+        let spans = &num_block_tokens[group_start..group_end];
+        if spans.iter().any(|&span| span != u64::from(hash_block_size)) {
+            tracing::warn!(
+                kv_block_size,
+                hash_block_size,
+                group_start,
+                "Lower-tier aggregation skipped a group with non-hash-sized entries"
+            );
+            token_offset = token_offset.saturating_add(
+                spans
+                    .iter()
+                    .copied()
+                    .map(|span| span as usize)
+                    .sum::<usize>(),
+            );
+            continue;
+        }
+
+        let end = token_offset + kv_block_size as usize;
+        if end > token_ids.len() {
+            if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+                tracing::warn!(
+                    needed_tokens = end,
+                    available_tokens = token_ids.len(),
+                    "Lower-tier aggregation skipped a group with truncated token_ids"
+                );
+            }
+            break;
+        }
+
+        blocks.push(create_stored_block_from_parts(
+            kv_block_size,
+            block_hashes[group_end - 1],
+            &token_ids[token_offset..end],
+            StoredBlockOptions {
+                lora_name,
+                cache_namespace,
+                mm_extra_info: aggregate_mm_extra_info(
+                    block_mm_infos.and_then(|infos| infos.get(group_start..group_end)),
+                    hash_block_size as usize,
+                ),
+                is_eagle: Some(false),
+                image_token_id,
+            },
+        ));
+        token_offset = end;
+    }
+
+    blocks
+}
+
+fn aggregate_mm_extra_info(
+    infos: Option<&[Option<BlockExtraInfo>]>,
+    block_size: usize,
+) -> Option<BlockExtraInfo> {
+    let infos = infos?;
+    let mut mm_objects = Vec::new();
+    for (block_idx, info) in infos.iter().enumerate() {
+        let Some(info) = info else {
+            continue;
+        };
+        let block_offset = block_idx * block_size;
+        for object in &info.mm_objects {
+            mm_objects.push(crate::protocols::BlockMmObjectInfo {
+                mm_hash: object.mm_hash,
+                offsets: object
+                    .offsets
+                    .iter()
+                    .map(|&(start, end)| (start + block_offset, end + block_offset))
+                    .collect(),
+            });
+        }
+    }
+    (!mm_objects.is_empty()).then_some(BlockExtraInfo { mm_objects })
+}
+
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
     use crate::protocols::{BlockMmObjectInfo, pad_value_for_mm_hash};
+
+    fn aggregation_inputs() -> (Vec<u32>, Vec<u64>, Vec<u64>) {
+        (
+            (0..8).collect(),
+            vec![2, 2, 2, 2],
+            vec![101, 102, 103, 104],
+        )
+    }
+
+    #[test]
+    fn lower_tier_aggregation_matches_device_granularity_query_hash() {
+        let (tokens, spans, hashes) = aggregation_inputs();
+        let blocks = create_stored_blocks_with_lower_tier_aggregation(
+            8,
+            2,
+            StorageTier::HostPinned,
+            &tokens,
+            &spans,
+            &hashes,
+            None,
+            None,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            Some(false),
+            None,
+            true,
+        );
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_hash, ExternalSequenceBlockHash(104));
+        assert_eq!(
+            blocks[0].tokens_hash,
+            compute_block_hash_for_seq(&tokens, 8, BlockHashOptions::default())[0],
+            "aggregated HostPinned key must equal the device-granularity query key"
+        );
+    }
+
+    #[test]
+    fn lower_tier_aggregation_is_off_by_default() {
+        let (tokens, spans, hashes) = aggregation_inputs();
+        let blocks = create_stored_blocks(
+            8,
+            2,
+            StorageTier::HostPinned,
+            &tokens,
+            &spans,
+            &hashes,
+            None,
+            None,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            Some(false),
+            None,
+        );
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[3].block_hash, ExternalSequenceBlockHash(104));
+    }
+
+    #[test]
+    fn lower_tier_aggregation_drops_incomplete_trailing_group() {
+        let tokens: Vec<u32> = (0..10).collect();
+        let spans = vec![2, 2, 2, 2, 2];
+        let hashes = vec![101, 102, 103, 104, 105];
+        let blocks = create_stored_blocks_with_lower_tier_aggregation(
+            8,
+            2,
+            StorageTier::HostPinned,
+            &tokens,
+            &spans,
+            &hashes,
+            None,
+            None,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            Some(false),
+            None,
+            true,
+        );
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_hash, ExternalSequenceBlockHash(104));
+    }
+
+    #[test]
+    fn lower_tier_aggregation_never_changes_device_events() {
+        let (tokens, spans, hashes) = aggregation_inputs();
+        let blocks = create_stored_blocks_with_lower_tier_aggregation(
+            8,
+            2,
+            StorageTier::Device,
+            &tokens,
+            &spans,
+            &hashes,
+            None,
+            None,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            Some(false),
+            None,
+            true,
+        );
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[3].block_hash, ExternalSequenceBlockHash(104));
+    }
+
+    #[test]
+    fn lower_tier_aggregation_uses_each_complete_groups_last_hash() {
+        let tokens: Vec<u32> = (0..16).collect();
+        let spans = vec![2; 8];
+        let hashes = (101..=108).collect::<Vec<_>>();
+        let blocks = create_stored_blocks_with_lower_tier_aggregation(
+            8,
+            2,
+            StorageTier::HostPinned,
+            &tokens,
+            &spans,
+            &hashes,
+            None,
+            None,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            Some(false),
+            None,
+            true,
+        );
+
+        assert_eq!(
+            blocks.iter().map(|block| block.block_hash).collect::<Vec<_>>(),
+            vec![ExternalSequenceBlockHash(104), ExternalSequenceBlockHash(108)],
+            "the next chunk's vLLM parent points to the preceding chunk's last hash"
+        );
+    }
 
     /// A normalized vLLM block (image_token_id run + mm_hash) must hash
     /// identically to the frontend's pad_value scheme. The parity the

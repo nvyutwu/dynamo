@@ -178,7 +178,8 @@ impl ListenerLoop {
             watermark,
             normalizer: ZmqEventNormalizer::new(block_size)
                 .with_hash_block_size_from_env()
-                .with_mamba_align_indexing_from_env(),
+                .with_mamba_align_indexing_from_env()
+                .with_lower_tier_aggregation_from_env(),
             messages_processed: 0,
         }
     }

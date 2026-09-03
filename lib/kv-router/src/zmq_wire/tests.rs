@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, PlacementEvent, StorageTier, WorkerWithDpRank,
+    KvCacheEventData, KvCacheStoredBlockData, PlacementEvent, StorageTier, WorkerWithDpRank,
     compute_block_hash_for_seq,
 };
 
@@ -974,6 +974,13 @@ fn stored_block_count(event: &PlacementEvent) -> usize {
     }
 }
 
+fn stored_blocks(event: &PlacementEvent) -> &[KvCacheStoredBlockData] {
+    match &event.event.data {
+        KvCacheEventData::Stored(data) => &data.blocks,
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
 /// Shape 1. Device full blocks match kv_block_size and were always published.
 #[test]
 fn test_device_full_block_is_published() {
@@ -1019,6 +1026,59 @@ fn test_host_tier_block_is_published_with_hash_block_size() {
         "host-tier blocks must be indexed once the hash granularity is known"
     );
     assert_eq!(event.placement.tier, StorageTier::HostPinned);
+}
+
+/// The Kimi-K3 host offload publisher uses 128-token hashes while a request
+/// query is keyed on its 12,288-token device block. With the compatibility
+/// mode enabled, only a complete 96-entry host group is represented in the
+/// index, using the final 128-token hash as its external continuation key.
+#[test]
+fn test_host_tier_complete_hash_group_aggregates_to_device_block() {
+    let raw = stored_event(
+        K3_HASH_BLOCK as usize,
+        (K3_DEVICE_BLOCK / K3_HASH_BLOCK) as usize,
+        Some("CPU"),
+        "mla_attention",
+    );
+    let mut normalizer = ZmqEventNormalizer::new(K3_DEVICE_BLOCK)
+        .with_hash_block_size(K3_HASH_BLOCK)
+        .with_lower_tier_aggregation(true);
+
+    let event = normalizer
+        .normalize(raw, 31, WorkerWithDpRank::new(1, 0))
+        .expect("complete host group should convert");
+    let blocks = stored_blocks(&event);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].block_hash, ExternalSequenceBlockHash(106));
+    assert_eq!(
+        blocks[0].tokens_hash,
+        compute_block_hash_for_seq(
+            &(0..K3_DEVICE_BLOCK).collect::<Vec<_>>(),
+            K3_DEVICE_BLOCK,
+            BlockHashOptions::default(),
+        )[0],
+        "host index key must equal the device-block request query key"
+    );
+}
+
+/// An incomplete host group must never be represented as a full device block:
+/// that would advertise bytes which cannot be transferred to a peer.
+#[test]
+fn test_host_tier_incomplete_hash_group_is_not_rounded_up() {
+    let raw = stored_event(
+        K3_HASH_BLOCK as usize,
+        (K3_DEVICE_BLOCK / K3_HASH_BLOCK - 1) as usize,
+        Some("CPU"),
+        "mla_attention",
+    );
+    let mut normalizer = ZmqEventNormalizer::new(K3_DEVICE_BLOCK)
+        .with_hash_block_size(K3_HASH_BLOCK)
+        .with_lower_tier_aggregation(true);
+
+    let event = normalizer
+        .normalize(raw, 32, WorkerWithDpRank::new(1, 0))
+        .expect("incomplete host group still converts as an empty store event");
+    assert_eq!(stored_block_count(&event), 0);
 }
 
 /// Shape 2, fixed. Device partial blocks carry a ragged span
