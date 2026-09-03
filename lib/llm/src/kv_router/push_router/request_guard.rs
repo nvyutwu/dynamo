@@ -10,7 +10,11 @@ use dynamo_runtime::{
 };
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter,
+        cache_history::{CacheHistory, CacheHistoryRequest},
+        metrics::RouterRequestMetrics,
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
@@ -227,6 +231,65 @@ struct OutputBlockUpdate {
     decay_fraction: Option<f64>,
 }
 
+#[derive(Clone, Copy)]
+struct CacheLossRoute {
+    prompt_tokens: u64,
+    previously_computed_tokens: u64,
+    best_router_tokens: u64,
+    selected_router_tokens: u64,
+}
+
+impl CacheLossRoute {
+    fn bounded(self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens,
+            previously_computed_tokens: self.previously_computed_tokens.min(self.prompt_tokens),
+            best_router_tokens: self.best_router_tokens.min(self.prompt_tokens),
+            selected_router_tokens: self.selected_router_tokens.min(self.prompt_tokens),
+        }
+    }
+}
+
+pub(super) struct CacheLossTracking {
+    route: CacheLossRoute,
+    history: Arc<parking_lot::Mutex<CacheHistory>>,
+    request: CacheHistoryRequest,
+    complete: bool,
+}
+
+impl CacheLossTracking {
+    pub(super) fn new(
+        prompt_tokens: u64,
+        previously_computed_tokens: u64,
+        best_router_tokens: u64,
+        selected_router_tokens: u64,
+        history: Arc<parking_lot::Mutex<CacheHistory>>,
+        request: CacheHistoryRequest,
+    ) -> Self {
+        Self {
+            route: CacheLossRoute {
+                prompt_tokens,
+                previously_computed_tokens,
+                best_router_tokens,
+                selected_router_tokens,
+            }
+            .bounded(),
+            history,
+            request,
+            complete: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CacheLossWorkerOutcome {
+    complete: bool,
+    prompt_tokens: u64,
+    gpu_hit_tokens: u64,
+    cpu_hit_tokens: u64,
+    cpu_lookup_tokens: u64,
+}
+
 /// Tracks when streamed output grows into a new scheduler accounting block.
 struct OutputBlockTracker {
     track_output_blocks: bool,
@@ -283,6 +346,8 @@ pub(super) struct RequestGuard {
     observability: RequestObservability,
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
+    cache_loss: Option<CacheLossTracking>,
+    cache_loss_recorded: bool,
 }
 
 impl RequestGuard {
@@ -293,6 +358,7 @@ impl RequestGuard {
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
         lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
+        cache_loss: Option<CacheLossTracking>,
     ) -> Self {
         // Snapshot request-scoped inputs now so the guard can outlive the
         // PreprocessedRequest after it is moved into backend dispatch.
@@ -307,6 +373,9 @@ impl RequestGuard {
         let track_request_progress = lifecycle.is_some();
         if scheduler_tracked {
             request_metrics.requests_started_total().inc();
+            if let Some(cache_loss) = cache_loss.as_ref() {
+                request_metrics.observe_cache_loss_input(cache_loss.route.prompt_tokens);
+            }
         }
 
         Self {
@@ -320,6 +389,8 @@ impl RequestGuard {
                 expected_output_tokens,
             ),
             prefill_marked: false,
+            cache_loss,
+            cache_loss_recorded: false,
         }
     }
 
@@ -347,6 +418,16 @@ impl RequestGuard {
 
     pub(super) async fn on_item(&mut self, item: &Annotated<LLMEngineOutput>) {
         self.observability.observe_response();
+
+        if let Some(cache_loss) = self.cache_loss.as_mut()
+            && let Some(data) = item.data.as_ref()
+            && !data.token_ids.is_empty()
+        {
+            cache_loss
+                .request
+                .observe_output(data.index.unwrap_or(0), &data.token_ids);
+        }
+        self.observe_cache_loss_worker_outcome(item);
 
         if let Some(usage) = item
             .data
@@ -413,6 +494,8 @@ impl RequestGuard {
 
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
+        self.record_cache_loss_incomplete();
+        self.finalize_cache_history();
         self.observability.record_metrics();
         self.mark_completed_terminal();
         self.cleanup.finish().await;
@@ -431,13 +514,89 @@ impl RequestGuard {
     }
 
     pub(super) async fn abort(&mut self) {
+        self.record_cache_loss_incomplete();
         self.cleanup.finish().await;
+    }
+
+    fn observe_cache_loss_worker_outcome(&mut self, item: &Annotated<LLMEngineOutput>) {
+        if self.cache_loss_recorded {
+            return;
+        }
+        let Some(route) = self.cache_loss.as_ref().map(|tracking| tracking.route) else {
+            return;
+        };
+        let Some(value) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.engine_data.as_ref())
+            .and_then(|data| data.get("cache_loss"))
+        else {
+            return;
+        };
+        let Ok(outcome) = serde_json::from_value::<CacheLossWorkerOutcome>(value.clone()) else {
+            self.record_cache_loss_incomplete();
+            return;
+        };
+        if !outcome.complete || outcome.prompt_tokens != route.prompt_tokens {
+            self.record_cache_loss_incomplete();
+            return;
+        }
+
+        let f1 = route.previously_computed_tokens;
+        let f2 = route.best_router_tokens.min(f1);
+        let f3 = route.selected_router_tokens.min(f2);
+        let f4 = outcome
+            .gpu_hit_tokens
+            .saturating_add(outcome.cpu_lookup_tokens)
+            .min(f3);
+        let f5 = outcome
+            .gpu_hit_tokens
+            .saturating_add(outcome.cpu_hit_tokens)
+            .min(f4);
+        self.request_metrics()
+            .observe_cache_loss_funnel([route.prompt_tokens, f1, f2, f3, f4, f5]);
+        if let Some(cache_loss) = self.cache_loss.as_mut() {
+            cache_loss.complete = true;
+        }
+        self.cache_loss_recorded = true;
+    }
+
+    fn record_cache_loss_incomplete(&mut self) {
+        if self.cache_loss_recorded || self.cache_loss.is_none() {
+            return;
+        }
+        self.request_metrics().observe_cache_loss_incomplete();
+        self.cache_loss_recorded = true;
+    }
+
+    fn finalize_cache_history(&mut self) {
+        let Some(cache_loss) = self.cache_loss.as_mut() else {
+            return;
+        };
+        if !cache_loss.complete {
+            return;
+        }
+        let stats = {
+            let mut history = cache_loss.history.lock();
+            cache_loss.request.finalize(&mut history);
+            history.stats()
+        };
+        self.request_metrics().set_cache_loss_history_stats(
+            stats.retained_records,
+            stats.retained_unique_hashes,
+            stats.represented_tokens,
+            stats.estimated_retained_bytes,
+            stats.capacity_bytes,
+            stats.capacity_blocks,
+        );
     }
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         // RequestCleanup drops immediately afterward and performs resource cleanup.
+        self.record_cache_loss_incomplete();
+        self.finalize_cache_history();
         self.observability.record_metrics();
     }
 }

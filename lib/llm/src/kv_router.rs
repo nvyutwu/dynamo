@@ -43,6 +43,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod cache_history;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
@@ -81,6 +82,7 @@ pub enum FindBestMatchOutcome {
         eligible_oracle_cached_tokens: usize,
         resident_oracle_cached_tokens: usize,
         selected_worker_tiers: SelectedWorkerTierSnapshot,
+        eligible_oracle_worker: Option<WorkerWithDpRank>,
         eligible_oracle_tiers: SelectedWorkerTierSnapshot,
         routing_hashes: Option<RoutingDecisionHashes>,
     },
@@ -767,6 +769,7 @@ where
                 eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                 selected_worker_tiers: response.selected_worker_tiers,
+                eligible_oracle_worker: response.eligible_oracle_worker,
                 eligible_oracle_tiers: response.eligible_oracle_tiers,
                 routing_hashes,
             },

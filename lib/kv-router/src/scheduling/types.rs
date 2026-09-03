@@ -78,6 +78,7 @@ pub struct SchedulingResponse {
     pub eligible_oracle_cached_tokens: usize,
     pub resident_oracle_cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    pub eligible_oracle_worker: Option<WorkerWithDpRank>,
     pub eligible_oracle_tiers: SelectedWorkerTierSnapshot,
     pub request_progress: Option<RequestProgressUpdater>,
     pub lifecycle_lease: Option<super::queue::RequestLifecycleLease>,

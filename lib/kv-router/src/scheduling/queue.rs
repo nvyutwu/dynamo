@@ -1421,6 +1421,9 @@ impl<
                 .as_ref()
                 .and_then(|provider| provider());
             let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+            // Capture the best eligible cache holder from the same snapshot used
+            // by scheduling, before `select_worker` consumes eligibility.
+            let eligible_oracle = oracle_cached_entry(&workers, &request, eligibility);
             self.selector
                 .select_worker(&workers, &request, eligibility, self.block_size)
                 .map(|selection| {
@@ -1430,20 +1433,25 @@ impl<
                     let selected_worker_tiers = request
                         .overlap
                         .selected_worker_tiers(selection.worker, config);
-                    let eligible_oracle_tiers =
-                        oracle_cached_entry(&workers, &request, eligibility).and_then(
-                            |(worker, _)| {
-                                workers.get(&worker.worker_id).map(|config| {
-                                    request.overlap.selected_worker_tiers(worker, config)
-                                })
-                            },
-                        )
+                    let eligible_oracle_worker = eligible_oracle.map(|(worker, _)| worker);
+                    let eligible_oracle_tiers = eligible_oracle_worker
+                        .and_then(|worker| {
+                            workers.get(&worker.worker_id).map(|config| {
+                                request.overlap.selected_worker_tiers(worker, config)
+                            })
+                        })
                         .unwrap_or_default();
-                    (selection, selected_worker_tiers, eligible_oracle_tiers)
+                    (
+                        selection,
+                        selected_worker_tiers,
+                        eligible_oracle_worker,
+                        eligible_oracle_tiers,
+                    )
                 })
         };
 
-        let (selection, selected_worker_tiers, eligible_oracle_tiers) = match selection {
+        let (selection, selected_worker_tiers, eligible_oracle_worker, eligible_oracle_tiers) =
+            match selection {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scheduling failed: {e}");
@@ -1458,7 +1466,7 @@ impl<
                     false,
                 );
             }
-        };
+            };
 
         let (admission, request_progress) = match admission {
             Some(RequestAdmission { ticket, progress }) => (Some(ticket), Some(progress)),
@@ -1472,6 +1480,7 @@ impl<
             eligible_oracle_cached_tokens: selection.eligible_oracle_cached_tokens,
             resident_oracle_cached_tokens: selection.resident_oracle_cached_tokens,
             selected_worker_tiers,
+            eligible_oracle_worker,
             eligible_oracle_tiers,
             request_progress,
             lifecycle_lease: None,

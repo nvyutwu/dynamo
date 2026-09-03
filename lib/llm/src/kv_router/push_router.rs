@@ -20,12 +20,16 @@ use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter,
+        cache_history::{CacheHistory, CacheHistoryRequest},
+        metrics::RouterRequestMetrics,
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         FinishReason,
         llm_backend::LLMEngineOutput,
-        timing::{RequestPhase, RoutingData},
+        timing::{RequestPhase, RequestTracker, RoutingData, RoutingDecisionCandidate, RoutingDecisionTrace},
     },
     session_affinity::{
         AffinityAcquire, AffinityCoordinator, AffinityTarget, affinity_id, explicit_target,
@@ -37,12 +41,69 @@ mod request_guard;
 mod selection;
 
 use cancellation::cancel_on_stop;
-use request_guard::RequestGuard;
+use request_guard::{CacheLossTracking, RequestGuard};
 use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
 const CACHE_RESIDENCY_TIERS: [&str; 2] = ["hbm", "cpu"];
+
+fn router_decision_trace_enabled() -> bool {
+    std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn routing_decision_candidate(
+    worker: WorkerWithDpRank,
+    effective_overlap_blocks: f64,
+    cached_tokens: usize,
+    tiers: &SelectedWorkerTierSnapshot,
+) -> RoutingDecisionCandidate {
+    RoutingDecisionCandidate {
+        worker_id: worker.worker_id,
+        dp_rank: worker.dp_rank,
+        effective_overlap_blocks,
+        cached_tokens,
+        hbm_blocks: tiers.gpu_blocks,
+        cpu_ram_cumulative_blocks: tiers.host_pinned_blocks,
+        cpu_ram_only_blocks: tiers.host_pinned_blocks.saturating_sub(tiers.gpu_blocks),
+        disk_cumulative_blocks: tiers.disk_blocks,
+    }
+}
+
+fn record_routing_decision_trace(
+    tracker: &RequestTracker,
+    selection: &WorkerSelection,
+    input_tokens: usize,
+    block_size: u32,
+) {
+    if !router_decision_trace_enabled() {
+        return;
+    }
+    let selected_worker = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
+    let eligible_oracle = selection.eligible_oracle_worker.map(|worker| {
+        routing_decision_candidate(
+            worker,
+            selection.eligible_oracle_cached_tokens as f64 / f64::from(block_size.max(1)),
+            selection.eligible_oracle_cached_tokens,
+            &selection.eligible_oracle_tiers,
+        )
+    });
+    tracker.record_routing_decision_trace(RoutingDecisionTrace {
+        schema: "dynamo.router.decision.v44.v1".to_string(),
+        candidate_scope: "selected_and_best_eligible_cache_holder".to_string(),
+        block_size,
+        input_tokens,
+        selected: routing_decision_candidate(
+            selected_worker,
+            selection.effective_overlap_blocks,
+            selection.cached_tokens,
+            &selection.selected_worker_tiers,
+        ),
+        eligible_oracle,
+    });
+}
 
 fn cache_residency_tokens(
     snapshot: &SelectedWorkerTierSnapshot,
@@ -162,6 +223,9 @@ pub struct KvPushRouter {
     pub chooser: Arc<KvRouter>,
     request_metrics: Arc<RouterRequestMetrics>,
     affinity: Option<AffinityCoordinator>,
+    /// Backs funnel stage F1. `None` unless cache-loss telemetry is enabled, in
+    /// which case nothing is allocated and F1 stays at zero.
+    cache_history: Option<Arc<parking_lot::Mutex<CacheHistory>>>,
 }
 
 impl KvPushRouter {
@@ -187,12 +251,25 @@ impl KvPushRouter {
         // and the standalone router create KvPushRouter, so this covers both.
         let request_metrics =
             RouterRequestMetrics::from_component(chooser.client().endpoint.component());
+        let cache_history = CacheHistory::from_env(chooser.block_size());
+        if let Some(history) = cache_history.as_ref() {
+            let stats = history.lock().stats();
+            request_metrics.set_cache_loss_history_stats(
+                stats.retained_records,
+                stats.retained_unique_hashes,
+                stats.represented_tokens,
+                stats.estimated_retained_bytes,
+                stats.capacity_bytes,
+                stats.capacity_blocks,
+            );
+        }
 
         KvPushRouter {
             inner,
             chooser,
             request_metrics,
             affinity,
+            cache_history,
         }
     }
 
@@ -301,6 +378,35 @@ impl KvPushRouter {
         let request_context = request.context().clone();
         let routing_parts = RoutingRequestParts::new(request);
         let block_size = self.chooser.block_size() as usize;
+        let cache_loss_tracking = (!is_query_only)
+            .then(|| self.cache_history.as_ref())
+            .flatten()
+            .map(|history| {
+                let tracked = CacheHistoryRequest::new(
+                    routing_parts.token_ids.to_vec(),
+                    routing_parts.block_mm_infos.map(ToOwned::to_owned),
+                    request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.lora_name.clone()),
+                    request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.cache_namespace.clone()),
+                    self.chooser.block_size(),
+                    self.chooser.is_eagle(),
+                );
+                let prompt_tokens = routing_parts.token_ids.len() as u64;
+                CacheLossTracking::new(
+                    prompt_tokens,
+                    tracked.previously_computed_tokens(&history.lock()),
+                    selection.eligible_oracle_cached_tokens.min(routing_parts.token_ids.len())
+                        as u64,
+                    selection.cached_tokens.min(routing_parts.token_ids.len()) as u64,
+                    Arc::clone(history),
+                    tracked,
+                )
+            });
         let mut guard = RequestGuard::new(
             self.chooser.clone(),
             self.request_metrics.clone(),
@@ -308,6 +414,7 @@ impl KvPushRouter {
             request,
             !is_query_only,
             selection.lifecycle.take(),
+            cache_loss_tracking,
         );
 
         let record_result: Result<(), Error> = async {
@@ -351,6 +458,12 @@ impl KvPushRouter {
             }
 
             if let Some(ref tracker) = request.tracker {
+                record_routing_decision_trace(
+                    tracker,
+                    selection,
+                    routing_parts.token_ids.len(),
+                    self.chooser.block_size(),
+                );
                 let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
                 tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
@@ -604,6 +717,12 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         if is_query_only {
             let routing_parts = RoutingRequestParts::new(&request);
             if let Some(ref tracker) = request.tracker {
+                record_routing_decision_trace(
+                    tracker,
+                    &selection,
+                    routing_parts.token_ids.len(),
+                    self.chooser.block_size(),
+                );
                 let isl_blocks = routing_parts
                     .token_ids
                     .len()
@@ -946,6 +1065,7 @@ mod tests {
                     .request_progress
                     .take()
                     .zip(response.lifecycle_lease.take()),
+                None,
             );
             guard.mark_dispatched().await;
 
@@ -1024,6 +1144,7 @@ mod tests {
             "terminal-drain".to_string(),
             &request(),
             false,
+            None,
             None,
         );
         let monitored = monitor_response_stream(source, context, guard);

@@ -102,6 +102,10 @@ from .multimodal_utils.vision_encoder_backend import VisionEncoderBackend
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+CACHE_LOSS_FUNNEL_ENABLED: Final[bool] = os.environ.get(
+    "DYN_CACHE_LOSS_FUNNEL_ENABLED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
 _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
 _RL_INIT_WEIGHTS_TIMEOUT_ENV = "DYN_RL_INIT_WEIGHTS_TIMEOUT_S"
@@ -2699,6 +2703,26 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         }
 
     @staticmethod
+    def _cache_loss_engine_data(request_output: RequestOutput) -> Dict[str, Any]:
+        """Return final cache counters for the router F0-F5 funnel."""
+        prompt_tokens = getattr(request_output, "prompt_token_ids", None)
+        local_hits = getattr(request_output, "num_local_cached_tokens", None)
+        external_hits = getattr(request_output, "num_external_cached_tokens", None)
+        external_lookups = getattr(
+            request_output, "num_external_lookup_tokens", None
+        )
+        values = (local_hits, external_hits, external_lookups)
+        if prompt_tokens is None or any(not isinstance(value, int) for value in values):
+            return {"complete": False}
+        return {
+            "complete": True,
+            "prompt_tokens": len(prompt_tokens),
+            "gpu_hit_tokens": local_hits,
+            "cpu_hit_tokens": external_hits,
+            "cpu_lookup_tokens": external_lookups,
+        }
+
+    @staticmethod
     def _extract_logprobs(
         output, num_output_tokens_so_far: int, tokenizer=None
     ) -> tuple[list[float] | None, list[list[dict]] | None]:
@@ -2866,6 +2890,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             request_output=res,
                             completion_token_counts=total_output_tokens_by_index,
                         )
+                        if CACHE_LOSS_FUNNEL_ENABLED:
+                            out.setdefault("engine_data", {})["cache_loss"] = (
+                                BaseWorkerHandler._cache_loss_engine_data(res)
+                            )
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(
                                 out, prompt_logprobs_payload
@@ -3352,6 +3380,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             chunk["usage"] = BaseWorkerHandler._build_completion_usage(
                                 request_output=res,
                             )
+                            if CACHE_LOSS_FUNNEL_ENABLED:
+                                chunk.setdefault("engine_data", {})["cache_loss"] = (
+                                    BaseWorkerHandler._cache_loss_engine_data(res)
+                                )
 
                         yield chunk
                         previous_text_per_choice[output_idx] = output.text
@@ -3536,6 +3568,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         request_output=res,
                     ),
                 }
+                if CACHE_LOSS_FUNNEL_ENABLED:
+                    output.setdefault("engine_data", {})["cache_loss"] = (
+                        BaseWorkerHandler._cache_loss_engine_data(res)
+                    )
 
                 # Log prefill completion with LoRA info
                 self._log_with_lora_context(
