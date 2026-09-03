@@ -827,7 +827,10 @@ pub struct RouterRequestMetrics {
     pub kv_hit_rate: prometheus::Histogram,
     pub input_tokens_total: prometheus::IntCounter,
     pub selected_cached_tokens_total: prometheus::IntCounter,
+    pub selected_cache_residency_tokens_total: prometheus::IntCounterVec,
     pub eligible_oracle_cached_tokens_total: prometheus::IntCounter,
+    pub eligible_oracle_cache_residency_tokens_total: prometheus::IntCounterVec,
+    pub eligible_oracle_cache_residency_missed_tokens_total: prometheus::IntCounterVec,
     pub resident_oracle_cached_tokens_total: prometheus::IntCounter,
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
@@ -938,6 +941,14 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_selected_cached_tokens_total");
+                let selected_cache_residency_tokens_total = metrics
+                    .create_intcountervec(
+                        router::SELECTED_CACHE_RESIDENCY_TOKENS_TOTAL,
+                        "Raw KV-residency tokens on the worker selected by the router, by storage tier",
+                        &["tier"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_selected_cache_residency_tokens_total");
                 let eligible_oracle_cached_tokens_total = metrics
                     .create_intcounter(
                         router::ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL,
@@ -945,6 +956,27 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_eligible_oracle_cached_tokens_total");
+                let eligible_oracle_cache_residency_tokens_total = metrics
+                    .create_intcountervec(
+                        router::ELIGIBLE_ORACLE_CACHE_RESIDENCY_TOKENS_TOTAL,
+                        "Raw KV-residency tokens on the best eligible-cache worker, by storage tier",
+                        &["tier"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_eligible_oracle_cache_residency_tokens_total");
+                let eligible_oracle_cache_residency_missed_tokens_total = metrics
+                    .create_intcountervec(
+                        router::ELIGIBLE_ORACLE_CACHE_RESIDENCY_MISSED_TOKENS_TOTAL,
+                        "KV-residency tokens available on the best eligible-cache worker but absent on the selected worker, by storage tier",
+                        &["tier"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_eligible_oracle_cache_residency_missed_tokens_total");
+                for tier in ["hbm", "cpu"] {
+                    selected_cache_residency_tokens_total.with_label_values(&[tier]);
+                    eligible_oracle_cache_residency_tokens_total.with_label_values(&[tier]);
+                    eligible_oracle_cache_residency_missed_tokens_total.with_label_values(&[tier]);
+                }
                 let resident_oracle_cached_tokens_total = metrics
                     .create_intcounter(
                         router::RESIDENT_ORACLE_CACHED_TOKENS_TOTAL,
@@ -985,7 +1017,10 @@ impl RouterRequestMetrics {
                     kv_hit_rate,
                     input_tokens_total,
                     selected_cached_tokens_total,
+                    selected_cache_residency_tokens_total,
                     eligible_oracle_cached_tokens_total,
+                    eligible_oracle_cache_residency_tokens_total,
+                    eligible_oracle_cache_residency_missed_tokens_total,
                     resident_oracle_cached_tokens_total,
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
