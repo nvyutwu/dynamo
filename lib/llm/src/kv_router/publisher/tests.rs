@@ -17,7 +17,7 @@ use std::time::Duration;
 #[cfg(test)]
 mod test_event_processing {
     use super::*;
-    use dynamo_kv_router::protocols::{BlockHashOptions, compute_block_hash_for_seq};
+    use dynamo_kv_router::protocols::{BlockHashOptions, StorageTier, compute_block_hash_for_seq};
     use dynamo_kv_router::zmq_wire::StoredBlockOptions;
 
     #[test]
@@ -149,6 +149,8 @@ mod test_event_processing {
 
         let blocks = create_stored_blocks(
             kv_block_size,
+            kv_block_size,
+            StorageTier::Device,
             &token_ids,
             &num_block_tokens,
             &block_hashes,
@@ -166,6 +168,8 @@ mod test_event_processing {
 
         let salted_blocks = create_stored_blocks(
             kv_block_size,
+            kv_block_size,
+            StorageTier::Device,
             &token_ids,
             &num_block_tokens,
             &block_hashes,
@@ -202,6 +206,8 @@ mod test_event_processing {
 
         let blocks = create_stored_blocks(
             kv_block_size,
+            kv_block_size,
+            StorageTier::Device,
             &token_ids,
             &num_block_tokens,
             &block_hashes,
@@ -242,6 +248,7 @@ mod test_event_processing {
         let out = convert_event(
             raw_evt,
             42,
+            kv_block_size,
             kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &Arc::new(AtomicU32::new(0)),
@@ -290,6 +297,7 @@ mod test_event_processing {
             base_evt,
             1,
             kv_block_size,
+            kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &wc,
             None,
@@ -298,6 +306,7 @@ mod test_event_processing {
         let lora_out = convert_event(
             lora_evt,
             2,
+            kv_block_size,
             kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &wc,
@@ -358,6 +367,7 @@ mod test_event_processing {
             evt1,
             1,
             kv_block_size,
+            kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &wc,
             None,
@@ -366,6 +376,7 @@ mod test_event_processing {
         let out2 = convert_event(
             evt2,
             2,
+            kv_block_size,
             kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &wc,
@@ -457,6 +468,7 @@ mod test_event_processing {
             raw_evt,
             7,
             kv_block_size,
+            kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &Arc::new(AtomicU32::new(0)),
             None,
@@ -473,6 +485,7 @@ mod test_event_processing {
         let out = convert_event(
             raw_evt,
             1,
+            kv_block_size,
             kv_block_size,
             WorkerWithDpRank::from_worker_id(1),
             &Arc::new(AtomicU32::new(0)),
