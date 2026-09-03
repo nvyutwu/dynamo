@@ -28,7 +28,7 @@ use super::queue_admission::{
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
     KvSchedulerError, OverloadedWorkerProvider, SchedulingContext, SchedulingRequest,
-    SchedulingResponse,
+    SchedulingResponse, oracle_cached_entry,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerWithDpRank,
@@ -1430,11 +1430,20 @@ impl<
                     let selected_worker_tiers = request
                         .overlap
                         .selected_worker_tiers(selection.worker, config);
-                    (selection, selected_worker_tiers)
+                    let eligible_oracle_tiers =
+                        oracle_cached_entry(&workers, &request, eligibility).and_then(
+                            |(worker, _)| {
+                                workers.get(&worker.worker_id).map(|config| {
+                                    request.overlap.selected_worker_tiers(worker, config)
+                                })
+                            },
+                        )
+                        .unwrap_or_default();
+                    (selection, selected_worker_tiers, eligible_oracle_tiers)
                 })
         };
 
-        let (selection, selected_worker_tiers) = match selection {
+        let (selection, selected_worker_tiers, eligible_oracle_tiers) = match selection {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scheduling failed: {e}");
@@ -1463,6 +1472,7 @@ impl<
             eligible_oracle_cached_tokens: selection.eligible_oracle_cached_tokens,
             resident_oracle_cached_tokens: selection.resident_oracle_cached_tokens,
             selected_worker_tiers,
+            eligible_oracle_tiers,
             request_progress,
             lifecycle_lease: None,
         };

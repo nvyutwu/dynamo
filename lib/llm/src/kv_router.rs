@@ -17,7 +17,8 @@ use dynamo_kv_router::{
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, RequestLifecycleLease,
         RequestProgressUpdater, ScheduleMode, ScheduleRequest, TieredOverlapRefresher,
-        effective_prefill_tokens, overlap::cache_hit_estimates_from_tiered_matches,
+        SelectedWorkerTierSnapshot, effective_prefill_tokens,
+        overlap::cache_hit_estimates_from_tiered_matches,
     },
 };
 use dynamo_runtime::{
@@ -79,6 +80,8 @@ pub enum FindBestMatchOutcome {
         cached_tokens: usize,
         eligible_oracle_cached_tokens: usize,
         resident_oracle_cached_tokens: usize,
+        selected_worker_tiers: SelectedWorkerTierSnapshot,
+        eligible_oracle_tiers: SelectedWorkerTierSnapshot,
         routing_hashes: Option<RoutingDecisionHashes>,
     },
     QueueRejected {
@@ -763,6 +766,8 @@ where
                 cached_tokens: response.cached_tokens,
                 eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
                 resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
+                selected_worker_tiers: response.selected_worker_tiers,
+                eligible_oracle_tiers: response.eligible_oracle_tiers,
                 routing_hashes,
             },
             lifecycle,

@@ -3,7 +3,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
+use dynamo_kv_router::{
+    protocols::{TokensWithHashes, WorkerWithDpRank},
+    scheduling::SelectedWorkerTierSnapshot,
+};
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
@@ -39,6 +42,57 @@ use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
+const CACHE_RESIDENCY_TIERS: [&str; 2] = ["hbm", "cpu"];
+
+fn cache_residency_tokens(
+    snapshot: &SelectedWorkerTierSnapshot,
+    input_tokens: usize,
+    block_size: u32,
+) -> [u64; 2] {
+    let tokens_for_blocks = |blocks: u32| {
+        u64::from(blocks)
+            .saturating_mul(u64::from(block_size))
+            .min(input_tokens as u64)
+    };
+    let hbm_tokens = tokens_for_blocks(snapshot.gpu_blocks);
+    let hbm_and_cpu_tokens = tokens_for_blocks(snapshot.host_pinned_blocks);
+
+    // host_pinned_blocks is cumulative with gpu_blocks. The CPU value is the
+    // host-only extension of the matched prefix, not a double-count of HBM.
+    [hbm_tokens, hbm_and_cpu_tokens.saturating_sub(hbm_tokens)]
+}
+
+fn record_cache_residency_metrics(
+    metrics: &RouterRequestMetrics,
+    selected: &SelectedWorkerTierSnapshot,
+    eligible_oracle: &SelectedWorkerTierSnapshot,
+    input_tokens: usize,
+    block_size: u32,
+) {
+    let selected_tokens = cache_residency_tokens(selected, input_tokens, block_size);
+    let eligible_oracle_tokens =
+        cache_residency_tokens(eligible_oracle, input_tokens, block_size);
+
+    for ((tier, selected), eligible_oracle) in CACHE_RESIDENCY_TIERS
+        .iter()
+        .copied()
+        .zip(selected_tokens)
+        .zip(eligible_oracle_tokens)
+    {
+        metrics
+            .selected_cache_residency_tokens_total
+            .with_label_values(&[tier])
+            .inc_by(selected);
+        metrics
+            .eligible_oracle_cache_residency_tokens_total
+            .with_label_values(&[tier])
+            .inc_by(eligible_oracle);
+        metrics
+            .eligible_oracle_cache_residency_missed_tokens_total
+            .with_label_values(&[tier])
+            .inc_by(eligible_oracle.saturating_sub(selected));
+    }
+}
 
 fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
@@ -333,8 +387,15 @@ impl KvPushRouter {
                 .inc_by(
                     selection
                         .resident_oracle_cached_tokens
-                        .min(routing_parts.token_ids.len()) as u64,
+                    .min(routing_parts.token_ids.len()) as u64,
                 );
+            record_cache_residency_metrics(
+                guard.request_metrics(),
+                &selection.selected_worker_tiers,
+                &selection.eligible_oracle_tiers,
+                routing_parts.token_ids.len(),
+                self.chooser.block_size(),
+            );
             guard
                 .request_metrics()
                 .input_sequence_tokens
@@ -576,8 +637,15 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 .inc_by(
                     selection
                         .resident_oracle_cached_tokens
-                        .min(routing_parts.token_ids.len()) as u64,
+                    .min(routing_parts.token_ids.len()) as u64,
                 );
+            record_cache_residency_metrics(
+                &self.request_metrics,
+                &selection.selected_worker_tiers,
+                &selection.eligible_oracle_tiers,
+                routing_parts.token_ids.len(),
+                self.chooser.block_size(),
+            );
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker
@@ -785,6 +853,19 @@ mod tests {
 
         output.finish_reason = Some(FinishReason::Length);
         assert!(!response_item_failed(&Annotated::from_data(output)));
+    }
+
+    #[test]
+    fn cache_residency_counts_cpu_only_beyond_hbm() {
+        let snapshot = SelectedWorkerTierSnapshot {
+            gpu_blocks: 2,
+            host_pinned_blocks: 4,
+            ..Default::default()
+        };
+
+        // Four 32-token blocks cover 128 tokens, but the request ends at 100.
+        // The final 36 tokens are CPU-only after the 64-token HBM prefix.
+        assert_eq!(cache_residency_tokens(&snapshot, 100, 32), [64, 36]);
     }
 
     #[tokio::test]

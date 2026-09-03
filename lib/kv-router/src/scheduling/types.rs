@@ -78,6 +78,7 @@ pub struct SchedulingResponse {
     pub eligible_oracle_cached_tokens: usize,
     pub resident_oracle_cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    pub eligible_oracle_tiers: SelectedWorkerTierSnapshot,
     pub request_progress: Option<RequestProgressUpdater>,
     pub lifecycle_lease: Option<super::queue::RequestLifecycleLease>,
 }
@@ -245,6 +246,31 @@ impl<'a, C: WorkerConfigLike> SchedulingContext<'a, C> {
                 .unwrap_or(0),
         }
     }
+}
+
+pub(crate) fn oracle_cached_entry<C: WorkerConfigLike>(
+    workers: &HashMap<WorkerId, C>,
+    request: &SchedulingRequest,
+    eligibility: RoutingEligibility<'_>,
+) -> Option<(WorkerWithDpRank, usize)> {
+    if let Some(worker) = eligibility.pinned_worker() {
+        return eligibility
+            .validate_worker_rank(workers, worker)
+            .ok()
+            .map(|_| (worker, request.effective_cached_tokens_for(worker)));
+    }
+
+    request
+        .overlap
+        .effective_cached_tokens
+        .iter()
+        .filter(|(worker, _)| {
+            workers
+                .get(&worker.worker_id)
+                .is_some_and(|config| eligibility.allows_worker(worker.worker_id, config))
+        })
+        .map(|(worker, cached_tokens)| (*worker, *cached_tokens))
+        .max_by_key(|(worker, cached_tokens)| (*cached_tokens, *worker))
 }
 
 impl SchedulingRequest {

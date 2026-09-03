@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use super::config::KvRouterConfig;
 use super::filter::{RoutingEligibility, WorkerEligibilityError};
-use super::types::{KvSchedulerError, SchedulingRequest};
+use super::types::{KvSchedulerError, SchedulingRequest, oracle_cached_entry};
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 
 /// A trait that users can implement to define custom selection logic.
@@ -21,32 +21,6 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         eligibility: RoutingEligibility<'_>,
         block_size: u32,
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
-}
-
-fn oracle_cached_tokens<C: WorkerConfigLike>(
-    workers: &HashMap<WorkerId, C>,
-    request: &SchedulingRequest,
-    eligibility: RoutingEligibility<'_>,
-) -> usize {
-    if let Some(worker) = eligibility.pinned_worker() {
-        return eligibility
-            .validate_worker_rank(workers, worker)
-            .ok()
-            .map_or(0, |_| request.effective_cached_tokens_for(worker));
-    }
-
-    request
-        .overlap
-        .effective_cached_tokens
-        .iter()
-        .filter(|(worker, _)| {
-            workers
-                .get(&worker.worker_id)
-                .is_some_and(|config| eligibility.allows_worker(worker.worker_id, config))
-        })
-        .map(|(_, cached_tokens)| *cached_tokens)
-        .max()
-        .unwrap_or(0)
 }
 
 /// Helper function for softmax sampling.
@@ -295,8 +269,12 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
         let request_blocks = request.request_blocks(block_size);
         let resident_oracle_cached_tokens =
-            oracle_cached_tokens(workers, request, request.eligibility());
-        let eligible_oracle_cached_tokens = oracle_cached_tokens(workers, request, eligibility);
+            oracle_cached_entry(workers, request, request.eligibility())
+                .map(|(_, cached_tokens)| cached_tokens)
+                .unwrap_or(0);
+        let eligible_oracle_cached_tokens = oracle_cached_entry(workers, request, eligibility)
+            .map(|(_, cached_tokens)| cached_tokens)
+            .unwrap_or(0);
 
         let weights = LogitWeights {
             overlap_score_credit: request
@@ -862,6 +840,11 @@ mod tests {
             .extend([(worker0, 64), (worker1, 16)]);
         request.worker_loads =
             worker_loads_with_active_decode(FxHashMap::from_iter([(worker0, 10)]));
+
+        assert_eq!(
+            oracle_cached_entry(&workers, &request, request.eligibility()),
+            Some((worker0, 64))
+        );
 
         let result = selector
             .select_worker(&workers, &request, request.eligibility(), 16)

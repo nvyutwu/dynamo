@@ -639,9 +639,21 @@ pub mod router {
     /// Predicted cached tokens on the worker selected by the router
     pub const SELECTED_CACHED_TOKENS_TOTAL: &str = "router_selected_cached_tokens_total";
 
+    /// Raw KV-residency tokens on the worker selected by the router, by storage tier
+    pub const SELECTED_CACHE_RESIDENCY_TOKENS_TOTAL: &str =
+        "router_selected_cache_residency_tokens_total";
+
     /// Best cached tokens among workers eligible after overload filtering
     pub const ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL: &str =
         "router_eligible_oracle_cached_tokens_total";
+
+    /// Raw KV-residency tokens on the best eligible-cache worker, by storage tier
+    pub const ELIGIBLE_ORACLE_CACHE_RESIDENCY_TOKENS_TOTAL: &str =
+        "router_eligible_oracle_cache_residency_tokens_total";
+
+    /// KV-residency tokens available on the best eligible-cache worker but absent on the selected worker, by storage tier
+    pub const ELIGIBLE_ORACLE_CACHE_RESIDENCY_MISSED_TOKENS_TOTAL: &str =
+        "router_eligible_oracle_cache_residency_missed_tokens_total";
 
     /// Best cached tokens among allowed workers before overload filtering
     pub const RESIDENT_ORACLE_CACHED_TOKENS_TOTAL: &str =

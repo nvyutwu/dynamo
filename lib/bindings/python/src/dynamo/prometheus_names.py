@@ -381,8 +381,14 @@ class router:
     INPUT_TOKENS_TOTAL = "router_input_tokens_total"
     # Predicted cached tokens on the worker selected by the router
     SELECTED_CACHED_TOKENS_TOTAL = "router_selected_cached_tokens_total"
+    # Raw KV-residency tokens on the worker selected by the router, by storage tier
+    SELECTED_CACHE_RESIDENCY_TOKENS_TOTAL = "router_selected_cache_residency_tokens_total"
     # Best cached tokens among workers eligible after overload filtering
     ELIGIBLE_ORACLE_CACHED_TOKENS_TOTAL = "router_eligible_oracle_cached_tokens_total"
+    # Raw KV-residency tokens on the best eligible-cache worker, by storage tier
+    ELIGIBLE_ORACLE_CACHE_RESIDENCY_TOKENS_TOTAL = "router_eligible_oracle_cache_residency_tokens_total"
+    # KV-residency tokens available on the best eligible-cache worker but absent on the selected worker, by storage tier
+    ELIGIBLE_ORACLE_CACHE_RESIDENCY_MISSED_TOKENS_TOTAL = "router_eligible_oracle_cache_residency_missed_tokens_total"
     # Best cached tokens among allowed workers before overload filtering
     RESIDENT_ORACLE_CACHED_TOKENS_TOTAL = "router_resident_oracle_cached_tokens_total"
     # Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
