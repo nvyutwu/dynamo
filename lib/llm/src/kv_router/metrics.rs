@@ -954,7 +954,9 @@ impl RouterRequestMetrics {
                     .create_intcountervec(
                         router::SELECTED_CACHE_RESIDENCY_TOKENS_TOTAL,
                         "Raw KV-residency tokens on the worker selected by the router, by storage tier",
-                        &["tier"],
+                        // `tier` is an NVCF/OTel resource label for the service class (for
+                        // example, `bronze`) and overwrites a metric label with the same name.
+                        &["cache_tier"],
                         extra_labels,
                     )
                     .expect("failed to create router_selected_cache_residency_tokens_total");
@@ -969,7 +971,7 @@ impl RouterRequestMetrics {
                     .create_intcountervec(
                         router::ELIGIBLE_ORACLE_CACHE_RESIDENCY_TOKENS_TOTAL,
                         "Raw KV-residency tokens on the best eligible-cache worker, by storage tier",
-                        &["tier"],
+                        &["cache_tier"],
                         extra_labels,
                     )
                     .expect("failed to create router_eligible_oracle_cache_residency_tokens_total");
@@ -977,7 +979,7 @@ impl RouterRequestMetrics {
                     .create_intcountervec(
                         router::ELIGIBLE_ORACLE_CACHE_RESIDENCY_MISSED_TOKENS_TOTAL,
                         "KV-residency tokens available on the best eligible-cache worker but absent on the selected worker, by storage tier",
-                        &["tier"],
+                        &["cache_tier"],
                         extra_labels,
                     )
                     .expect("failed to create router_eligible_oracle_cache_residency_missed_tokens_total");
