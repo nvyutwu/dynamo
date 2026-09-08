@@ -2712,8 +2712,21 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             request_output, "num_external_lookup_tokens", None
         )
         values = (local_hits, external_hits, external_lookups)
-        if prompt_tokens is None or any(not isinstance(value, int) for value in values):
+        if prompt_tokens is None:
             return {"complete": False}
+
+        # Newer vLLM integrations preserve the scheduler's local/external
+        # prefill breakdown on RequestOutput. Older vLLM versions expose only
+        # num_cached_tokens. Keep the funnel complete on those versions while
+        # conservatively collapsing F4 and F5 to the aggregate reused-token
+        # count; the precise tier split is unavailable there.
+        if any(not isinstance(value, int) for value in values):
+            aggregate_hits = getattr(request_output, "num_cached_tokens", None)
+            if not isinstance(aggregate_hits, int):
+                return {"complete": False}
+            local_hits = aggregate_hits
+            external_hits = 0
+            external_lookups = 0
         return {
             "complete": True,
             "prompt_tokens": len(prompt_tokens),

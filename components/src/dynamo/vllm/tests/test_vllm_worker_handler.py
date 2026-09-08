@@ -146,6 +146,46 @@ def _make_engine_response(request_id: str = "req-1", finished: bool = True):
     return resp
 
 
+class TestCacheLossEngineData:
+    def test_preserves_precise_local_and_external_breakdown(self):
+        request_output = SimpleNamespace(
+            prompt_token_ids=list(range(128)),
+            num_cached_tokens=96,
+            num_local_cached_tokens=64,
+            num_external_cached_tokens=32,
+            num_external_lookup_tokens=48,
+        )
+
+        assert mod.BaseWorkerHandler._cache_loss_engine_data(request_output) == {
+            "complete": True,
+            "prompt_tokens": 128,
+            "gpu_hit_tokens": 64,
+            "cpu_hit_tokens": 32,
+            "cpu_lookup_tokens": 48,
+        }
+
+    def test_legacy_request_output_uses_aggregate_cache_hits(self):
+        request_output = SimpleNamespace(
+            prompt_token_ids=list(range(128)),
+            num_cached_tokens=96,
+        )
+
+        assert mod.BaseWorkerHandler._cache_loss_engine_data(request_output) == {
+            "complete": True,
+            "prompt_tokens": 128,
+            "gpu_hit_tokens": 96,
+            "cpu_hit_tokens": 0,
+            "cpu_lookup_tokens": 0,
+        }
+
+    def test_missing_all_cache_accounting_is_incomplete(self):
+        request_output = SimpleNamespace(prompt_token_ids=[1, 2, 3])
+
+        assert mod.BaseWorkerHandler._cache_loss_engine_data(request_output) == {
+            "complete": False
+        }
+
+
 @pytest.mark.asyncio
 async def test_clear_kv_blocks_resets_vllm_external_cache():
     handler = _make_handler()
