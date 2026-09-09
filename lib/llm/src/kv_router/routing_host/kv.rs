@@ -354,6 +354,39 @@ where
             ),
         };
 
+        let cache_loss_tracking = (!is_query_only)
+            .then(|| self.cache_history.as_ref())
+            .flatten()
+            .map(|history| {
+                let tracked = CacheHistoryRequest::new(
+                    routing_parts.token_ids.to_vec(),
+                    routing_parts.block_mm_infos.map(ToOwned::to_owned),
+                    request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.lora_name.clone()),
+                    request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.cache_namespace.clone()),
+                    chooser.block_size(),
+                    chooser.is_eagle(),
+                );
+                let prompt_tokens = routing_parts.token_ids.len() as u64;
+                CacheLossTracking::new(
+                    prompt_tokens,
+                    tracked.previously_computed_tokens(&history.lock()),
+                    selection.eligible_oracle_cached_tokens.min(routing_parts.token_ids.len())
+                        as u64,
+                    selection.cached_tokens.min(routing_parts.token_ids.len()) as u64,
+                    Arc::clone(history),
+                    tracked,
+                )
+            });
+        if let Some(tracking) = cache_loss_tracking {
+            guard.set_cache_loss(tracking);
+        }
+
         let record_result: Result<(), Error> = async {
             if !is_query_only && chooser.indexer().records_routing_decisions() {
                 let worker = selected_worker;
@@ -416,6 +449,7 @@ where
             }
 
             if let Some(ref tracker) = request.tracker {
+                record_routing_decision_trace(tracker, selection, routing_parts.token_ids.len(), chooser.block_size());
                 let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
                 tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
@@ -429,6 +463,38 @@ where
                     guard.request_metrics().kv_hit_rate.observe(hit_rate);
                 }
             }
+            let input_tokens = routing_parts.token_ids.len() as u64;
+            guard
+                .request_metrics()
+                .input_tokens_total
+                .inc_by(input_tokens);
+            guard
+                .request_metrics()
+                .selected_cached_tokens_total
+                .inc_by(selection.cached_tokens.min(routing_parts.token_ids.len()) as u64);
+            guard
+                .request_metrics()
+                .eligible_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .eligible_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
+                );
+            guard
+                .request_metrics()
+                .resident_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .resident_oracle_cached_tokens
+                    .min(routing_parts.token_ids.len()) as u64,
+                );
+            record_cache_residency_metrics(
+                guard.request_metrics(),
+                &selection.selected_worker_tiers,
+                &selection.eligible_oracle_tiers,
+                routing_parts.token_ids.len(),
+                chooser.block_size(),
+            );
             guard
                 .request_metrics()
                 .input_sequence_tokens

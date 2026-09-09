@@ -29,6 +29,35 @@ pub const WORKER_TYPE_PREFILL: &str = "prefill";
 pub const WORKER_TYPE_DECODE: &str = "decode";
 const UNSET_DP_RANK_LABEL: &str = "none";
 
+/// Opt-in, bounded explanation of a v44 KV-router decision.
+///
+/// The record contains only numerical router state. `cpu_ram_only_blocks` is
+/// the host-pinned prefix beyond the HBM-resident prefix, so it is the portion
+/// that a CPU-RAM-only transfer mechanism could potentially reuse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingDecisionTrace {
+    pub schema: String,
+    pub candidate_scope: String,
+    pub block_size: u32,
+    pub input_tokens: usize,
+    pub selected: RoutingDecisionCandidate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eligible_oracle: Option<RoutingDecisionCandidate>,
+}
+
+/// Tiered cache snapshot for one router candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingDecisionCandidate {
+    pub worker_id: u64,
+    pub dp_rank: u32,
+    pub effective_overlap_blocks: f64,
+    pub cached_tokens: usize,
+    pub hbm_blocks: u32,
+    pub cpu_ram_cumulative_blocks: u32,
+    pub cpu_ram_only_blocks: u32,
+    pub disk_cumulative_blocks: u32,
+}
+
 /// Phase of the request in disaggregated serving.
 ///
 /// Used to determine which worker ID field to record when routing.
@@ -179,6 +208,7 @@ pub struct RequestTracker {
     /// re-tokenizing. Lives here rather than on `routing_data` because the preprocessor
     /// drains `routing_data` before the delta generator runs. First-write-wins.
     external_query_token_ids: OnceLock<Vec<u32>>,
+    routing_decision_trace: OnceLock<RoutingDecisionTrace>,
 
     /// Frontend-rendered prompt tokens retained only for an explicit
     /// `nvext.extra_fields=["prompt_token_ids"]` response request.
@@ -243,6 +273,7 @@ impl RequestTracker {
             prefill_complete_time: OnceLock::new(),
             external_timing: OnceLock::new(),
             external_query_token_ids: OnceLock::new(),
+            routing_decision_trace: OnceLock::new(),
             prompt_token_ids: OnceLock::new(),
         }
     }
@@ -514,6 +545,15 @@ impl RequestTracker {
     /// Get the router scheduler queue depth recorded at routing time.
     pub fn router_queue_depth(&self) -> Option<usize> {
         self.router_queue_depth.get().copied()
+    }
+
+    /// Record the first router decision observed for this request.
+    pub fn record_routing_decision_trace(&self, trace: RoutingDecisionTrace) {
+        let _ = self.routing_decision_trace.set(trace);
+    }
+
+    pub fn routing_decision_trace(&self) -> Option<RoutingDecisionTrace> {
+        self.routing_decision_trace.get().cloned()
     }
 
     /// Record when the prefill result was received by the router.
@@ -861,6 +901,50 @@ mod tests {
 
         let timing = tracker.get_timing_info();
         assert_eq!(timing.router_queue_depth, Some(42));
+    }
+
+    #[test]
+    fn routing_decision_trace_is_first_write_wins() {
+        let tracker = RequestTracker::new();
+        let trace = RoutingDecisionTrace {
+            schema: "dynamo.router.decision.v44.v1".to_string(),
+            candidate_scope: "selected_and_best_eligible_cache_holder".to_string(),
+            block_size: 16,
+            input_tokens: 64,
+            selected: RoutingDecisionCandidate {
+                worker_id: 1,
+                dp_rank: 0,
+                effective_overlap_blocks: 2.0,
+                cached_tokens: 32,
+                hbm_blocks: 1,
+                cpu_ram_cumulative_blocks: 2,
+                cpu_ram_only_blocks: 1,
+                disk_cumulative_blocks: 2,
+            },
+            eligible_oracle: None,
+        };
+        tracker.record_routing_decision_trace(trace);
+        tracker.record_routing_decision_trace(RoutingDecisionTrace {
+            schema: "ignored".to_string(),
+            candidate_scope: "ignored".to_string(),
+            block_size: 1,
+            input_tokens: 1,
+            selected: RoutingDecisionCandidate {
+                worker_id: 2,
+                dp_rank: 0,
+                effective_overlap_blocks: 0.0,
+                cached_tokens: 0,
+                hbm_blocks: 0,
+                cpu_ram_cumulative_blocks: 0,
+                cpu_ram_only_blocks: 0,
+                disk_cumulative_blocks: 0,
+            },
+            eligible_oracle: None,
+        });
+
+        let trace = tracker.routing_decision_trace().unwrap();
+        assert_eq!(trace.selected.worker_id, 1);
+        assert_eq!(trace.selected.cpu_ram_only_blocks, 1);
     }
 
     #[test]

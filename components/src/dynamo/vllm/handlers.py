@@ -114,6 +114,10 @@ from .state_agent import state_agent_settings
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+CACHE_LOSS_FUNNEL_ENABLED: Final[bool] = os.environ.get(
+    "DYN_CACHE_LOSS_FUNNEL_ENABLED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Marker set by the Rust conditional-disagg bypass path. When present on a
 # DECODE-mode worker, the request runs as local prefill+decode instead of
 # expecting KV-transfer metadata from an upstream prefill worker.
@@ -3177,6 +3181,41 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         }
 
     @staticmethod
+    def _cache_loss_engine_data(request_output: RequestOutput) -> Dict[str, Any]:
+        """Return final cache counters for the router F0-F5 funnel."""
+        prompt_tokens = getattr(request_output, "prompt_token_ids", None)
+        local_hits = getattr(request_output, "num_local_cached_tokens", None)
+        external_hits = getattr(request_output, "num_external_cached_tokens", None)
+        external_lookups = getattr(
+            request_output, "num_external_lookup_tokens", None
+        )
+        values = (local_hits, external_hits, external_lookups)
+        if prompt_tokens is None:
+            return {"complete": False}
+
+        # Newer vLLM integrations preserve the scheduler's local/external
+        # prefill breakdown on RequestOutput. Older vLLM versions expose only
+        # num_cached_tokens. Keep the funnel complete on those versions while
+        # conservatively collapsing F4 and F5 to the aggregate reused-token
+        # count; the precise tier split is unavailable there.
+        tier_breakdown_complete = all(type(value) is int and value >= 0 for value in values)
+        if not tier_breakdown_complete:
+            aggregate_hits = getattr(request_output, "num_cached_tokens", None)
+            if type(aggregate_hits) is not int or aggregate_hits < 0:
+                return {"complete": False}
+            local_hits = aggregate_hits
+            external_hits = 0
+            external_lookups = 0
+        return {
+            "complete": True,
+            "prompt_tokens": len(prompt_tokens),
+            "tier_breakdown_complete": tier_breakdown_complete,
+            "gpu_hit_tokens": local_hits,
+            "cpu_hit_tokens": external_hits,
+            "cpu_lookup_tokens": external_lookups,
+        }
+
+    @staticmethod
     def _extract_logprobs(
         output, num_output_tokens_so_far: int, tokenizer=None
     ) -> tuple[list[float] | None, list[list[dict]] | None]:
@@ -3344,6 +3383,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             request_output=res,
                             completion_token_counts=total_output_tokens_by_index,
                         )
+                        if CACHE_LOSS_FUNNEL_ENABLED:
+                            out.setdefault("engine_data", {})["cache_loss"] = (
+                                BaseWorkerHandler._cache_loss_engine_data(res)
+                            )
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(
                                 out, prompt_logprobs_payload
@@ -3868,6 +3911,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             chunk["usage"] = BaseWorkerHandler._build_completion_usage(
                                 request_output=res,
                             )
+                            if CACHE_LOSS_FUNNEL_ENABLED:
+                                chunk.setdefault("engine_data", {})["cache_loss"] = (
+                                    BaseWorkerHandler._cache_loss_engine_data(res)
+                                )
 
                         yield chunk
                         previous_text_per_choice[output_idx] = output.text
@@ -4048,6 +4095,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         request_output=res,
                     ),
                 }
+                if CACHE_LOSS_FUNNEL_ENABLED:
+                    output.setdefault("engine_data", {})["cache_loss"] = (
+                        BaseWorkerHandler._cache_loss_engine_data(res)
+                    )
 
                 # Log prefill completion with LoRA info
                 self._log_with_lora_context(

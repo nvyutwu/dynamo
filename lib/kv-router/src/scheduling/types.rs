@@ -135,6 +135,11 @@ pub struct SchedulingResponse {
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    pub eligible_oracle_cached_tokens: usize,
+    pub resident_oracle_cached_tokens: usize,
+    pub eligible_oracle_worker: Option<WorkerWithDpRank>,
+    pub eligible_oracle_tiers: SelectedWorkerTierSnapshot,
+
     pub target_cached_prefix_blocks: u32,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub potential_decode_blocks: usize,

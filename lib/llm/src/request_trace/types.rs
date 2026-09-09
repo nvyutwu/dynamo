@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::protocols::common::extensions::AgentContext;
+use crate::protocols::common::timing::RoutingDecisionTrace;
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
@@ -116,6 +117,8 @@ pub struct RequestTraceMetrics {
     pub replay: Option<RequestReplayMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason_metadata: Option<FinishReasonMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_decision: Option<RoutingDecisionTrace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,6 +342,7 @@ mod tests {
                     input_sequence_hashes: vec![11, 22],
                 }),
                 finish_reason_metadata: None,
+                routing_decision: None,
             }),
             tool: None,
             payload: None,

@@ -55,6 +55,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod cache_history;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
@@ -349,6 +350,11 @@ pub enum FindBestMatchOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        eligible_oracle_cached_tokens: usize,
+        resident_oracle_cached_tokens: usize,
+        eligible_oracle_worker: Option<WorkerWithDpRank>,
+        eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+        selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
@@ -368,6 +374,11 @@ pub enum FindBestMatchAdvisoryOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        eligible_oracle_cached_tokens: usize,
+        resident_oracle_cached_tokens: usize,
+        eligible_oracle_worker: Option<WorkerWithDpRank>,
+        eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+        selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
         potential_decode_blocks: u64,
         selected_worker_load: scheduling::AdvisoryWorkerLoad,
         routing_hashes: Option<RoutingDecisionHashes>,
@@ -1785,6 +1796,12 @@ where
                         overlap_blocks: response.effective_overlap_blocks.round() as u32,
                         effective_overlap_blocks: response.effective_overlap_blocks,
                         cached_tokens: response.cached_tokens,
+                        eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
+                        resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
+                        eligible_oracle_worker: response.eligible_oracle_worker,
+                        eligible_oracle_tiers: response.eligible_oracle_tiers,
+                        selected_worker_tiers: response.selected_worker_tiers,
+
                         potential_decode_blocks: response.potential_decode_blocks as u64,
                         routing_hashes,
                         kv_hint,
@@ -1798,6 +1815,12 @@ where
                     overlap_blocks: response.effective_overlap_blocks.round() as u32,
                     effective_overlap_blocks: response.effective_overlap_blocks,
                     cached_tokens: response.cached_tokens,
+                        eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
+                        resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
+                        eligible_oracle_worker: response.eligible_oracle_worker,
+                        eligible_oracle_tiers: response.eligible_oracle_tiers,
+                        selected_worker_tiers: response.selected_worker_tiers,
+
                     potential_decode_blocks: response.potential_decode_blocks as u64,
                     selected_worker_load: selected_worker_load
                         .expect("without-admission selection returns advisory load"),

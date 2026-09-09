@@ -9,6 +9,7 @@ use std::{
 };
 
 use dynamo_kv_router::{
+    scheduling::overlap::SelectedWorkerTierSnapshot,
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
     selector::{WorkerInputs, WorkerSelector},
 };
@@ -29,7 +30,7 @@ use tracing::Instrument;
 
 use crate::{
     kv_router::{
-        KvRouter, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector,
+        KvRouter, cache_history::{CacheHistory, CacheHistoryRequest}, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector,
         to_worker_selection_session_context,
     },
     local_model::runtime_config::ModelRuntimeConfig,
@@ -39,7 +40,7 @@ use crate::{
         FinishReason,
         extensions::SessionAffinityId,
         llm_backend::LLMEngineOutput,
-        timing::{RequestPhase, RoutingData, WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL},
+        timing::{RequestTracker, RoutingDecisionCandidate, RoutingDecisionTrace, RequestPhase, RoutingData, WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL},
     },
     session_affinity::{
         AffinityAcquire, AffinityCoordinator, AffinityTarget, SessionAffinityMode, affinity_id,
@@ -59,10 +60,120 @@ use cancellation::{CleanupBudget, DispatchCancellation, StagedKv, await_with_cle
 use kv_selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 use occupancy::HostedOccupancy;
 pub(crate) use request_guard::prompt_private_blocks;
-use request_guard::{KvRequestCleanup, LoraLoadGuard, RequestGuard};
+use request_guard::{CacheLossTracking, KvRequestCleanup, LoraLoadGuard, RequestGuard};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
+
+const CACHE_RESIDENCY_TIERS: [&str; 2] = ["hbm", "cpu"];
+
+fn router_decision_trace_enabled() -> bool {
+    std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn routing_decision_candidate(
+    worker: WorkerWithDpRank,
+    effective_overlap_blocks: f64,
+    cached_tokens: usize,
+    tiers: &SelectedWorkerTierSnapshot,
+) -> RoutingDecisionCandidate {
+    RoutingDecisionCandidate {
+        worker_id: worker.worker_id,
+        dp_rank: worker.dp_rank,
+        effective_overlap_blocks,
+        cached_tokens,
+        hbm_blocks: tiers.gpu_blocks,
+        cpu_ram_cumulative_blocks: tiers.host_pinned_blocks,
+        cpu_ram_only_blocks: tiers.host_pinned_blocks.saturating_sub(tiers.gpu_blocks),
+        disk_cumulative_blocks: tiers.disk_blocks,
+    }
+}
+
+fn record_routing_decision_trace(
+    tracker: &RequestTracker,
+    selection: &WorkerSelection,
+    input_tokens: usize,
+    block_size: u32,
+) {
+    if !router_decision_trace_enabled() {
+        return;
+    }
+    let selected_worker = WorkerWithDpRank::new(selection.worker.worker_id, selection.worker.dp_rank);
+    let eligible_oracle = selection.eligible_oracle_worker.map(|worker| {
+        routing_decision_candidate(
+            worker,
+            selection.eligible_oracle_cached_tokens as f64 / f64::from(block_size.max(1)),
+            selection.eligible_oracle_cached_tokens,
+            &selection.eligible_oracle_tiers,
+        )
+    });
+    tracker.record_routing_decision_trace(RoutingDecisionTrace {
+        schema: "dynamo.router.decision.v44.v1".to_string(),
+        candidate_scope: "selected_and_best_eligible_cache_holder".to_string(),
+        block_size,
+        input_tokens,
+        selected: routing_decision_candidate(
+            selected_worker,
+            selection.effective_overlap_blocks,
+            selection.cached_tokens,
+            &selection.selected_worker_tiers,
+        ),
+        eligible_oracle,
+    });
+}
+
+fn cache_residency_tokens(
+    snapshot: &SelectedWorkerTierSnapshot,
+    input_tokens: usize,
+    block_size: u32,
+) -> [u64; 2] {
+    let tokens_for_blocks = |blocks: u32| {
+        u64::from(blocks)
+            .saturating_mul(u64::from(block_size))
+            .min(input_tokens as u64)
+    };
+    let hbm_tokens = tokens_for_blocks(snapshot.gpu_blocks);
+    let hbm_and_cpu_tokens = tokens_for_blocks(snapshot.host_pinned_blocks);
+
+    // host_pinned_blocks is cumulative with gpu_blocks. The CPU value is the
+    // host-only extension of the matched prefix, not a double-count of HBM.
+    [hbm_tokens, hbm_and_cpu_tokens.saturating_sub(hbm_tokens)]
+}
+
+fn record_cache_residency_metrics(
+    metrics: &RouterRequestMetrics,
+    selected: &SelectedWorkerTierSnapshot,
+    eligible_oracle: &SelectedWorkerTierSnapshot,
+    input_tokens: usize,
+    block_size: u32,
+) {
+    let selected_tokens = cache_residency_tokens(selected, input_tokens, block_size);
+    let eligible_oracle_tokens =
+        cache_residency_tokens(eligible_oracle, input_tokens, block_size);
+
+    for ((tier, selected), eligible_oracle) in CACHE_RESIDENCY_TIERS
+        .iter()
+        .copied()
+        .zip(selected_tokens)
+        .zip(eligible_oracle_tokens)
+    {
+        metrics
+            .selected_cache_residency_tokens_total
+            .with_label_values(&[tier])
+            .inc_by(selected);
+        metrics
+            .eligible_oracle_cache_residency_tokens_total
+            .with_label_values(&[tier])
+            .inc_by(eligible_oracle);
+        metrics
+            .eligible_oracle_cache_residency_missed_tokens_total
+            .with_label_values(&[tier])
+            .inc_by(eligible_oracle.saturating_sub(selected));
+    }
+}
+
 
 /// Bounds the wait for a worker's trailing typed error after a terminal frame.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -248,6 +359,7 @@ where
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     policy: RoutingPolicy<Sel>,
     request_metrics: Arc<RouterRequestMetrics>,
+    cache_history: Option<Arc<parking_lot::Mutex<CacheHistory>>>,
     affinity: Option<AffinityCoordinator>,
     session_affinity_mode: SessionAffinityMode,
     hosted_occupancy: Option<HostedOccupancy>,
@@ -421,7 +533,9 @@ where
         let request_metrics =
             RouterRequestMetrics::from_component(kv_router.client().endpoint.component());
 
+        let cache_history = CacheHistory::from_env(kv_router.block_size());
         RoutingHost {
+            cache_history,
             inner,
             policy: RoutingPolicy::Kv(kv_router),
             request_metrics,
@@ -510,6 +624,7 @@ where
         let request_metrics =
             RouterRequestMetrics::from_component(inner.client.endpoint.component());
         Ok(Self {
+            cache_history: None,
             inner,
             policy,
             request_metrics,
@@ -780,6 +895,12 @@ where
         if is_query_only {
             let routing_parts = RoutingRequestParts::new(&request);
             if let Some(ref tracker) = request.tracker {
+                record_routing_decision_trace(
+                    tracker,
+                    &selection,
+                    routing_parts.token_ids.len(),
+                    self.kv_router().block_size(),
+                );
                 let isl_blocks = routing_parts
                     .token_ids
                     .len()
@@ -796,6 +917,32 @@ where
             self.request_metrics
                 .input_sequence_tokens
                 .observe(request.token_ids.len() as f64);
+            let input_tokens = routing_parts.token_ids.len() as u64;
+            self.request_metrics.input_tokens_total.inc_by(input_tokens);
+            self.request_metrics
+                .selected_cached_tokens_total
+                .inc_by(selection.cached_tokens.min(routing_parts.token_ids.len()) as u64);
+            self.request_metrics
+                .eligible_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .eligible_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
+                );
+            self.request_metrics
+                .resident_oracle_cached_tokens_total
+                .inc_by(
+                    selection
+                        .resident_oracle_cached_tokens
+                    .min(routing_parts.token_ids.len()) as u64,
+                );
+            record_cache_residency_metrics(
+                &self.request_metrics,
+                &selection.selected_worker_tiers,
+                &selection.eligible_oracle_tiers,
+                routing_parts.token_ids.len(),
+                self.kv_router().block_size(),
+            );
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker
@@ -882,3 +1029,18 @@ fn classify_response_item(item: &Annotated<LLMEngineOutput>) -> ResponseItemOutc
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_residency_tests {
+    use super::*;
+    #[test]
+    fn cpu_residency_is_extension_and_total_is_capped_by_prompt() {
+        let snapshot = SelectedWorkerTierSnapshot {
+            gpu_blocks: 2, host_pinned_blocks: 5, disk_blocks: 8,
+            ..Default::default()
+        };
+        assert_eq!(cache_residency_tokens(&snapshot, 64, 16), [32, 32]);
+        assert_eq!(cache_residency_tokens(&snapshot, 16, 16), [16, 0]);
+        assert_eq!(cache_residency_tokens(&snapshot, 128, 16), [32, 48]);
+    }
+}
