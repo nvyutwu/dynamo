@@ -534,6 +534,14 @@ where
             RouterRequestMetrics::from_component(kv_router.client().endpoint.component());
 
         let cache_history = CacheHistory::from_env(kv_router.block_size());
+        if let Some(history) = cache_history.as_ref() {
+            let stats = history.lock().stats();
+            request_metrics.set_cache_loss_history_stats(
+                stats.retained_records, stats.retained_unique_hashes,
+                stats.represented_tokens, stats.estimated_retained_bytes,
+                stats.capacity_bytes, stats.capacity_blocks,
+            );
+        }
         RoutingHost {
             cache_history,
             inner,

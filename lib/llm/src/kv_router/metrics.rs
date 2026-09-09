@@ -1168,6 +1168,51 @@ impl RouterRequestMetrics {
             .clone()
     }
 
+    pub(crate) fn observe_cache_loss_input(&self, prompt_tokens: u64) {
+        self.cache_loss_observation_input_tokens_total
+            .inc_by(prompt_tokens);
+    }
+
+    pub(crate) fn observe_cache_loss_funnel(&self, stages: [u64; 6]) {
+        for (stage, tokens) in ["f0", "f1", "f2", "f3", "f4", "f5"].into_iter().zip(stages) {
+            self.cache_loss_funnel_tokens_total
+                .with_label_values(&[stage])
+                .inc_by(tokens);
+        }
+        self.cache_loss_observations_total
+            .with_label_values(&["complete"])
+            .inc();
+    }
+
+    pub(crate) fn observe_cache_loss_incomplete(&self) {
+        self.cache_loss_observations_total
+            .with_label_values(&["incomplete"])
+            .inc();
+    }
+
+    pub(crate) fn set_cache_loss_history_stats(
+        &self,
+        retained_records: usize,
+        retained_unique_hashes: usize,
+        represented_tokens: u64,
+        estimated_retained_bytes: usize,
+        capacity_bytes: usize,
+        capacity_blocks: usize,
+    ) {
+        let as_i64 = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        self.cache_loss_history_block_records.set(as_i64(retained_records));
+        self.cache_loss_history_unique_hashes
+            .set(as_i64(retained_unique_hashes));
+        self.cache_loss_history_represented_tokens
+            .set(i64::try_from(represented_tokens).unwrap_or(i64::MAX));
+        self.cache_loss_history_estimated_bytes
+            .set(as_i64(estimated_retained_bytes));
+        self.cache_loss_history_capacity_bytes
+            .set(as_i64(capacity_bytes));
+        self.cache_loss_history_capacity_blocks
+            .set(as_i64(capacity_blocks));
+    }
+
     /// Record a selection that sacrificed KV cache overlap.
     pub fn observe_non_max_overlap_selection(&self, worker_type: &str, overlap_blocks_lost: f64) {
         debug_assert!(overlap_blocks_lost > 0.0);
@@ -1361,50 +1406,7 @@ impl ApproximateLruMetrics {
         }
         *previous = current;
     }
-    pub(crate) fn observe_cache_loss_input(&self, prompt_tokens: u64) {
-        self.cache_loss_observation_input_tokens_total
-            .inc_by(prompt_tokens);
-    }
 
-    pub(crate) fn observe_cache_loss_funnel(&self, stages: [u64; 6]) {
-        for (stage, tokens) in ["f0", "f1", "f2", "f3", "f4", "f5"].into_iter().zip(stages) {
-            self.cache_loss_funnel_tokens_total
-                .with_label_values(&[stage])
-                .inc_by(tokens);
-        }
-        self.cache_loss_observations_total
-            .with_label_values(&["complete"])
-            .inc();
-    }
-
-    pub(crate) fn observe_cache_loss_incomplete(&self) {
-        self.cache_loss_observations_total
-            .with_label_values(&["incomplete"])
-            .inc();
-    }
-
-    pub(crate) fn set_cache_loss_history_stats(
-        &self,
-        retained_records: usize,
-        retained_unique_hashes: usize,
-        represented_tokens: u64,
-        estimated_retained_bytes: usize,
-        capacity_bytes: usize,
-        capacity_blocks: usize,
-    ) {
-        let as_i64 = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
-        self.cache_loss_history_block_records.set(as_i64(retained_records));
-        self.cache_loss_history_unique_hashes
-            .set(as_i64(retained_unique_hashes));
-        self.cache_loss_history_represented_tokens
-            .set(i64::try_from(represented_tokens).unwrap_or(i64::MAX));
-        self.cache_loss_history_estimated_bytes
-            .set(as_i64(estimated_retained_bytes));
-        self.cache_loss_history_capacity_bytes
-            .set(as_i64(capacity_bytes));
-        self.cache_loss_history_capacity_blocks
-            .set(as_i64(capacity_blocks));
-    }
 }
 
 pub struct RemoteIndexerMetrics {
