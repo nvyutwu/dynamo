@@ -4,6 +4,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    collections::HashSet,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1987,6 +1989,7 @@ async fn handler_chat_completions(
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
+    let body = materialize_nvcf_asset_refs(&body, &headers);
     let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
     if *FORCE_INCLUDE_USAGE && request.inner.stream.unwrap_or(false) {
         delta_common::force_include_usage(&mut request.inner.stream_options);
@@ -2065,6 +2068,272 @@ async fn handler_chat_completions(
 
     response
 }
+
+// ---- NVCF asset support (dynamo.frontend equivalent of vLLM payload_sanitization) ----
+// NVCF delivers uploaded multimodal assets as files in a gateway-provided directory and
+// advertises them via request headers; multimodal parts arrive as `data:<mime>;asset_id,<id>`
+// URIs. vLLM's OpenAI server resolves these, but the dynamo path runs vLLM headless
+// (api_server_count=0), so that hook never fires — this frontend HTTP handler is the only
+// place with both the raw body and the NVCF headers. We resolve each allow-listed asset id
+// by reading the mounted file and inlining its bytes as a `data:<mime>;base64,...` URI,
+// which the dynamo worker decodes directly (it rejects `file://`). Header-gated: no-op /
+// byte-identical unless the NVCF
+// asset headers are present, so non-NVCF and non-asset requests are unaffected.
+const NVCF_ASSET_DIR_HEADERS: [&str; 2] = ["nvcf-input-asset-dir", "nvcf-asset-dir"];
+const NVCF_ASSET_IDS_HEADERS: [&str; 2] =
+    ["nvcf-input-asset-references", "nvcf-function-asset-ids"];
+const ASSET_ID_MARKER: &str = ";asset_id,";
+// NVCF does NOT reliably inject a `nvcf-input-asset-dir` request header, and clients cannot
+// set it (the gateway strips inbound `nvcf-*` headers). So resolve the asset mount dir from:
+// the header if present, else the operator-set env var, else the fixed NVCF convention path
+// (the same dir pure-vLLM reads via `--allowed-local-media-path /var/inf/inputAssets`).
+const ENV_NVCF_ASSET_DIR: &str = "DYN_NVCF_ASSET_DIR";
+const DEFAULT_NVCF_ASSET_DIR: &str = "/var/inf/inputAssets";
+
+fn is_asset_delim(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ',')
+}
+
+fn nvcf_header<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|n| {
+        headers
+            .get(*n)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+// Engage the asset path when NVCF advertises input-asset ids for this request — the ids
+// header is what NVCF actually forwards (the dir header is not reliably injected).
+fn has_nvcf_asset_ids(headers: &HeaderMap) -> bool {
+    NVCF_ASSET_IDS_HEADERS.iter().any(|n| headers.contains_key(*n))
+}
+
+// Asset mount dir: gateway-provided header if present, else the operator env var, else the
+// fixed NVCF convention path.
+fn nvcf_asset_dir(headers: &HeaderMap) -> String {
+    if let Some(dir) = nvcf_header(headers, &NVCF_ASSET_DIR_HEADERS) {
+        return dir.to_string();
+    }
+    std::env::var(ENV_NVCF_ASSET_DIR).unwrap_or_else(|_| DEFAULT_NVCF_ASSET_DIR.to_string())
+}
+
+fn normalize_asset_id(value: &str) -> String {
+    let mut s = value.trim().trim_matches(',').trim();
+    while s.len() >= 2 {
+        let b = s.as_bytes();
+        if (b[0] == b'\'' || b[0] == b'"') && b[s.len() - 1] == b[0] {
+            s = s[1..s.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+    s.to_string()
+}
+
+// Max asset we will inline as base64 into the request body — guards the HTTP handler
+// against a huge/hostile asset (the NVCF gateway already bounds upload size). Over this,
+// the ref is left unresolved (the worker then 4xx's, rather than us OOMing the frontend).
+const MAX_INLINE_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+
+fn resolve_asset_id(
+    asset_id: &str,
+    mime: &str,
+    asset_root: &Path,
+    allowed: &HashSet<String>,
+) -> Option<String> {
+    if asset_id.is_empty() {
+        return None;
+    }
+    if !allowed.contains(asset_id) {
+        tracing::warn!(asset_id, "NVCF asset id not in the request allow-list (nvcf-input-asset-references)");
+        return None;
+    }
+    let candidate = asset_root.join(asset_id);
+    let resolved = match std::fs::canonicalize(&candidate) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(asset_id, path = %candidate.display(), error = %e, "NVCF asset not found under asset root");
+            return None;
+        }
+    };
+    // Path-traversal guard: the resolved file must sit directly under the asset root.
+    if resolved.parent() != Some(asset_root) || !resolved.is_file() {
+        tracing::warn!(asset_id, path = %resolved.display(), "NVCF asset escaped the asset root or is not a regular file");
+        return None;
+    }
+    // Size guard before reading the whole file into memory.
+    if std::fs::metadata(&resolved).ok()?.len() > MAX_INLINE_ASSET_BYTES {
+        tracing::warn!(asset_id, "NVCF asset exceeds the inline size cap");
+        return None;
+    }
+    // Inline the bytes as a base64 data URI: the dynamo worker's ImageLoader decodes
+    // `data:<mime>;base64,...` directly but rejects `file://`. This == the validated
+    // base64-client path and needs no asset mount on the worker pod.
+    let bytes = std::fs::read(&resolved).ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{mime};base64,{b64}"))
+}
+
+/// Rewrite every `data:<image|video|audio>/<subtype>;asset_id,<id>` span in `s` to a
+/// resolved `file://` URI. Returns `None` when nothing changed.
+fn rewrite_asset_refs(s: &str, asset_root: &Path, allowed: &HashSet<String>) -> Option<String> {
+    if !s.contains(ASSET_ID_MARKER) {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+    while let Some(rel) = s[cursor..].find(ASSET_ID_MARKER) {
+        let marker = cursor + rel;
+        let mut handled = false;
+        if let Some(dp) = s[cursor..marker].rfind("data:") {
+            let start = cursor + dp;
+            let mime = &s[start + "data:".len()..marker];
+            let mime_ok = !mime.is_empty()
+                && !mime.contains(';')
+                && (mime.starts_with("image/")
+                    || mime.starts_with("video/")
+                    || mime.starts_with("audio/"))
+                && !mime.contains(is_asset_delim);
+            if mime_ok {
+                let id_start = marker + ASSET_ID_MARKER.len();
+                let id_end =
+                    id_start + s[id_start..].find(is_asset_delim).unwrap_or(s.len() - id_start);
+                let asset_id = normalize_asset_id(&s[id_start..id_end]);
+                if let Some(uri) = resolve_asset_id(&asset_id, mime, asset_root, allowed) {
+                    out.push_str(&s[cursor..start]);
+                    out.push_str(&uri);
+                    cursor = id_end;
+                    changed = true;
+                    handled = true;
+                }
+            }
+        }
+        if !handled {
+            let keep_to = marker + ASSET_ID_MARKER.len();
+            out.push_str(&s[cursor..keep_to]);
+            cursor = keep_to;
+        }
+    }
+    out.push_str(&s[cursor..]);
+    changed.then_some(out)
+}
+
+fn visit_nvcf_asset_strings(
+    value: &mut serde_json::Value,
+    asset_root: &Path,
+    allowed: &HashSet<String>,
+    changed: &mut bool,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(rewritten) = rewrite_asset_refs(s, asset_root, allowed) {
+                *s = rewritten;
+                *changed = true;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                visit_nvcf_asset_strings(item, asset_root, allowed, changed);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, item) in map {
+                visit_nvcf_asset_strings(item, asset_root, allowed, changed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inline NVCF `asset_id` multimodal refs in the raw request body as `data:<mime>;base64,...`
+/// URIs, using the gateway asset dir + allow-list headers. No-op (byte-identical) unless the
+/// NVCF asset headers are present and resolve; runs on the raw bytes before typed parse,
+/// mirroring `hoist_dynamic_message_tools`. Inlining (not `file://`) is required: the dynamo
+/// worker decodes `data:` but rejects local paths, and the frontend is the pod NVCF mounts
+/// the assets into — so no worker-side asset mount is needed.
+fn materialize_nvcf_asset_refs(body: &Bytes, headers: &HeaderMap) -> Bytes {
+    if !has_nvcf_asset_ids(headers) {
+        return body.clone();
+    }
+    let Some(ids_hdr) = nvcf_header(headers, &NVCF_ASSET_IDS_HEADERS) else {
+        return body.clone();
+    };
+    let asset_dir = nvcf_asset_dir(headers);
+    let asset_root = match std::fs::canonicalize(&asset_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(asset_dir = %asset_dir, error = %e, "NVCF asset path engaged (ids header present) but the asset dir does not exist; set DYN_NVCF_ASSET_DIR on the frontend if NVCF mounts assets elsewhere");
+            return body.clone();
+        }
+    };
+    if !asset_root.is_dir() {
+        tracing::warn!(asset_dir = %asset_root.display(), "NVCF asset dir is not a directory");
+        return body.clone();
+    }
+    let allowed: HashSet<String> = ids_hdr
+        .split(',')
+        .map(normalize_asset_id)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if allowed.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let mut changed = false;
+    visit_nvcf_asset_strings(&mut payload, &asset_root, &allowed, &mut changed);
+    if !changed {
+        tracing::warn!(asset_root = %asset_root.display(), ids = %ids_hdr, "NVCF asset path engaged but resolved 0 asset refs");
+        return body.clone();
+    }
+    tracing::debug!(asset_root = %asset_root.display(), "NVCF asset refs inlined as base64");
+    serde_json::to_vec(&payload).map(Bytes::from).unwrap_or_else(|_| body.clone())
+}
+
+#[cfg(test)]
+mod nvcf_asset_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn resolves_allow_listed_asset_id_to_inline_base64() {
+        let dir = std::env::temp_dir().join(format!("dyn_nvcf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = "asset-abc123";
+        std::fs::write(dir.join(asset), b"PNGDATA").unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("nvcf-input-asset-dir", root.to_str().unwrap().parse().unwrap());
+        headers.insert("nvcf-input-asset-references", asset.parse().unwrap());
+
+        let body = Bytes::from(format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;asset_id,{asset}"}}}}]}}]}}"#
+        ));
+        let out = materialize_nvcf_asset_refs(&body, &headers);
+        let out = String::from_utf8(out.to_vec()).unwrap();
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(b"PNGDATA");
+        let expected = format!("data:image/png;base64,{expected_b64}");
+        assert!(out.contains(&expected), "expected {expected} in {out}");
+        assert!(!out.contains("asset_id,"), "asset_id should be resolved: {out}");
+
+        // No headers -> unchanged (byte-identical).
+        assert_eq!(materialize_nvcf_asset_refs(&body, &HeaderMap::new()), body);
+        // Not in allow-list -> unchanged.
+        let mut h2 = HeaderMap::new();
+        h2.insert("nvcf-input-asset-dir", root.to_str().unwrap().parse().unwrap());
+        h2.insert("nvcf-input-asset-references", "other-id".parse().unwrap());
+        assert_eq!(materialize_nvcf_asset_refs(&body, &h2), body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 
 fn parse_json_request<T>(endpoint: &'static str, body: &[u8]) -> Result<T, ErrorResponse>
 where
