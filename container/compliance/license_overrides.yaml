@@ -24,6 +24,12 @@
 # the policy gate will reject it.
 
 overrides:
+  # The 0.1.9 metadata embeds the full license, which detection leaves UNKNOWN.
+  - ecosystem: python
+    name: instanttensor
+    license: Apache-2.0
+    source: "Verified instanttensor-0.1.9/LICENSE in the PyPI source archive (SHA256 d8692b97991c1a5fb2db7905b9a6ae90a7f967c7ddd853d35e41caa146750c02): https://pypi.org/project/instanttensor/0.1.9/"
+
   # --- NVIDIA CUDA Python wheels ---
   # Most ship via pypi.nvidia.com; the wheel METADATA's License field is empty
   # or contains marketing prose. The actual EULA is bundled in the wheel
