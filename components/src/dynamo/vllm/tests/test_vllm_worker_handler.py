@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for WorkerHandler in combination with multimodal handling."""
+
 # [gluo FIXME] This suite of tests is added for MultimodalPDWorkerHandler,
 # which is now removed. Yet the concept of this tests is still valid that
 # we need to have unit tests for the worker handlers.
@@ -176,6 +177,31 @@ class TestCacheLossEngineData:
             "cpu_hit_tokens": 0,
             "cpu_lookup_tokens": 0,
         }
+
+    @pytest.mark.parametrize("cached_tokens", [-1, True, None, "3"])
+    def test_invalid_legacy_counter_is_incomplete(self, cached_tokens):
+        output = SimpleNamespace(prompt_token_ids=[1], num_cached_tokens=cached_tokens)
+        assert mod.BaseWorkerHandler._cache_loss_engine_data(output) == {
+            "complete": False
+        }
+
+    def test_missing_prompt_is_incomplete(self):
+        output = SimpleNamespace(num_cached_tokens=1)
+        assert mod.BaseWorkerHandler._cache_loss_engine_data(output) == {
+            "complete": False
+        }
+
+    def test_partial_precise_fields_use_explicit_legacy_fallback(self):
+        output = SimpleNamespace(
+            prompt_token_ids=list(range(128)),
+            num_cached_tokens=96,
+            num_local_cached_tokens=64,
+        )
+        result = mod.BaseWorkerHandler._cache_loss_engine_data(output)
+        assert result["complete"] is True
+        assert result["tier_breakdown_complete"] is False
+        assert result["gpu_hit_tokens"] == 96
+        assert result["cpu_hit_tokens"] == 0
 
     def test_missing_all_cache_accounting_is_incomplete(self):
         request_output = SimpleNamespace(prompt_token_ids=[1, 2, 3])

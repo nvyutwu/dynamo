@@ -3186,9 +3186,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         prompt_tokens = getattr(request_output, "prompt_token_ids", None)
         local_hits = getattr(request_output, "num_local_cached_tokens", None)
         external_hits = getattr(request_output, "num_external_cached_tokens", None)
-        external_lookups = getattr(
-            request_output, "num_external_lookup_tokens", None
-        )
+        external_lookups = getattr(request_output, "num_external_lookup_tokens", None)
         values = (local_hits, external_hits, external_lookups)
         if prompt_tokens is None:
             return {"complete": False}
@@ -3198,7 +3196,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         # num_cached_tokens. Keep the funnel complete on those versions while
         # conservatively collapsing F4 and F5 to the aggregate reused-token
         # count; the precise tier split is unavailable there.
-        tier_breakdown_complete = all(type(value) is int and value >= 0 for value in values)
+        tier_breakdown_complete = all(
+            type(value) is int and value >= 0 for value in values
+        )
         if not tier_breakdown_complete:
             aggregate_hits = getattr(request_output, "num_cached_tokens", None)
             if type(aggregate_hits) is not int or aggregate_hits < 0:
@@ -3384,9 +3384,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             completion_token_counts=total_output_tokens_by_index,
                         )
                         if CACHE_LOSS_FUNNEL_ENABLED:
-                            out.setdefault("engine_data", {})["cache_loss"] = (
-                                BaseWorkerHandler._cache_loss_engine_data(res)
-                            )
+                            out.setdefault("engine_data", {})[
+                                "cache_loss"
+                            ] = BaseWorkerHandler._cache_loss_engine_data(res)
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(
                                 out, prompt_logprobs_payload
@@ -3912,9 +3912,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                 request_output=res,
                             )
                             if CACHE_LOSS_FUNNEL_ENABLED:
-                                chunk.setdefault("engine_data", {})["cache_loss"] = (
-                                    BaseWorkerHandler._cache_loss_engine_data(res)
-                                )
+                                chunk.setdefault("engine_data", {})[
+                                    "cache_loss"
+                                ] = BaseWorkerHandler._cache_loss_engine_data(res)
 
                         yield chunk
                         previous_text_per_choice[output_idx] = output.text
@@ -4096,9 +4096,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     ),
                 }
                 if CACHE_LOSS_FUNNEL_ENABLED:
-                    output.setdefault("engine_data", {})["cache_loss"] = (
-                        BaseWorkerHandler._cache_loss_engine_data(res)
-                    )
+                    output.setdefault("engine_data", {})[
+                        "cache_loss"
+                    ] = BaseWorkerHandler._cache_loss_engine_data(res)
 
                 # Log prefill completion with LoRA info
                 self._log_with_lora_context(
