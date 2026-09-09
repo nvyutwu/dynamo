@@ -1757,3 +1757,20 @@ fn py_err_to_dynamo(err: PyErr) -> DynamoError {
         .message(message)
         .build()
 }
+
+#[cfg(test)]
+mod k3_validation_error_compat_tests {
+    use super::*;
+    pyo3::create_exception!(k3_compat, VLLMValidationError, pyo3::exceptions::PyException);
+
+    #[test]
+    fn test_k3_worker_validation_error_maps_to_400() {
+        pyo3::prepare_freethreaded_python();
+        let error = VLLMValidationError::new_err("At most 8 images may be provided");
+        let mapped = py_err_to_dynamo(error);
+        assert!(matches!(mapped.error_type(), ErrorType::Backend(BackendError::InvalidArgument)));
+        let payload: serde_json::Value = serde_json::from_str(mapped.message()).unwrap();
+        assert_eq!(payload["code"], 400);
+        assert_eq!(payload["message"], "At most 8 images may be provided");
+    }
+}
