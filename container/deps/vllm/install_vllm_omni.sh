@@ -6,6 +6,12 @@ set -euo pipefail
 
 : "${VLLM_OMNI_REF:?VLLM_OMNI_REF must be set}"
 
+# Engine-only runtime candidates can retain the upstream vLLM dependency solve.
+if [ "${VLLM_OMNI_REF}" = "none" ]; then
+  echo "Skipping vLLM-Omni installation (VLLM_OMNI_REF=none)"
+  exit 0
+fi
+
 VLLM_OMNI_PROTECTED_PACKAGES_FILE="${VLLM_OMNI_PROTECTED_PACKAGES_FILE:-/tmp/vllm_omni_protected_packages.txt}"
 
 PROTECTED_CONSTRAINTS="$(mktemp /tmp/vllm-openai-protected.XXXXXX.txt)"
