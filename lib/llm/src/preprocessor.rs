@@ -1901,6 +1901,118 @@ fn resolve_qwen_video_processor_contract(
     Ok(vllm_contract.or(sglang_contract))
 }
 
+/// Trailing segments of a K3 prompt that form the assistant generation stub
+/// (`<|open|>think<|sep|>` or `<|open|>response<|sep|>`), which the vendor API
+/// leaves out of client-facing `prompt_tokens`.
+///
+/// A segmented prompt reports its own stub, which is empty for continuations
+/// and when no generation prompt was added, so prompt text that merely ends with
+/// the stub's characters is never counted. Only an unsegmented
+/// (template-rendered) prompt falls back to matching the rendered tail.
+fn k3_generation_stub_segments(
+    prompt: &RenderedPrompt,
+) -> Option<Vec<crate::tokenizers::EncodeSegment<'_>>> {
+    if prompt.segments().is_some() {
+        if prompt.pending_segments() == 0 {
+            return None;
+        }
+        return prompt.pending_encode_segments();
+    }
+    const OPEN: &str = "<|open|>";
+    const SEP: &str = "<|sep|>";
+    let text = prompt.as_str().trim_end();
+    let channel = ["think", "response"]
+        .into_iter()
+        .find(|channel| text.ends_with(&format!("{OPEN}{channel}{SEP}")))?;
+    // OPEN and SEP are control tokens; the channel name is ordinary text.
+    Some(vec![
+        crate::tokenizers::EncodeSegment {
+            text: OPEN,
+            allow_special: true,
+        },
+        crate::tokenizers::EncodeSegment {
+            text: channel,
+            allow_special: false,
+        },
+        crate::tokenizers::EncodeSegment {
+            text: SEP,
+            allow_special: true,
+        },
+    ])
+}
+
+#[cfg(test)]
+mod k3_generation_stub_tests {
+    use super::k3_generation_stub_segments;
+    use dynamo_renderer::{RenderedPrompt, RenderedSegment};
+
+    fn seg(text: &str, allow_special: bool) -> RenderedSegment {
+        RenderedSegment {
+            text: text.to_string(),
+            allow_special,
+        }
+    }
+
+    fn texts(prompt: &RenderedPrompt) -> Option<Vec<(String, bool)>> {
+        k3_generation_stub_segments(prompt).map(|segments| {
+            segments
+                .iter()
+                .map(|segment| (segment.text.to_string(), segment.allow_special))
+                .collect()
+        })
+    }
+
+    fn stub(channel: &str) -> Vec<(String, bool)> {
+        vec![
+            ("<|open|>".to_string(), true),
+            (channel.to_string(), false),
+            ("<|sep|>".to_string(), true),
+        ]
+    }
+
+    #[test]
+    fn segmented_prompt_uses_renderer_pending_segments() {
+        let prompt = RenderedPrompt::segmented_with_pending(
+            vec![
+                seg("user text", false),
+                seg("<|open|>", true),
+                seg("response", false),
+                seg("<|sep|>", true),
+            ],
+            3,
+        );
+        assert_eq!(texts(&prompt), Some(stub("response")));
+    }
+
+    #[test]
+    fn segmented_prompt_without_pending_stub_subtracts_nothing() {
+        // A continuation or add_generation_prompt=false: the tail matches the
+        // stub text (here also as literal user text) but the renderer reports none.
+        for prompt in [
+            RenderedPrompt::segmented_with_pending(
+                vec![
+                    seg("<|open|>", true),
+                    seg("response", false),
+                    seg("<|sep|>", true),
+                ],
+                0,
+            ),
+            RenderedPrompt::segmented(vec![seg("say <|open|>think<|sep|>", false)]),
+        ] {
+            assert_eq!(texts(&prompt), None);
+        }
+    }
+
+    #[test]
+    fn unsegmented_prompt_falls_back_to_rendered_tail() {
+        let prompt = RenderedPrompt::text("hi<|open|>think<|sep|>\n".to_string());
+        assert_eq!(texts(&prompt), Some(stub("think")));
+        let prompt = RenderedPrompt::text("hi<|open|>response<|sep|>".to_string());
+        assert_eq!(texts(&prompt), Some(stub("response")));
+        assert_eq!(texts(&RenderedPrompt::text("hi".to_string())), None);
+    }
+}
+
 impl OpenAIPreprocessor {
     fn omitted_max_tokens_default(
         prompt_len: usize,
@@ -3056,8 +3168,8 @@ impl OpenAIPreprocessor {
         HashMap<String, String>,
         PromptReasoningPrefill,
     )> {
-        let (request, annotations, prompt_injected_reasoning, _image_tokens) = self
-            .preprocess_request_with_options(
+        let (request, annotations, prompt_injected_reasoning, _image_tokens, _client_prompt_stub) =
+            self.preprocess_request_with_options(
                 request,
                 tracker,
                 PreprocessRequestOptions::default(),
@@ -3065,6 +3177,28 @@ impl OpenAIPreprocessor {
             )
             .await?;
         Ok((request, annotations, prompt_injected_reasoning))
+    }
+
+    fn kimi_k3_generation_stub_len(
+        &self,
+        formatted_prompt: Option<&RenderedPrompt>,
+    ) -> Option<u32> {
+        if !matches!(
+            self.runtime_config.reasoning_parser.as_deref(),
+            Some("kimi_k3" | "kimi-k3")
+        ) {
+            return None;
+        }
+        // Tokenize the stub exactly as it entered `token_ids`, so the measured
+        // length equals its contribution to the rendered token count.
+        let segments = k3_generation_stub_segments(formatted_prompt?)?;
+        let stub_len = self
+            .tokenizer
+            .encode_segments(&segments)
+            .ok()?
+            .token_ids()
+            .len();
+        Some(stub_len as u32)
     }
 
     async fn preprocess_request_with_options<
@@ -3087,6 +3221,7 @@ impl OpenAIPreprocessor {
         HashMap<String, String>,
         PromptReasoningPrefill,
         Option<usize>,
+        Option<u32>,
     )> {
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
         let preprocess_start = Instant::now();
@@ -3188,11 +3323,13 @@ impl OpenAIPreprocessor {
             Self::validate_preprocessed_token_budget(&preprocessed, self.token_budget.as_ref())?;
         }
 
+        let client_prompt_stub = self.kimi_k3_generation_stub_len(formatted_prompt.as_ref());
         Ok((
             preprocessed,
             annotations,
             prompt_injected_reasoning,
             image_tokens,
+            client_prompt_stub,
         ))
     }
 
@@ -7838,7 +7975,13 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
+        let (
+            mut common_request,
+            annotations,
+            prompt_injected_reasoning,
+            image_tokens,
+            client_prompt_stub,
+        ) = self
             .preprocess_request_with_options(
                 &request,
                 tracker.as_deref(),
@@ -7913,6 +8056,9 @@ impl
         let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
 
         let mut response_generator = Box::new(response_generator);
+        if let Some(stub_len) = client_prompt_stub {
+            response_generator.set_client_prompt_stub(stub_len);
+        }
 
         // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
         if common_request.prompt_embeds.is_none() {
