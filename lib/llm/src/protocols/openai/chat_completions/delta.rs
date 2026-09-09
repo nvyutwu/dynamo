@@ -45,6 +45,7 @@ impl NvCreateChatCompletionRequest {
 pub struct DeltaGenerator {
     /// State shared with the text completion delta generator.
     state: DeltaGeneratorState,
+    client_prompt_stub: Option<u32>,
     /// Optional service tier information for the response.
     service_tier: Option<dynamo_protocols::types::ServiceTierResponse>,
     /// Choice indices for which the assistant role has already been emitted.
@@ -60,6 +61,7 @@ impl DeltaGenerator {
                 model,
                 options,
             ),
+            client_prompt_stub: None,
             service_tier: None,
             emitted_role_choices: HashSet::new(),
         }
@@ -76,6 +78,19 @@ impl DeltaGenerator {
     /// * `isl` - Input Sequence Length. The number of prompt tokens used.
     pub fn update_isl(&mut self, isl: u32) {
         self.state.update_isl(isl);
+    }
+
+    pub fn set_client_prompt_stub(&mut self, stub_len: u32) {
+        self.client_prompt_stub = Some(stub_len);
+    }
+
+    fn client_usage(&self) -> dynamo_protocols::types::CompletionUsage {
+        let mut usage = self.get_usage();
+        if let Some(stub) = self.client_prompt_stub {
+            usage.prompt_tokens = usage.prompt_tokens.saturating_sub(stub);
+            usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        }
+        usage
     }
 
     pub fn create_logprobs(
@@ -174,7 +189,7 @@ impl DeltaGenerator {
                 choices,
                 usage: if self.state.is_usage_enabled() && self.state.is_continuous_usage_enabled()
                 {
-                    Some(self.get_usage())
+                    Some(self.client_usage())
                 } else {
                     None
                 },
@@ -191,7 +206,7 @@ impl DeltaGenerator {
     /// # Returns
     /// * A `CreateChatCompletionStreamResponse` with empty choices and usage stats.
     pub fn create_usage_chunk(&self) -> NvCreateChatCompletionStreamResponse {
-        let usage = self.get_usage();
+        let usage = self.client_usage();
 
         NvCreateChatCompletionStreamResponse {
             inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
@@ -489,6 +504,99 @@ mod tests {
             .expect("completion token details should be propagated");
 
         assert_eq!(completion_details.reasoning_tokens, Some(3));
+    }
+
+    #[test]
+    fn client_usage_subtracts_k3_stub_for_text_and_vision() {
+        // K3 request: the frontend pins the generation-prompt stub LENGTH; the
+        // worker's terminal completion_usage carries the FULL prompt_tokens (for
+        // vision, including image tokens the frontend ISL never had). client_usage
+        // must subtract only the stub, while metrics keep the worker's full count.
+        const STUB: u32 = 3;
+
+        // Returns (client-facing prompt_tokens from the emitted usage chunk,
+        // metric/ISL prompt_tokens from get_usage).
+        fn client_and_metric(worker_prompt_tokens: u32, stub: Option<u32>) -> (u32, u32) {
+            let request = create_test_request();
+            let mut generator = request.response_generator("req-vision".to_string());
+            if let Some(stub_len) = stub {
+                generator.set_client_prompt_stub(stub_len);
+            }
+            let mut backend_output = final_backend_output();
+            backend_output.completion_usage = Some(CompletionUsage {
+                prompt_tokens: worker_prompt_tokens,
+                completion_tokens: 1,
+                total_tokens: worker_prompt_tokens + 1,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            });
+            generator
+                .choice_from_postprocessor(backend_output)
+                .expect("choice generation");
+            let client = generator
+                .create_usage_chunk()
+                .inner
+                .usage
+                .expect("usage chunk carries usage")
+                .prompt_tokens;
+            (client, generator.get_usage().prompt_tokens)
+        }
+
+        // Text: worker == frontend full render (231); stub 3 -> client 228.
+        let (client, metric) = client_and_metric(231, Some(STUB));
+        assert_eq!(client, 228, "text client prompt_tokens = full - stub");
+        assert_eq!(metric, 231, "metric/ISL keeps the full count");
+
+        // Vision: worker prompt_tokens includes image tokens (4164); stub 3 ->
+        // client 4161 (image tokens preserved, not clobbered by a text-only ISL).
+        let (client, metric) = client_and_metric(4164, Some(STUB));
+        assert_eq!(
+            client, 4161,
+            "vision client prompt_tokens = worker full - stub"
+        );
+        assert_eq!(metric, 4164);
+
+        // No stub pinned (non-K3): client == worker full, byte-identical behavior.
+        let (client, metric) = client_and_metric(197, None);
+        assert_eq!(client, 197);
+        assert_eq!(metric, 197);
+    }
+
+    #[test]
+    fn test_client_prompt_stub_is_subtracted_from_client_facing_usage_only() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-prompt-stub".to_string());
+        generator.update_isl(10);
+        generator
+            .choice_from_postprocessor(final_backend_output())
+            .expect("choice generation");
+
+        // Without a stub the client sees the engine count unchanged.
+        let engine = generator.get_usage();
+        assert_eq!(engine.prompt_tokens, 10);
+        let usage = generator.create_usage_chunk().inner.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, engine.prompt_tokens);
+        assert_eq!(usage.completion_tokens, engine.completion_tokens);
+        assert_eq!(usage.total_tokens, engine.total_tokens);
+
+        // The K3 generation stub is removed from the client-facing count and
+        // total_tokens is recomputed; the internal count used for metrics and
+        // traces stays at the engine value.
+        generator.set_client_prompt_stub(3);
+        let usage = generator.create_usage_chunk().inner.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, engine.prompt_tokens - 3);
+        assert_eq!(usage.completion_tokens, engine.completion_tokens);
+        assert_eq!(
+            usage.total_tokens,
+            engine.prompt_tokens - 3 + engine.completion_tokens
+        );
+        assert_eq!(generator.get_usage().prompt_tokens, engine.prompt_tokens);
+
+        // A stub larger than the prompt saturates instead of underflowing.
+        generator.set_client_prompt_stub(u32::MAX);
+        let usage = generator.create_usage_chunk().inner.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.total_tokens, engine.completion_tokens);
     }
 
     #[test]
