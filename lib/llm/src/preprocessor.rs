@@ -2650,7 +2650,7 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
     ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
-        let (request, annotations, prompt_injected_reasoning, _image_tokens) = self
+        let (request, annotations, prompt_injected_reasoning, _image_tokens, _client_prompt_stub) = self
             .preprocess_request_with_options(
                 request,
                 tracker,
@@ -2659,6 +2659,51 @@ impl OpenAIPreprocessor {
             )
             .await?;
         Ok((request, annotations, prompt_injected_reasoning))
+    }
+
+    fn kimi_k3_generation_stub_len(&self, formatted_prompt: Option<&str>) -> Option<u32> {
+        if !matches!(
+            self.runtime_config.reasoning_parser.as_deref(),
+            Some("kimi_k3" | "kimi-k3")
+        ) {
+            return None;
+        }
+        let prompt = formatted_prompt.map(str::trim_end)?;
+
+        const OPEN: &str = "<|open|>";
+        const SEP: &str = "<|sep|>";
+        // The add_generation_prompt tail is the last segment emitted by
+        // dynamo_renderer's kimi_k3 `build_chat_segments`.
+        let channel = ["think", "response"]
+            .into_iter()
+            .find(|ch| prompt.ends_with(&format!("{OPEN}{ch}{SEP}")))?;
+
+        // Tokenize the stub exactly as it entered `token_ids`: OPEN and SEP are
+        // control (special) segments; the channel name is ordinary text. The
+        // measured length therefore equals the stub's contribution to the
+        // rendered token count.
+        let segments = [
+            crate::tokenizers::EncodeSegment {
+                text: OPEN.to_string(),
+                allow_special: true,
+            },
+            crate::tokenizers::EncodeSegment {
+                text: channel.to_string(),
+                allow_special: false,
+            },
+            crate::tokenizers::EncodeSegment {
+                text: SEP.to_string(),
+                allow_special: true,
+            },
+        ];
+        let stub_len = self
+            .tokenizer
+            .encode_segments(&segments)
+            .ok()?
+            .token_ids()
+            .len();
+
+        Some(stub_len as u32)
     }
 
     async fn preprocess_request_with_options<
@@ -2681,6 +2726,7 @@ impl OpenAIPreprocessor {
         HashMap<String, String>,
         bool,
         Option<usize>,
+        Option<u32>,
     )> {
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
         let preprocess_start = Instant::now();
@@ -2781,11 +2827,9 @@ impl OpenAIPreprocessor {
             Self::validate_preprocessed_token_budget(&preprocessed, self.token_budget.as_ref())?;
         }
 
+        let client_prompt_stub = self.kimi_k3_generation_stub_len(formatted_prompt.as_ref().map(RenderedPrompt::as_str));
         Ok((
-            preprocessed,
-            annotations,
-            prompt_injected_reasoning,
-            image_tokens,
+            preprocessed, annotations, prompt_injected_reasoning, image_tokens, client_prompt_stub,
         ))
     }
 
@@ -7009,7 +7053,7 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
+        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens, client_prompt_stub) = self
             .preprocess_request_with_options(
                 &request,
                 tracker.as_deref(),
@@ -7057,6 +7101,9 @@ impl
         let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
 
         let mut response_generator = Box::new(response_generator);
+        if let Some(stub_len) = client_prompt_stub {
+            response_generator.set_client_prompt_stub(stub_len);
+        }
 
         // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
         if common_request.prompt_embeds.is_none() {

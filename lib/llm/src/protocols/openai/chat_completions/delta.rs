@@ -45,6 +45,7 @@ impl NvCreateChatCompletionRequest {
 pub struct DeltaGenerator {
     /// State shared with the text completion delta generator.
     state: DeltaGeneratorState,
+    client_prompt_stub: Option<u32>,
     /// Optional service tier information for the response.
     service_tier: Option<dynamo_protocols::types::ServiceTierResponse>,
     /// Choice indices for which the assistant role has already been emitted.
@@ -60,6 +61,7 @@ impl DeltaGenerator {
                 model,
                 options,
             ),
+            client_prompt_stub: None,
             service_tier: None,
             emitted_role_choices: HashSet::new(),
         }
@@ -76,6 +78,19 @@ impl DeltaGenerator {
     /// * `isl` - Input Sequence Length. The number of prompt tokens used.
     pub fn update_isl(&mut self, isl: u32) {
         self.state.update_isl(isl);
+    }
+
+    pub fn set_client_prompt_stub(&mut self, stub_len: u32) {
+        self.client_prompt_stub = Some(stub_len);
+    }
+
+    fn client_usage(&self) -> dynamo_protocols::types::CompletionUsage {
+        let mut usage = self.get_usage();
+        if let Some(stub) = self.client_prompt_stub {
+            usage.prompt_tokens = usage.prompt_tokens.saturating_sub(stub);
+            usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        }
+        usage
     }
 
     pub fn create_logprobs(
@@ -174,7 +189,7 @@ impl DeltaGenerator {
                 choices,
                 usage: if self.state.is_usage_enabled() && self.state.is_continuous_usage_enabled()
                 {
-                    Some(self.get_usage())
+                    Some(self.client_usage())
                 } else {
                     None
                 },
@@ -191,7 +206,7 @@ impl DeltaGenerator {
     /// # Returns
     /// * A `CreateChatCompletionStreamResponse` with empty choices and usage stats.
     pub fn create_usage_chunk(&self) -> NvCreateChatCompletionStreamResponse {
-        let usage = self.get_usage();
+        let usage = self.client_usage();
 
         NvCreateChatCompletionStreamResponse {
             inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
