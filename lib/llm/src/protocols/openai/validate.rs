@@ -126,6 +126,16 @@ static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
 static KIMI_K3_LENIENT_TOOL_ARGS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_LENIENT_TOOL_ARGS"));
 
+/// True when this frontend serves Kimi K3 and should enforce Moonshot's
+/// immutable sampling-parameter contract: `temperature` in `[0, 1]`, `top_p`
+/// exactly `0.95`, `presence_penalty` and `frequency_penalty` exactly `0`, and
+/// `n` exactly `1`. Omitted parameters are always accepted. Any other value is
+/// rejected with HTTP 400, matching the vendor API (Kimi-Vendor-Verifier
+/// `tests/params`). Set on the K3 deployment only; unset leaves every other
+/// model's accepted parameter ranges unchanged.
+static KIMI_K3_IMMUTABLE_PARAMS: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_IMMUTABLE_PARAMS"));
+
 /// Validates that no unsupported fields are present in the request.
 ///
 /// Fields in `PASSTHROUGH_EXTRA_FIELDS` are validated by downstream handlers.
@@ -935,6 +945,69 @@ pub fn validate_chat_only_generation_flags(
     Ok(())
 }
 
+/// Enforce Moonshot's immutable sampling-parameter contract for Kimi K3 when
+/// `DYN_KIMI_K3_IMMUTABLE_PARAMS` is truthy. See [`KIMI_K3_IMMUTABLE_PARAMS`].
+pub fn validate_kimi_k3_immutable_params(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    n: Option<u8>,
+) -> Result<(), anyhow::Error> {
+    validate_kimi_k3_immutable_params_with_gate(
+        temperature,
+        top_p,
+        presence_penalty,
+        frequency_penalty,
+        n,
+        *KIMI_K3_IMMUTABLE_PARAMS,
+    )
+}
+
+/// Inner form of [`validate_kimi_k3_immutable_params`] with the gate passed
+/// explicitly so tests can exercise both branches without touching the
+/// process-global `LazyLock`.
+fn validate_kimi_k3_immutable_params_with_gate(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    n: Option<u8>,
+    enforce: bool,
+) -> Result<(), anyhow::Error> {
+    if !enforce {
+        return Ok(());
+    }
+    if let Some(t) = temperature
+        && !(0.0..=1.0).contains(&t)
+    {
+        anyhow::bail!(
+            "`temperature` is immutable for this model and must be between 0.0 and 1.0, got {t}"
+        );
+    }
+    if let Some(p) = top_p
+        && p != 0.95
+    {
+        anyhow::bail!("`top_p` is immutable for this model and must be 0.95, got {p}");
+    }
+    if let Some(v) = presence_penalty
+        && v != 0.0
+    {
+        anyhow::bail!("`presence_penalty` is immutable for this model and must be 0, got {v}");
+    }
+    if let Some(v) = frequency_penalty
+        && v != 0.0
+    {
+        anyhow::bail!("`frequency_penalty` is immutable for this model and must be 0, got {v}");
+    }
+    if let Some(v) = n
+        && v != 1
+    {
+        anyhow::bail!("`n` is immutable for this model and must be 1, got {v}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1110,5 +1183,58 @@ mod tests {
             err.to_string().contains("tool_call_id"),
             "unexpected error: {err}"
         );
+    }
+
+    fn immutable(
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        presence_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        n: Option<u8>,
+        enforce: bool,
+    ) -> Result<(), anyhow::Error> {
+        validate_kimi_k3_immutable_params_with_gate(
+            temperature,
+            top_p,
+            presence_penalty,
+            frequency_penalty,
+            n,
+            enforce,
+        )
+    }
+
+    #[test]
+    fn kimi_k3_immutable_params_accepts_vendor_defaults() {
+        // Mirrors Kimi-Vendor-Verifier tests/params IMMUTABLE_PARAMS defaults.
+        immutable(None, None, None, None, None, true).unwrap();
+        for temperature in [0.0, 0.6, 1.0] {
+            immutable(Some(temperature), None, None, None, None, true).unwrap();
+        }
+        immutable(None, Some(0.95), None, None, None, true).unwrap();
+        immutable(None, None, Some(0.0), None, None, true).unwrap();
+        immutable(None, None, None, Some(0.0), None, true).unwrap();
+        immutable(None, None, None, None, Some(1), true).unwrap();
+    }
+
+    #[test]
+    fn kimi_k3_immutable_params_rejects_vendor_wrong_values() {
+        // Mirrors Kimi-Vendor-Verifier tests/params IMMUTABLE_PARAMS wrong_value.
+        for temperature in [1.1, 2.0, -0.1] {
+            let err = immutable(Some(temperature), None, None, None, None, true).unwrap_err();
+            assert!(err.to_string().contains("`temperature`"), "{err}");
+        }
+        let err = immutable(None, Some(0.8), None, None, None, true).unwrap_err();
+        assert!(err.to_string().contains("`top_p`"), "{err}");
+        let err = immutable(None, None, Some(0.5), None, None, true).unwrap_err();
+        assert!(err.to_string().contains("`presence_penalty`"), "{err}");
+        let err = immutable(None, None, None, Some(0.5), None, true).unwrap_err();
+        assert!(err.to_string().contains("`frequency_penalty`"), "{err}");
+        let err = immutable(None, None, None, None, Some(2), true).unwrap_err();
+        assert!(err.to_string().contains("`n`"), "{err}");
+    }
+
+    #[test]
+    fn kimi_k3_immutable_params_is_a_no_op_when_disabled() {
+        immutable(Some(2.0), Some(0.8), Some(0.5), Some(0.5), Some(2), false).unwrap();
     }
 }
