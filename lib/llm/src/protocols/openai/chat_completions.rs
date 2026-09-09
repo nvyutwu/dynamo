@@ -635,6 +635,10 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_top_k(self.get_top_k())?;
         // Cross-field validation
         validate::validate_n_with_temperature(self.inner.n, self.inner.temperature)?;
+        validate::validate_kimi_k3_immutable_params(
+            self.inner.temperature, self.inner.top_p, self.inner.presence_penalty,
+            self.inner.frequency_penalty, self.inner.n,
+        )?;
         validate::validate_continue_final_message(
             self.common.add_generation_prompt,
             self.common.continue_final_message,

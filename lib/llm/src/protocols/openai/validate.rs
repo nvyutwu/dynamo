@@ -123,6 +123,9 @@ static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
 /// is skipped. Set on the K3 deployment only; the Dynamo frontend is deployed
 /// per-model, so leaving it unset keeps MiniMax-M3 (which needs the guard) and
 /// every other model byte-identical to today's behavior.
+static KIMI_K3_IMMUTABLE_PARAMS: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_IMMUTABLE_PARAMS"));
+
 static KIMI_K3_LENIENT_TOOL_ARGS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_LENIENT_TOOL_ARGS"));
 
@@ -1100,4 +1103,43 @@ mod tests {
         let err = validate_messages_with_lenient_tool_args(&messages, true).unwrap_err();
         assert!(err.to_string().contains("tool_call_id"), "unexpected error: {err}");
     }
+}
+
+
+pub fn validate_kimi_k3_immutable_params(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    n: Option<u8>,
+) -> Result<(), anyhow::Error> {
+    if !*KIMI_K3_IMMUTABLE_PARAMS {
+        return Ok(());
+    }
+    if let Some(t) = temperature
+        && !(0.0..=1.0).contains(&t)
+    {
+        anyhow::bail!("`temperature` is immutable for this model and must be between 0.0 and 1.0, got {}", t);
+    }
+    if let Some(p) = top_p
+        && p != 0.95
+    {
+        anyhow::bail!("`top_p` is immutable for this model and must be 0.95, got {}", p);
+    }
+    if let Some(v) = presence_penalty
+        && v != 0.0
+    {
+        anyhow::bail!("`presence_penalty` is immutable for this model and must be 0, got {}", v);
+    }
+    if let Some(v) = frequency_penalty
+        && v != 0.0
+    {
+        anyhow::bail!("`frequency_penalty` is immutable for this model and must be 0, got {}", v);
+    }
+    if let Some(v) = n
+        && v != 1
+    {
+        anyhow::bail!("`n` is immutable for this model and must be 1, got {}", v);
+    }
+    Ok(())
 }
