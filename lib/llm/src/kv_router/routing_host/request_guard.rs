@@ -407,6 +407,7 @@ pub(super) struct CacheLossTracking {
     history: Arc<parking_lot::Mutex<CacheHistory>>,
     request: CacheHistoryRequest,
     complete: bool,
+    pending_stages: Option<[u64; 6]>,
 }
 
 impl CacheLossTracking {
@@ -429,6 +430,7 @@ impl CacheLossTracking {
             history,
             request,
             complete: false,
+            pending_stages: None,
         }
     }
 }
@@ -780,10 +782,25 @@ where
             .gpu_hit_tokens
             .saturating_add(outcome.cpu_hit_tokens)
             .min(f4);
-        self.request_metrics()
-            .observe_cache_loss_funnel([route.prompt_tokens, f1, f2, f3, f4, f5]);
+        // A terminal frame is not transport completion: the worker may still
+        // send a typed error, and the consumer may cancel or drop the stream.
         if let Some(cache_loss) = self.cache_loss.as_mut() {
-            cache_loss.complete = true;
+            cache_loss.pending_stages = Some([route.prompt_tokens, f1, f2, f3, f4, f5]);
+        }
+    }
+
+    fn record_cache_loss_complete(&mut self) {
+        if self.cache_loss_recorded {
+            return;
+        }
+        let stages = self.cache_loss.as_mut().and_then(|tracking| tracking.pending_stages.take());
+        let Some(stages) = stages else {
+            self.record_cache_loss_incomplete();
+            return;
+        };
+        self.request_metrics().observe_cache_loss_funnel(stages);
+        if let Some(tracking) = self.cache_loss.as_mut() {
+            tracking.complete = true;
         }
         self.cache_loss_recorded = true;
     }
@@ -791,6 +808,9 @@ where
     fn record_cache_loss_incomplete(&mut self) {
         if self.cache_loss_recorded || self.cache_loss.is_none() {
             return;
+        }
+        if let Some(tracking) = self.cache_loss.as_mut() {
+            tracking.pending_stages = None;
         }
         self.request_metrics().observe_cache_loss_incomplete();
         self.cache_loss_recorded = true;
@@ -959,7 +979,7 @@ where
     }
 
     pub(super) async fn finish(&mut self) {
-        self.record_cache_loss_incomplete();
+        self.record_cache_loss_complete();
         self.finalize_cache_history();
         // Metrics must observe the completed request before cleanup releases its state.
         self.observability
@@ -979,7 +999,6 @@ where
 {
     fn drop(&mut self) {
         self.record_cache_loss_incomplete();
-        self.finalize_cache_history();
         self.observability
             .record_metrics(self.record_itl_at_completion);
         // RequestCleanup drops immediately afterward and performs resource cleanup.
