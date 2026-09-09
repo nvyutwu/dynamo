@@ -1250,3 +1250,16 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+
+#[cfg(test)]
+mod k3_repetition_compat_tests {
+    use super::FinishReason;
+    #[test]
+    fn test_k3_repetition_roundtrips_for_trace_and_maps_client_stop() {
+        let reason: FinishReason = serde_json::from_str("\"repetition\"").expect("worker repetition finish must deserialize");
+        assert_eq!(reason.to_string(), "repetition");
+        assert_eq!(serde_json::to_string(&reason).unwrap(), "\"repetition\"");
+        let client: dynamo_protocols::types::CompletionFinishReason = reason.into();
+        assert_eq!(client, dynamo_protocols::types::CompletionFinishReason::Stop);
+    }
+}

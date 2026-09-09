@@ -1006,6 +1006,50 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_tool_choice_required_accepts_dynamic_message_tools() {
+        // Route A: Kimi K3 dynamic tools live on `messages[].tools`, not
+        // top-level `tools`. `tool_choice=required` must resolve against the
+        // effective union, so a dynamic-only request is accepted (v6 parity —
+        // v6's hoist made these tools visible to validation).
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [{
+                    "type": "function",
+                    "function": {"name": "Calculator", "parameters": {"type": "object", "properties": {}}}
+                }]},
+                {"role": "user", "content": "compute 1+1"}
+            ],
+            "tool_choice": "required"
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request)
+            .expect("required tool_choice is satisfied by dynamic message tools");
+    }
+
+    #[test]
+    fn test_validate_tool_choice_named_accepts_dynamic_message_tool() {
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [{
+                    "type": "function",
+                    "function": {"name": "Calculator", "parameters": {"type": "object", "properties": {}}}
+                }]},
+                {"role": "user", "content": "compute"}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "Calculator"}}
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request)
+            .expect("named tool_choice resolves against dynamic message tools");
+    }
+
+    #[test]
     fn test_validate_tool_choice_named_rejects_missing_tool() {
         let request_json = json!({
             "model": "test-model",
