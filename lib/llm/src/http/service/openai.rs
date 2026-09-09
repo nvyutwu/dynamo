@@ -7398,6 +7398,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_k3_decorated_worker_validation_error_retains_400() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use futures::stream;
+        let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None, id: None, event: Some("error".to_string()),
+            comment: Some(vec![r#"BackendInvalidArgument: {"message":"At most 8 images may be provided","code":400}"#.to_string()]),
+            error: None,
+        };
+        let result = check_for_backend_error(stream::iter(vec![error_event]), None).await;
+        let Err(response) = result else { panic!("expected worker validation error") };
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(response.1.message, "At most 8 images may be provided");
+    }
+
+    #[tokio::test]
     async fn test_check_for_backend_error_with_json_error_and_code() {
         use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
         use futures::stream;

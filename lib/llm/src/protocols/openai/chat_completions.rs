@@ -1809,6 +1809,88 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_thinking_missing_type_defaults_to_enabled() {
+        // An object-form `thinking` with the `type` key OMITTED defaults to
+        // enabled (Moonshot/K3 contract), rather than 400ing.
+        for thinking in [json!({}), json!({"keep": "all"}), json!({"keep": "all", "effort": "low"})] {
+            let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "moonshotai/Kimi-K3",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking": thinking,
+            }))
+            .expect("Failed to deserialize request");
+            request
+                .normalize_reasoning_template_args()
+                .expect("missing thinking.type should default to enabled");
+
+            let args = request
+                .chat_template_args
+                .as_ref()
+                .expect("chat_template_args should be populated");
+            assert_eq!(args.get("thinking"), Some(&json!(true)));
+            assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
+        }
+    }
+
+    #[test]
+    fn test_thinking_effort_takes_precedence_over_reasoning_effort() {
+        // Both nested thinking.effort and top-level reasoning_effort present:
+        // thinking.effort must win (the renderer prefers `thinking_effort`).
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": "max",
+            "thinking": {"type": "enabled", "keep": "all", "effort": "low"},
+        }))
+        .expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking.effort should normalize");
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking_effort"), Some(&json!("low")));
+        // reasoning_effort is still forwarded; the renderer prefers thinking_effort.
+        assert_eq!(args.get("reasoning_effort"), Some(&json!("max")));
+    }
+
+    #[test]
+    fn test_reasoning_effort_used_when_thinking_effort_absent() {
+        // Only top-level reasoning_effort present: behavior unchanged, no
+        // thinking_effort arg is emitted.
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": "max",
+            "thinking": {"type": "enabled"},
+        }))
+        .expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("reasoning_effort should normalize");
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking_effort"), None);
+        assert_eq!(args.get("reasoning_effort"), Some(&json!("max")));
+    }
+
+    #[test]
+    fn test_invalid_thinking_effort_is_rejected() {
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "effort": "bogus"},
+        }))
+        .expect("Failed to deserialize request");
+        assert!(request.normalize_reasoning_template_args().is_err());
+    }
+
+    #[test]
     fn test_invalid_openai_thinking_payload_is_rejected() {
         for invalid_thinking in [
             json!("enabled"),
