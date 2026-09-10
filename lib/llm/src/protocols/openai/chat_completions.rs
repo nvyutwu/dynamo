@@ -643,7 +643,8 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
         let effective_tools = self.effective_tools();
-        let effective_tools_ref = (!effective_tools.is_empty()).then_some(effective_tools.as_slice());
+        let effective_tools_ref =
+            (!effective_tools.is_empty()).then_some(effective_tools.as_slice());
         validate::validate_tools(&effective_tools_ref)?;
         validate::validate_tool_choice(&self.inner.tool_choice, effective_tools_ref)?;
         // none for parallel_tool_calls
@@ -657,8 +658,11 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // Cross-field validation
         validate::validate_n_with_temperature(self.inner.n, self.inner.temperature)?;
         validate::validate_kimi_k3_immutable_params(
-            self.inner.temperature, self.inner.top_p, self.inner.presence_penalty,
-            self.inner.frequency_penalty, self.inner.n,
+            self.inner.temperature,
+            self.inner.top_p,
+            self.inner.presence_penalty,
+            self.inner.frequency_penalty,
+            self.inner.n,
         )?;
         validate::validate_continue_final_message(
             self.common.add_generation_prompt,
@@ -1881,7 +1885,11 @@ mod tests {
     fn test_openai_thinking_missing_type_defaults_to_enabled() {
         // An object-form `thinking` with the `type` key OMITTED defaults to
         // enabled (Moonshot/K3 contract), rather than 400ing.
-        for thinking in [json!({}), json!({"keep": "all"}), json!({"keep": "all", "effort": "low"})] {
+        for thinking in [
+            json!({}),
+            json!({"keep": "all"}),
+            json!({"keep": "all", "effort": "low"}),
+        ] {
             let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
                 "model": "moonshotai/Kimi-K3",
                 "messages": [{"role": "user", "content": "Hello"}],

@@ -223,8 +223,11 @@ pub(crate) fn guided_tool_constraint(
         .tool_choice
         .as_ref()
         .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
-    validate_openai_tool_choice(Some(tool_choice), Some(request.effective_tools().as_slice()))
-        .map_err(|error| invalid_argument(error.to_string()))?;
+    validate_openai_tool_choice(
+        Some(tool_choice),
+        Some(request.effective_tools().as_slice()),
+    )
+    .map_err(|error| invalid_argument(error.to_string()))?;
     let is_forced_tool_choice = matches!(
         tool_choice,
         ChatCompletionToolChoiceOption::Required | ChatCompletionToolChoiceOption::Named(_)
@@ -248,7 +251,7 @@ pub(crate) fn guided_tool_constraint(
     // constraint for a `tool_choice` that names a tool absent from `tools` (or an
     // empty `tools` list under `tool_choice: "required"`).
     let effective_tools = request.effective_tools();
-        let tools = effective_tools.as_slice();
+    let tools = effective_tools.as_slice();
     match get_tool_choice_guidance_from_tools(
         Some(tool_choice),
         Some(tools),

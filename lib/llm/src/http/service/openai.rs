@@ -2107,7 +2107,9 @@ fn nvcf_header<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
 // Engage the asset path when NVCF advertises input-asset ids for this request — the ids
 // header is what NVCF actually forwards (the dir header is not reliably injected).
 fn has_nvcf_asset_ids(headers: &HeaderMap) -> bool {
-    NVCF_ASSET_IDS_HEADERS.iter().any(|n| headers.contains_key(*n))
+    NVCF_ASSET_IDS_HEADERS
+        .iter()
+        .any(|n| headers.contains_key(*n))
 }
 
 // Asset mount dir: gateway-provided header if present, else the operator env var, else the
@@ -2147,7 +2149,10 @@ fn resolve_asset_id(
         return None;
     }
     if !allowed.contains(asset_id) {
-        tracing::warn!(asset_id, "NVCF asset id not in the request allow-list (nvcf-input-asset-references)");
+        tracing::warn!(
+            asset_id,
+            "NVCF asset id not in the request allow-list (nvcf-input-asset-references)"
+        );
         return None;
     }
     let candidate = asset_root.join(asset_id);
@@ -2199,8 +2204,10 @@ fn rewrite_asset_refs(s: &str, asset_root: &Path, allowed: &HashSet<String>) -> 
                 && !mime.contains(is_asset_delim);
             if mime_ok {
                 let id_start = marker + ASSET_ID_MARKER.len();
-                let id_end =
-                    id_start + s[id_start..].find(is_asset_delim).unwrap_or(s.len() - id_start);
+                let id_end = id_start
+                    + s[id_start..]
+                        .find(is_asset_delim)
+                        .unwrap_or(s.len() - id_start);
                 let asset_id = normalize_asset_id(&s[id_start..id_end]);
                 if let Some(uri) = resolve_asset_id(&asset_id, mime, asset_root, allowed) {
                     out.push_str(&s[cursor..start]);
@@ -2291,7 +2298,9 @@ fn materialize_nvcf_asset_refs(body: &Bytes, headers: &HeaderMap) -> Bytes {
         return body.clone();
     }
     tracing::debug!(asset_root = %asset_root.display(), "NVCF asset refs inlined as base64");
-    serde_json::to_vec(&payload).map(Bytes::from).unwrap_or_else(|_| body.clone())
+    serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
 }
 
 #[cfg(test)]
@@ -2309,7 +2318,10 @@ mod nvcf_asset_tests {
         let root = std::fs::canonicalize(&dir).unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert("nvcf-input-asset-dir", root.to_str().unwrap().parse().unwrap());
+        headers.insert(
+            "nvcf-input-asset-dir",
+            root.to_str().unwrap().parse().unwrap(),
+        );
         headers.insert("nvcf-input-asset-references", asset.parse().unwrap());
 
         let body = Bytes::from(format!(
@@ -2320,20 +2332,25 @@ mod nvcf_asset_tests {
         let expected_b64 = base64::engine::general_purpose::STANDARD.encode(b"PNGDATA");
         let expected = format!("data:image/png;base64,{expected_b64}");
         assert!(out.contains(&expected), "expected {expected} in {out}");
-        assert!(!out.contains("asset_id,"), "asset_id should be resolved: {out}");
+        assert!(
+            !out.contains("asset_id,"),
+            "asset_id should be resolved: {out}"
+        );
 
         // No headers -> unchanged (byte-identical).
         assert_eq!(materialize_nvcf_asset_refs(&body, &HeaderMap::new()), body);
         // Not in allow-list -> unchanged.
         let mut h2 = HeaderMap::new();
-        h2.insert("nvcf-input-asset-dir", root.to_str().unwrap().parse().unwrap());
+        h2.insert(
+            "nvcf-input-asset-dir",
+            root.to_str().unwrap().parse().unwrap(),
+        );
         h2.insert("nvcf-input-asset-references", "other-id".parse().unwrap());
         assert_eq!(materialize_nvcf_asset_refs(&body, &h2), body);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
 
 fn parse_json_request<T>(endpoint: &'static str, body: &[u8]) -> Result<T, ErrorResponse>
 where
@@ -7407,7 +7424,9 @@ mod tests {
             error: None,
         };
         let result = check_for_backend_error(stream::iter(vec![error_event]), None).await;
-        let Err(response) = result else { panic!("expected worker validation error") };
+        let Err(response) = result else {
+            panic!("expected worker validation error")
+        };
         assert_eq!(response.0, StatusCode::BAD_REQUEST);
         assert_eq!(response.1.message, "At most 8 images may be provided");
     }
@@ -9321,10 +9340,7 @@ fn validate_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
         for tool in tools {
-            if let Some(name) = tool
-                .pointer("/function/name")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(name) = tool.pointer("/function/name").and_then(|v| v.as_str()) {
                 seen.insert(name.to_string());
             }
         }
@@ -9433,4 +9449,3 @@ fn validate_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> 
         .map_err(|e| bad_request(format!("failed to rebuild request body: {e}")))?;
     Ok(Bytes::from(bytes))
 }
-

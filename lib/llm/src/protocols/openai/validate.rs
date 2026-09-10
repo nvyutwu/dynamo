@@ -1064,14 +1064,16 @@ mod tests {
     ) -> dynamo_protocols::types::ChatCompletionRequestMessage {
         dynamo_protocols::types::ChatCompletionRequestMessage::Assistant(
             dynamo_protocols::types::ChatCompletionRequestAssistantMessage {
-                tool_calls: Some(vec![dynamo_protocols::types::ChatCompletionMessageToolCall {
-                    id: "call_1".to_string(),
-                    r#type: dynamo_protocols::types::FunctionType::Function,
-                    function: dynamo_protocols::types::FunctionCall {
-                        name: "get_weather".to_string(),
-                        arguments: arguments.to_string(),
+                tool_calls: Some(vec![
+                    dynamo_protocols::types::ChatCompletionMessageToolCall {
+                        id: "call_1".to_string(),
+                        r#type: dynamo_protocols::types::FunctionType::Function,
+                        function: dynamo_protocols::types::FunctionCall {
+                            name: "get_weather".to_string(),
+                            arguments: arguments.to_string(),
+                        },
                     },
-                }]),
+                ]),
                 ..Default::default()
             },
         )
@@ -1083,7 +1085,8 @@ mod tests {
         let messages = vec![assistant_with_tool_args(r#"{"location":"x"#)];
         let err = validate_messages_with_lenient_tool_args(&messages, false).unwrap_err();
         assert!(
-            err.to_string().contains("must be a valid JSON object string"),
+            err.to_string()
+                .contains("must be a valid JSON object string"),
             "unexpected error: {err}"
         );
     }
@@ -1106,10 +1109,12 @@ mod tests {
             },
         )];
         let err = validate_messages_with_lenient_tool_args(&messages, true).unwrap_err();
-        assert!(err.to_string().contains("tool_call_id"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("tool_call_id"),
+            "unexpected error: {err}"
+        );
     }
 }
-
 
 pub fn validate_kimi_k3_immutable_params(
     temperature: Option<f32>,
@@ -1124,22 +1129,34 @@ pub fn validate_kimi_k3_immutable_params(
     if let Some(t) = temperature
         && !(0.0..=1.0).contains(&t)
     {
-        anyhow::bail!("`temperature` is immutable for this model and must be between 0.0 and 1.0, got {}", t);
+        anyhow::bail!(
+            "`temperature` is immutable for this model and must be between 0.0 and 1.0, got {}",
+            t
+        );
     }
     if let Some(p) = top_p
         && p != 0.95
     {
-        anyhow::bail!("`top_p` is immutable for this model and must be 0.95, got {}", p);
+        anyhow::bail!(
+            "`top_p` is immutable for this model and must be 0.95, got {}",
+            p
+        );
     }
     if let Some(v) = presence_penalty
         && v != 0.0
     {
-        anyhow::bail!("`presence_penalty` is immutable for this model and must be 0, got {}", v);
+        anyhow::bail!(
+            "`presence_penalty` is immutable for this model and must be 0, got {}",
+            v
+        );
     }
     if let Some(v) = frequency_penalty
         && v != 0.0
     {
-        anyhow::bail!("`frequency_penalty` is immutable for this model and must be 0, got {}", v);
+        anyhow::bail!(
+            "`frequency_penalty` is immutable for this model and must be 0, got {}",
+            v
+        );
     }
     if let Some(v) = n
         && v != 1

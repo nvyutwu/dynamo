@@ -1071,7 +1071,10 @@ mod k3_description_policy_tests {
         strip_empty_tool_descriptions(&mut tools);
         assert!(tools[0]["function"].get("description").is_none());
         assert_eq!(tools[0]["function"]["name"], "a");
-        assert!(tools[1].get("description").is_none(), "top-level empty description dropped");
+        assert!(
+            tools[1].get("description").is_none(),
+            "top-level empty description dropped"
+        );
         assert_eq!(tools[1]["name"], "b");
     }
 }

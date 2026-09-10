@@ -506,7 +506,7 @@ fn convert_input_items_to_messages(
                                 let text = convert_input_content_to_text(&msg.content);
                                 ChatCompletionRequestMessage::System(
                                     ChatCompletionRequestSystemMessage {
-            tools: None,
+                                        tools: None,
                                         content: ChatCompletionRequestSystemMessageContent::Text(
                                             text,
                                         ),
@@ -622,7 +622,7 @@ fn convert_input_items_to_messages(
                         std::mem::take(&mut pending).flush_into(&mut messages);
                         messages.push(ChatCompletionRequestMessage::System(
                             ChatCompletionRequestSystemMessage {
-            tools: None,
+                                tools: None,
                                 content: ChatCompletionRequestSystemMessageContent::Text(text),
                                 name: None,
                             },
@@ -799,7 +799,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         if let Some(instructions) = &resp.inner.instructions {
             messages.push(ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessage {
-            tools: None,
+                    tools: None,
                     content: ChatCompletionRequestSystemMessageContent::Text(instructions.clone()),
                     name: None,
                 },
@@ -860,7 +860,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 messages.insert(
                     0,
                     ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            tools: None,
+                        tools: None,
                         content: ChatCompletionRequestSystemMessageContent::Text(combined),
                         name: None,
                     }),

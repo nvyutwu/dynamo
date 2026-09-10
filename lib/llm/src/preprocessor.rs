@@ -2650,8 +2650,8 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
     ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
-        let (request, annotations, prompt_injected_reasoning, _image_tokens, _client_prompt_stub) = self
-            .preprocess_request_with_options(
+        let (request, annotations, prompt_injected_reasoning, _image_tokens, _client_prompt_stub) =
+            self.preprocess_request_with_options(
                 request,
                 tracker,
                 PreprocessRequestOptions::default(),
@@ -2827,9 +2827,14 @@ impl OpenAIPreprocessor {
             Self::validate_preprocessed_token_budget(&preprocessed, self.token_budget.as_ref())?;
         }
 
-        let client_prompt_stub = self.kimi_k3_generation_stub_len(formatted_prompt.as_ref().map(RenderedPrompt::as_str));
+        let client_prompt_stub =
+            self.kimi_k3_generation_stub_len(formatted_prompt.as_ref().map(RenderedPrompt::as_str));
         Ok((
-            preprocessed, annotations, prompt_injected_reasoning, image_tokens, client_prompt_stub,
+            preprocessed,
+            annotations,
+            prompt_injected_reasoning,
+            image_tokens,
+            client_prompt_stub,
         ))
     }
 
@@ -3025,8 +3030,12 @@ impl OpenAIPreprocessor {
                 messages.iter().any(|message| {
                     use dynamo_protocols::types::ChatCompletionRequestMessage;
                     match message {
-                        ChatCompletionRequestMessage::System(m) => m.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
-                        ChatCompletionRequestMessage::Developer(m) => m.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+                        ChatCompletionRequestMessage::System(m) => {
+                            m.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                        }
+                        ChatCompletionRequestMessage::Developer(m) => {
+                            m.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                        }
                         _ => false,
                     }
                 })
@@ -4743,16 +4752,19 @@ impl OpenAIPreprocessor {
         // it does not need the same entry gate.
         //
         if let ToolProcessingRoute::MuseUnified(family) = &tool_processing_route {
-            let tool_definitions = Some(request.effective_tools()).filter(|tools| !tools.is_empty()).as_ref().map(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                        name: tool.function.name.clone(),
-                        parameters: tool.function.parameters.clone(),
-                        strict: tool.function.strict,
-                    })
-                    .collect()
-            });
+            let tool_definitions = Some(request.effective_tools())
+                .filter(|tools| !tools.is_empty())
+                .as_ref()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                            name: tool.function.name.clone(),
+                            parameters: tool.function.parameters.clone(),
+                            strict: tool.function.strict,
+                        })
+                        .collect()
+                });
             let unified: Pin<Box<dyn Stream<Item = _> + Send>> =
                 Box::pin(tool_parser_v2::apply_unified_stream(
                     stream,
@@ -4768,16 +4780,19 @@ impl OpenAIPreprocessor {
         }
 
         if let ToolProcessingRoute::QwenUnified(family) = &tool_processing_route {
-            let tool_definitions = Some(request.effective_tools()).filter(|tools| !tools.is_empty()).as_ref().map(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                        name: tool.function.name.clone(),
-                        parameters: tool.function.parameters.clone(),
-                        strict: tool.function.strict,
-                    })
-                    .collect()
-            });
+            let tool_definitions = Some(request.effective_tools())
+                .filter(|tools| !tools.is_empty())
+                .as_ref()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                            name: tool.function.name.clone(),
+                            parameters: tool.function.parameters.clone(),
+                            strict: tool.function.strict,
+                        })
+                        .collect()
+                });
             let unified: Pin<Box<dyn Stream<Item = _> + Send>> =
                 Box::pin(unified_parser::apply_stream_with_constraint(
                     stream,
@@ -4901,16 +4916,19 @@ impl OpenAIPreprocessor {
         let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
-        let tool_definitions = Some(request.effective_tools()).filter(|tools| !tools.is_empty()).as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                    name: tool.function.name.clone(),
-                    parameters: tool.function.parameters.clone(),
-                    strict: tool.function.strict,
-                })
-                .collect()
-        });
+        let tool_definitions = Some(request.effective_tools())
+            .filter(|tools| !tools.is_empty())
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                        name: tool.function.name.clone(),
+                        parameters: tool.function.parameters.clone(),
+                        strict: tool.function.strict,
+                    })
+                    .collect()
+            });
 
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
             match tool_processing_route {
@@ -7059,7 +7077,13 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens, client_prompt_stub) = self
+        let (
+            mut common_request,
+            annotations,
+            prompt_injected_reasoning,
+            image_tokens,
+            client_prompt_stub,
+        ) = self
             .preprocess_request_with_options(
                 &request,
                 tracker.as_deref(),

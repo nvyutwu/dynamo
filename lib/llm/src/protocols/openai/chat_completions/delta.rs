@@ -641,7 +641,10 @@ mod tests {
         // Vision: worker prompt_tokens includes image tokens (4164); stub 3 ->
         // client 4161 (image tokens preserved, not clobbered by a text-only ISL).
         let (client, metric) = client_and_metric(4164, Some(STUB));
-        assert_eq!(client, 4161, "vision client prompt_tokens = worker full - stub");
+        assert_eq!(
+            client, 4161,
+            "vision client prompt_tokens = worker full - stub"
+        );
         assert_eq!(metric, 4164);
 
         // No stub pinned (non-K3): client == worker full, byte-identical behavior.

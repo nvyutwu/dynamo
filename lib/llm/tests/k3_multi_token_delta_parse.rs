@@ -128,7 +128,8 @@ async fn run(raw_chunks: &[String], prompt_injected_reasoning: bool) -> (String,
 
 #[tokio::test]
 async fn k3_multi_token_deltas_preserve_tool_section() {
-    let think = "The user is asking for current weather in Paris. Need use get_weather tool. Call it.";
+    let think =
+        "The user is asking for current weather in Paris. Need use get_weather tool. Call it.";
     let call = "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>";
 
     let cands: Vec<(&str, String)> = vec![
@@ -141,7 +142,9 @@ async fn k3_multi_token_deltas_preserve_tool_section() {
         // D: canonical plain-chat response (the probe that is clean on staging).
         (
             "plain-response",
-            format!("{think}<|close|>think<|sep|><|open|>response<|sep|>Tokyo<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>"),
+            format!(
+                "{think}<|close|>think<|sep|><|open|>response<|sep|>Tokyo<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>"
+            ),
         ),
     ];
 
