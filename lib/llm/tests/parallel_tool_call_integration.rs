@@ -25,6 +25,7 @@ fn create_mock_chat_completion_request() -> NvCreateChatCompletionRequest {
     let messages = vec![
         dynamo_protocols::types::ChatCompletionRequestMessage::System(
             dynamo_protocols::types::ChatCompletionRequestSystemMessage {
+            tools: None,
                 content: dynamo_protocols::types::ChatCompletionRequestSystemMessageContent::Text(
                     "You MUST use two tools in parallel to resolve the user request: call get_current_weather for each city AND call is_holiday_today to check if today is a holiday. Do not answer without using both tools.".to_string()
                 ),

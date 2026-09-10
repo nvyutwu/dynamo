@@ -36,6 +36,7 @@ use crate::protocols::openai::common_ext::CommonExt;
 fn push_system_message(content: String, messages: &mut Vec<ChatCompletionRequestMessage>) {
     messages.push(ChatCompletionRequestMessage::System(
         ChatCompletionRequestSystemMessage {
+            tools: None,
             content: ChatCompletionRequestSystemMessageContent::Text(content),
             name: None,
         },
