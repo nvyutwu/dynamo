@@ -141,5 +141,5 @@ strip = false
 
 # Preserve Kimi-K3 per-message tools and named forcing; parser stays released.
 [patch.crates-io]
-dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "c8e3dfbe2dcf62af68e8f13b97ed73431493dca4" }
-dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "c8e3dfbe2dcf62af68e8f13b97ed73431493dca4" }
+dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "f79a1a5dfae551f5b027f41c9cc503297f151dbe" }
+dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "f79a1a5dfae551f5b027f41c9cc503297f151dbe" }
