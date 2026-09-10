@@ -9396,7 +9396,7 @@ fn validate_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> 
                 // top-level list; Route A no longer hoists, so restore it here
                 // (same limit + shape) so an over-long dynamic name is still a
                 // 400 (Kimi-Vendor-Verifier `too_long_257`).
-                let max_name_len = crate::protocols::openai::validate::MAX_FUNCTION_NAME_LENGTH;
+                let max_name_len = 96; // Retain the production K3 dynamic-tool name limit.
                 if name.len() > max_name_len {
                     return Err(bad_request(format!(
                         "dynamic tool name exceeds {} character limit, got {} characters",
