@@ -72,7 +72,9 @@ pub(super) fn adapt(
 fn native_finish_reason(reason: &FinishReason) -> Value {
     match reason {
         FinishReason::Length => json!({"type": "length"}),
-        FinishReason::EoS | FinishReason::Stop | FinishReason::Repetition => json!({"type": "stop"}),
+        FinishReason::EoS | FinishReason::Stop | FinishReason::Repetition => {
+            json!({"type": "stop"})
+        }
         FinishReason::Cancelled => json!({
             "type": "abort",
             "message": "request was cancelled",
