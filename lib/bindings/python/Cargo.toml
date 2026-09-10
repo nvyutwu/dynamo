@@ -139,6 +139,7 @@ inherits = "release"
 debug = true
 strip = false
 
-# Preserve Kimi-K3 per-message tools; renderer and parser remain released crates.
+# Preserve Kimi-K3 per-message tools and named forcing; parser stays released.
 [patch.crates-io]
-dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "67e23213d6cdd8d2f1d2d3903599ded63da37617" }
+dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "c8e3dfbe2dcf62af68e8f13b97ed73431493dca4" }
+dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "c8e3dfbe2dcf62af68e8f13b97ed73431493dca4" }
