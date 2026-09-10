@@ -61,8 +61,8 @@ fn apply_request_tool_call_parsing_options(
         .as_ref()
         .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
     let converted_tool_choice = crate::preprocessor::tool_choice::convert_tool_choice(tool_choice);
-    let tools = request.inner.tools.as_deref().unwrap_or(&[]);
-    let converted_tools = crate::preprocessor::tool_choice::convert_tools(tools);
+    let tools = request.effective_tools();
+    let converted_tools = crate::preprocessor::tool_choice::convert_tools(&tools);
     let uses_structural_tag = crate::preprocessor::structural_tag::structural_tag_decision(
         parsing_options.tool_call_parser.as_deref(),
         &converted_tool_choice,
@@ -109,6 +109,32 @@ mod tests {
             }]
         });
         serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    #[test]
+    fn dynamic_message_tools_reach_http_parsing_options() {
+        for choice in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            json!("auto"),
+        ] {
+            let mut value = serde_json::to_value(request(choice.clone())).unwrap();
+            let tools = value.as_object_mut().unwrap().remove("tools").unwrap();
+            value["messages"] = json!([
+                {"role": "system", "content": "", "tools": tools},
+                {"role": "user", "content": "weather in Beijing?"}
+            ]);
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(value).unwrap();
+            let options = ParsingOptions {
+                tool_call_parser: Some("kimi_k3".into()),
+                ..Default::default()
+            };
+            let result = apply_request_tool_call_parsing_options(options, &request)
+                .unwrap_or_else(|error| panic!("dynamic {choice} rejected: {error}"));
+            assert!(!result.suppress_tool_calls);
+            assert_eq!(result.tools.len(), 1);
+            assert_eq!(result.tools[0].name, "get_weather");
+        }
     }
 
     // A Kimi K2 pair with a forced/named tool_choice must resolve to the real
