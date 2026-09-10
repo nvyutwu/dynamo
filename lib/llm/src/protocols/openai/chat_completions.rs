@@ -129,6 +129,25 @@ pub struct NvCreateChatCompletionRequest {
 }
 
 impl NvCreateChatCompletionRequest {
+    pub(crate) fn effective_tools(&self) -> Vec<dynamo_protocols::types::ChatCompletionTool> {
+        use dynamo_protocols::types::ChatCompletionRequestMessage as Msg;
+        let mut out: Vec<dynamo_protocols::types::ChatCompletionTool> = Vec::new();
+        if let Some(tools) = self.inner.tools.as_ref() {
+            out.extend(tools.iter().cloned());
+        }
+        for message in &self.inner.messages {
+            let message_tools = match message {
+                Msg::System(m) => m.tools.as_ref(),
+                Msg::Developer(m) => m.tools.as_ref(),
+                _ => None,
+            };
+            if let Some(tools) = message_tools {
+                out.extend(tools.iter().cloned());
+            }
+        }
+        out
+    }
+
     /// Resolve the request's reasoning controls into `chat_template_args`.
     /// Runs once at the HTTP boundary, so every render path reads one answer.
     /// Model-specific overrides still apply later in the default preprocessor.
@@ -623,8 +642,10 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for stream_options
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
-        validate::validate_tools(&self.inner.tools.as_deref())?;
-        validate::validate_tool_choice(&self.inner.tool_choice, self.inner.tools.as_deref())?;
+        let effective_tools = self.effective_tools();
+        let effective_tools_ref = (!effective_tools.is_empty()).then_some(effective_tools.as_slice());
+        validate::validate_tools(&effective_tools_ref)?;
+        validate::validate_tool_choice(&self.inner.tool_choice, effective_tools_ref)?;
         // none for parallel_tool_calls
         validate::validate_user(self.inner.user.as_deref())?;
         // none for function call

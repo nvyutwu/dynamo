@@ -4626,11 +4626,7 @@ impl OpenAIPreprocessor {
             .as_deref()
             .is_some_and(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
         let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
-        let has_tools = request
-            .inner
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty());
+        let has_tools = !request.effective_tools().is_empty();
         let should_jail = if tool_call_parsing_enabled || parser_unwraps_all_kimi_k3_responses {
             Self::should_apply_tool_jail(
                 effective_tool_call_parser.as_ref(),
@@ -4737,7 +4733,7 @@ impl OpenAIPreprocessor {
         // it does not need the same entry gate.
         //
         if let ToolProcessingRoute::MuseUnified(family) = &tool_processing_route {
-            let tool_definitions = request.inner.tools.as_ref().map(|tools| {
+            let tool_definitions = Some(request.effective_tools()).filter(|tools| !tools.is_empty()).as_ref().map(|tools| {
                 tools
                     .iter()
                     .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
@@ -4762,7 +4758,7 @@ impl OpenAIPreprocessor {
         }
 
         if let ToolProcessingRoute::QwenUnified(family) = &tool_processing_route {
-            let tool_definitions = request.inner.tools.as_ref().map(|tools| {
+            let tool_definitions = Some(request.effective_tools()).filter(|tools| !tools.is_empty()).as_ref().map(|tools| {
                 tools
                     .iter()
                     .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
@@ -4895,7 +4891,7 @@ impl OpenAIPreprocessor {
         let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
-        let tool_definitions = request.inner.tools.as_ref().map(|tools| {
+        let tool_definitions = Some(request.effective_tools()).filter(|tools| !tools.is_empty()).as_ref().map(|tools| {
             tools
                 .iter()
                 .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {

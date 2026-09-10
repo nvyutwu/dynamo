@@ -1990,6 +1990,7 @@ async fn handler_chat_completions(
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
     let body = materialize_nvcf_asset_refs(&body, &headers);
+    let body = validate_dynamic_message_tools(&body)?;
     let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
     if *FORCE_INCLUDE_USAGE && request.inner.stream.unwrap_or(false) {
         delta_common::force_include_usage(&mut request.inner.stream_options);
@@ -9268,3 +9269,169 @@ mod tests {
         assert!(response.inner.usage.is_none());
     }
 }
+
+fn bad_request(message: impl Into<String>) -> ErrorResponse {
+    ErrorMessage::from_http_error(HttpError {
+        code: 400,
+        message: message.into(),
+    })
+}
+
+/// Moonshot's dynamic-tool name rule: the name must start with an ASCII letter
+/// or underscore, then contain only ASCII letters, digits, underscores, or
+/// dashes. This is stricter than dynamo's stock `validate_tools`, which permits
+/// a leading digit (e.g. `1bad_name`); Moonshot rejects that. Applied only to
+/// hoisted dynamic tools so top-level tool validation (and the 40/40 passing
+/// tool_call_json_schema suite) is unchanged.
+fn is_valid_dynamic_tool_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn validate_dynamic_message_tools(body: &Bytes) -> Result<Bytes, ErrorResponse> {
+    // Route A: Kimi K3 message-level dynamic `tools` (`messages[].tools`) are
+    // now preserved on the typed message (see dynamo_protocols
+    // `ChatCompletionRequest{System,Developer}Message.tools`) and rendered IN
+    // PLACE by the K3 renderer, byte-matching Moonshot `encoding_k3.py`. This
+    // function therefore NO LONGER hoists/merges dynamic tools to the top level
+    // (which produced the empty-system + merged-block token artifacts). It only:
+    //   (1) VALIDATES dynamic tools (the checks the Kimi-Vendor-Verifier
+    //       dynamic-tool suite asserts as 400s), and
+    //   (2) normalizes an absent/null `content` to "" so the content-required
+    //       typed layer accepts a `{"role":"system","tools":[...]}` message —
+    //       token-stream neutral, since the renderer ignores content for a
+    //       tool-carrying system message.
+    // It does NOT set `__dynamo_tools_are_dynamic`; top-level tools now always
+    // render under the short header (matching the reference), so
+    // `OAIChatLikeRequest::tools_are_dynamic()` is always false.
+    let mut root: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        // Not valid JSON, or not an object at the top level: leave it for the
+        // typed parser to reject with its standard error.
+        Err(_) => return Ok(body.clone()),
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(body.clone());
+    };
+
+    // Seed the dedup set with any existing top-level (global) tool names.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
+        for tool in tools {
+            if let Some(name) = tool
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+            {
+                seen.insert(name.to_string());
+            }
+        }
+    }
+
+    let mut saw_dynamic = false;
+    let mut normalized_content = false;
+    if let Some(messages) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        for message in messages.iter_mut() {
+            let Some(map) = message.as_object_mut() else {
+                continue;
+            };
+            // Inspect `tools` WITHOUT removing it — it must survive to the typed
+            // layer + renderer.
+            let Some(tools_val) = map.get("tools") else {
+                continue; // no dynamic tools on this message
+            };
+            if tools_val.is_null() {
+                continue;
+            }
+            saw_dynamic = true;
+
+            // Only the system role may declare dynamic tools.
+            if map.get("role").and_then(|v| v.as_str()) != Some("system") {
+                return Err(bad_request(
+                    "dynamic `tools` are only allowed in a system message",
+                ));
+            }
+            // Content must be absent/null/empty when dynamic tools are present.
+            let content_nonempty = match map.get("content") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(s)) => !s.is_empty(),
+                Some(_) => true,
+            };
+            if content_nonempty {
+                return Err(bad_request(
+                    "a system message with dynamic `tools` must have empty content",
+                ));
+            }
+            // `tools` must be an array.
+            let Some(arr) = tools_val.as_array() else {
+                return Err(bad_request("message `tools` must be an array"));
+            };
+            for tool in arr {
+                // Each item must be an object.
+                let Some(t) = tool.as_object() else {
+                    return Err(bad_request("each dynamic tool must be an object"));
+                };
+                // Must be a function tool.
+                if t.get("type").and_then(|v| v.as_str()) != Some("function") {
+                    return Err(bad_request("dynamic tool `type` must be \"function\""));
+                }
+                // Must carry a function name.
+                let name = tool
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| bad_request("dynamic tool missing `function.name`"))?;
+                // Enforce Moonshot's dynamic-tool name rule (stricter than the
+                // stock charset check, which allows a leading digit).
+                if !is_valid_dynamic_tool_name(name) {
+                    return Err(bad_request(format!(
+                        "dynamic tool name \"{name}\" is invalid: must start with a letter or \
+                         underscore and contain only letters, digits, underscores, or dashes"
+                    )));
+                }
+                // Enforce the function-name length limit. Under v6's hoist this
+                // was applied by `validate_tools` once the tool reached the
+                // top-level list; Route A no longer hoists, so restore it here
+                // (same limit + shape) so an over-long dynamic name is still a
+                // 400 (Kimi-Vendor-Verifier `too_long_257`).
+                let max_name_len = crate::protocols::openai::validate::MAX_FUNCTION_NAME_LENGTH;
+                if name.len() > max_name_len {
+                    return Err(bad_request(format!(
+                        "dynamic tool name exceeds {} character limit, got {} characters",
+                        max_name_len,
+                        name.len()
+                    )));
+                }
+                // Reject duplicates (against global tools and earlier dynamic tools).
+                if !seen.insert(name.to_string()) {
+                    return Err(bad_request(format!("duplicate tool name: {name}")));
+                }
+            }
+
+            // A system message requires `content`. The vendor omits `content`
+            // entirely (or sends null) alongside dynamic tools, so normalize it
+            // to an empty string here to keep the typed parse valid. The
+            // renderer ignores content for a tool-carrying system message, so
+            // this does not change the rendered token stream.
+            if !matches!(map.get("content"), Some(serde_json::Value::String(_))) {
+                map.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+                normalized_content = true;
+            }
+        }
+    }
+
+    // Nothing dynamic, or nothing needed normalizing: return original bytes.
+    if !saw_dynamic || !normalized_content {
+        return Ok(body.clone());
+    }
+
+    let bytes = serde_json::to_vec(&root)
+        .map_err(|e| bad_request(format!("failed to rebuild request body: {e}")))?;
+    Ok(Bytes::from(bytes))
+}
+

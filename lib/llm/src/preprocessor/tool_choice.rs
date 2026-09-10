@@ -30,7 +30,7 @@ impl OpenAIPreprocessor {
     /// Assistant-output constraints apply to assistant content and do not revoke
     /// an `auto` request's ability to choose a tool call.
     pub(crate) fn tool_call_parsing_enabled(request: &NvCreateChatCompletionRequest) -> bool {
-        if request.inner.tools.as_ref().is_none_or(Vec::is_empty) {
+        if request.effective_tools().is_empty() {
             return false;
         }
 
@@ -67,7 +67,8 @@ impl OpenAIPreprocessor {
             .tool_choice
             .as_ref()
             .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
-        let tools = request.inner.tools.as_deref().unwrap_or(&[]);
+        let effective_tools = request.effective_tools();
+        let tools = effective_tools.as_slice();
         let is_forced_tool_choice = matches!(
             tool_choice,
             ChatCompletionToolChoiceOption::Required | ChatCompletionToolChoiceOption::Named(_)
@@ -222,7 +223,7 @@ pub(crate) fn guided_tool_constraint(
         .tool_choice
         .as_ref()
         .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
-    validate_openai_tool_choice(Some(tool_choice), request.inner.tools.as_deref())
+    validate_openai_tool_choice(Some(tool_choice), Some(request.effective_tools().as_slice()))
         .map_err(|error| invalid_argument(error.to_string()))?;
     let is_forced_tool_choice = matches!(
         tool_choice,
@@ -246,7 +247,8 @@ pub(crate) fn guided_tool_constraint(
     // `apply_tool_choice_guided_decoding` does, instead of blindly installing a
     // constraint for a `tool_choice` that names a tool absent from `tools` (or an
     // empty `tools` list under `tool_choice: "required"`).
-    let tools = request.inner.tools.as_deref().unwrap_or(&[]);
+    let effective_tools = request.effective_tools();
+        let tools = effective_tools.as_slice();
     match get_tool_choice_guidance_from_tools(
         Some(tool_choice),
         Some(tools),
