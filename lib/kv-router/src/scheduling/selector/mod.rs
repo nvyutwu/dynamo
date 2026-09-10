@@ -276,6 +276,8 @@ fn selection_result(
     block_size: u32,
 ) -> WorkerSelectionResult {
     WorkerSelectionResult {
+        score_decision: None,
+        decision_explanation: None,
         worker,
         required_blocks: request.request_blocks(block_size),
         effective_overlap_blocks: request.effective_overlap_blocks_for(worker),
@@ -380,13 +382,49 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
 
     let weights = selection_weights(kv_router_config, request);
     let input = MaterializedSelectionInput::new(request, block_size, weights);
+    let trace_enabled = crate::protocols::routing_decision_trace_enabled();
+    let mut score_decision = None;
+    let mut decision_explanation = None;
     let selected = match state {
         WorkerSelectionPolicyStateRef::Default(picker) => {
             let scorer = DefaultWorkerScorer {
                 kv_router_config,
                 worker_type,
             };
-            pick_default_worker(&scorer, picker, &input, workers, request, eligibility)
+            let selected =
+                pick_default_worker(&scorer, picker, &input, workers, request, eligibility);
+            if trace_enabled && let Some((worker, _)) = selected {
+                score_decision =
+                    Some(scorer.score_decision(&input, workers, request, eligibility, worker));
+                let mut explanation = crate::protocols::RoutingDecisionExplanation::unavailable(
+                    "default", worker, "",
+                );
+                explanation.kind = "additive_score".into();
+                explanation.policy_instance = Some("default".into());
+                explanation.eligibility_scope = "host_eligible".into();
+                explanation.reason = None;
+                // Configuration identity excludes time, worker state and selection outcomes.
+                let score = score_decision.as_ref().unwrap();
+                let identity = format!(
+                    "{:?}",
+                    (
+                        score.router_temperature,
+                        score.track_prefill_tokens,
+                        score.overlap_score_credit,
+                        score.overlap_score_credit_decay,
+                        score.prefill_load_scale,
+                        score.shared_cache_multiplier,
+                        score.host_cache_hit_weight,
+                        score.disk_cache_hit_weight,
+                        score.decode_active_request_weight,
+                        worker_type,
+                    )
+                );
+                explanation.configuration_identity =
+                    Some(format!("blake3:{}", blake3::hash(identity.as_bytes())));
+                decision_explanation = Some(Box::new(explanation));
+            }
+            selected
         }
         WorkerSelectionPolicyStateRef::Custom(state) => {
             let mut state = state.borrow_mut();
@@ -423,7 +461,11 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                         .contains(WorkerInputs::LOAD)
                         .then_some(load_inputs.as_slice()),
                 };
-                let row = picker.pick(&input.context, picker_input)?;
+                let (row, explanation) = if trace_enabled {
+                    picker.pick_with_explanation(&input.context, picker_input)?
+                } else {
+                    (picker.pick(&input.context, picker_input)?, None)
+                };
                 let Some(candidate) = candidates.get(row) else {
                     return Err(WorkerSelectionPolicyError::InvalidPickerRow {
                         row,
@@ -431,6 +473,30 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                     }
                     .into());
                 };
+                if trace_enabled {
+                    let mut explanation = explanation.unwrap_or_else(|| {
+                        crate::protocols::RoutingDecisionExplanation::unavailable(
+                            "custom",
+                            candidate.worker,
+                            "picker_does_not_supply_explanation",
+                        )
+                    });
+                    // The host owns row validation and candidate scope even for custom evidence.
+                    explanation.selected_worker = candidate.worker;
+                    explanation.eligibility_scope = "host_eligible_after_policy_filters".into();
+                    if let Some(rule) = explanation.two_tier_rule.as_mut() {
+                        rule.candidate_count = candidates.len();
+                        rule.load_observed_candidate_count = Some(
+                            candidates
+                                .iter()
+                                .filter(|row| request.worker_loads.contains_key(&row.worker))
+                                .count(),
+                        );
+                        rule.selected_load_observed =
+                            Some(request.worker_loads.contains_key(&candidate.worker));
+                    }
+                    decision_explanation = Some(Box::new(explanation));
+                }
                 Some((candidate.worker, candidate.cost))
             }
         }
@@ -445,7 +511,9 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         }
         return Err(KvSchedulerError::NoEndpoints);
     };
-    let result = selection_result(request, worker, block_size);
+    let mut result = selection_result(request, worker, block_size);
+    result.score_decision = score_decision;
+    result.decision_explanation = decision_explanation;
     log_selection(
         workers,
         request,

@@ -36,6 +36,12 @@ const UNSET_DP_RANK_LABEL: &str = "none";
 /// that a CPU-RAM-only transfer mechanism could potentially reuse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingDecisionTrace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_explanation: Option<Box<dynamo_kv_router::protocols::RoutingDecisionExplanation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_instance: Option<String>,
     pub schema: String,
     pub candidate_scope: String,
     pub block_size: u32,
@@ -904,9 +910,106 @@ mod tests {
     }
 
     #[test]
+    fn routing_decision_v2_serializes_real_selector_evidence() {
+        use dynamo_kv_router::protocols::{RoutingConstraints, WorkerConfigLike, WorkerWithDpRank};
+        use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
+        use dynamo_kv_router::{
+            DefaultWorkerSelector, KvRouterConfig, SchedulingRequest, WorkerSelectionInput,
+            WorkerSelector,
+        };
+        struct Config;
+        impl WorkerConfigLike for Config {
+            fn data_parallel_start_rank(&self) -> u32 {
+                0
+            }
+            fn data_parallel_size(&self) -> u32 {
+                1
+            }
+            fn max_num_batched_tokens(&self) -> Option<u64> {
+                None
+            }
+            fn total_kv_blocks(&self) -> Option<u64> {
+                None
+            }
+        }
+        let worker = WorkerWithDpRank::from_worker_id(9_007_199_254_740_993);
+        let workers = std::collections::HashMap::from([(worker.worker_id, Config)]);
+        let request = SchedulingRequest {
+            mode: ScheduleMode::QueryOnly {
+                request_id: Some("synthetic-trace".into()),
+            },
+            token_seq: None,
+            isl_tokens: 64,
+            lora_name: None,
+            expected_output_tokens: None,
+            affinity_target: None,
+            pinned_worker: None,
+            allowed_worker_ids: None,
+            routing_constraints: RoutingConstraints::default(),
+            router_config_override: None,
+            track_prefill_tokens: true,
+            priority_jump: 0.0,
+            strict_priority: 0,
+            policy_class: None,
+            session_context: None,
+            overlap: OverlapSignals::default(),
+            kv_transfer_candidates: None,
+            retain_kv_transfer_chain: false,
+            shared_cache_hits: None,
+            worker_loads: Default::default(),
+            resp_tx: None,
+        };
+        let result = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "prefill")
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+        let trace = RoutingDecisionTrace {
+            schema: "dynamo.router.decision.v44.v2".into(),
+            score_decision: result.score_decision,
+            decision_explanation: result.decision_explanation,
+            frontend_instance: Some("synthetic-frontend".into()),
+            candidate_scope: "selected_and_best_eligible_cache_holder".into(),
+            block_size: 16,
+            input_tokens: 64,
+            selected: RoutingDecisionCandidate {
+                worker_id: result.worker.worker_id,
+                dp_rank: result.worker.dp_rank,
+                effective_overlap_blocks: result.effective_overlap_blocks,
+                cached_tokens: result.cached_tokens,
+                hbm_blocks: 0,
+                cpu_ram_cumulative_blocks: 0,
+                cpu_ram_only_blocks: 0,
+                disk_cumulative_blocks: 0,
+            },
+            eligible_oracle: None,
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let decoded: RoutingDecisionTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.selected.worker_id, worker.worker_id);
+        if dynamo_kv_router::protocols::routing_decision_trace_enabled() {
+            assert!(decoded.score_decision.is_some());
+            assert_eq!(
+                decoded.decision_explanation.unwrap().selected_worker,
+                worker
+            );
+        } else {
+            assert!(decoded.score_decision.is_none());
+            assert!(decoded.decision_explanation.is_none());
+        }
+        println!("ROUTING_DECISION_FIXTURE={json}");
+    }
+
+    #[test]
     fn routing_decision_trace_is_first_write_wins() {
         let tracker = RequestTracker::new();
         let trace = RoutingDecisionTrace {
+            score_decision: None,
+            decision_explanation: None,
+            frontend_instance: None,
             schema: "dynamo.router.decision.v44.v1".to_string(),
             candidate_scope: "selected_and_best_eligible_cache_holder".to_string(),
             block_size: 16,
@@ -925,6 +1028,9 @@ mod tests {
         };
         tracker.record_routing_decision_trace(trace);
         tracker.record_routing_decision_trace(RoutingDecisionTrace {
+            score_decision: None,
+            decision_explanation: None,
+            frontend_instance: None,
             schema: "ignored".to_string(),
             candidate_scope: "ignored".to_string(),
             block_size: 1,

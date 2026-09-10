@@ -1060,8 +1060,134 @@ pub enum RouterResponse {
     },
 }
 
+/// Decision-time score inputs, captured from the same immutable admission view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingCandidateScore {
+    pub worker: WorkerWithDpRank,
+    pub cached_tokens: usize,
+    pub load_observed: bool,
+    pub active_prefill_tokens: usize,
+    pub active_decode_blocks: usize,
+    pub additional_active_blocks: usize,
+    pub raw_prefill_blocks: f64,
+    pub device_overlap_blocks: f64,
+    pub host_overlap_blocks: f64,
+    pub disk_overlap_blocks: f64,
+    pub shared_overlap_blocks: f64,
+    pub overlap_credit_decay: f64,
+    pub overlap_credit_blocks: f64,
+    pub prefill_cost_blocks: f64,
+    pub decode_cost_blocks: f64,
+    pub preference_multiplier: f64,
+    pub total_cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_requests: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_request_cost_blocks: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_overlap_adjusted_blocks: Option<f64>,
+}
+
+/// Bounded explanation of a selection, before scheduler reservation. No block hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingScoreDecision {
+    pub selection_unix_ms: u64,
+    pub method: String,
+    pub router_temperature: f64,
+    pub track_prefill_tokens: bool,
+    pub min_active_prefill_tokens: usize,
+    pub overlap_score_credit: f64,
+    pub overlap_score_credit_decay: f64,
+    pub prefill_load_scale: f64,
+    pub shared_cache_multiplier: f64,
+    pub host_cache_hit_weight: f64,
+    pub disk_cache_hit_weight: f64,
+    pub request_override_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_active_request_weight: Option<f64>,
+    pub selected: RoutingCandidateScore,
+    pub eligible_oracle: Option<RoutingCandidateScore>,
+}
+
+/// Numerical explanation produced during selection, before reservation. Costs remain in
+/// scheduler model units. Missing explanations never imply a zero additive cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingDecisionExplanation {
+    pub schema: String,
+    pub kind: String,
+    pub policy_type: String,
+    pub policy_instance: Option<String>,
+    pub configuration_identity: Option<String>,
+    pub eligibility_scope: String,
+    pub selected_worker: WorkerWithDpRank,
+    pub reason: Option<String>,
+    pub two_tier_rule: Option<RoutingTwoTierRule>,
+}
+
+/// Exact effective inputs and branch outcomes of the two-tier picker. Loads are host
+/// projections, which can default to zero when absent; observation counts preserve that fact.
+/// Candidate row order is deliberately retained, not sorted for tracing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingTwoTierRule {
+    pub cache_threshold: f64,
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f64,
+    pub request_blocks: u64,
+    pub min_active_requests: usize,
+    pub max_active_requests: usize,
+    pub max_device_overlap_blocks: f64,
+    pub cache_ratio: f64,
+    pub absolute_load_gate: bool,
+    pub relative_load_gate: bool,
+    pub cache_gate: bool,
+    pub selected_rule: String,
+    pub selected_row: usize,
+    pub selected_device_overlap_blocks: f64,
+    pub selected_active_requests: usize,
+    pub tie_strategy: String,
+    pub tie_count: usize,
+    pub candidate_count: usize,
+    pub load_observed_candidate_count: Option<usize>,
+    pub selected_load_observed: Option<bool>,
+}
+
+impl RoutingDecisionExplanation {
+    pub fn unavailable(policy_type: &str, selected_worker: WorkerWithDpRank, reason: &str) -> Self {
+        Self {
+            schema: "dynamo.router.explanation.v1".into(),
+            kind: "unavailable".into(),
+            policy_type: policy_type.into(),
+            policy_instance: None,
+            configuration_identity: None,
+            eligibility_scope: "host_eligible_after_policy_filters".into(),
+            selected_worker,
+            reason: Some(reason.into()),
+            two_tier_rule: None,
+        }
+    }
+}
+
+fn decision_trace_flag_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Shared opt-in for picker evidence and frontend trace propagation.
+/// Read once per selection; no environment mutation is performed by routing.
+pub fn routing_decision_trace_enabled() -> bool {
+    std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED")
+        .ok()
+        .is_some_and(|value| decision_trace_flag_value(&value))
+}
+
 #[derive(Debug)]
 pub struct WorkerSelectionResult {
+    pub score_decision: Option<Box<RoutingScoreDecision>>,
+    pub decision_explanation: Option<Box<RoutingDecisionExplanation>>,
     /// The full worker information including dp_rank
     pub worker: WorkerWithDpRank,
 
@@ -2811,5 +2937,18 @@ mod tests {
             serde_json::to_string(&load).unwrap(),
             r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4,"active_requests":2}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_trace_flag_tests {
+    #[test]
+    fn decision_trace_truthy_values_are_normalized() {
+        for value in ["1", "true", "yes", "on", " TRUE ", "On"] {
+            assert!(super::decision_trace_flag_value(value));
+        }
+        for value in ["0", "false", "", "off", "no", "anything"] {
+            assert!(!super::decision_trace_flag_value(value));
+        }
     }
 }

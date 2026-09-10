@@ -74,14 +74,7 @@ const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
 const CACHE_RESIDENCY_TIERS: [&str; 2] = ["hbm", "cpu"];
 
 fn router_decision_trace_enabled() -> bool {
-    std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    dynamo_kv_router::protocols::routing_decision_trace_enabled()
 }
 
 fn routing_decision_candidate(
@@ -122,7 +115,10 @@ fn record_routing_decision_trace(
         )
     });
     tracker.record_routing_decision_trace(RoutingDecisionTrace {
-        schema: "dynamo.router.decision.v44.v1".to_string(),
+        schema: "dynamo.router.decision.v44.v2".to_string(),
+        score_decision: selection.score_decision.clone(),
+        decision_explanation: selection.decision_explanation.clone(),
+        frontend_instance: std::env::var("HOSTNAME").ok(),
         candidate_scope: "selected_and_best_eligible_cache_holder".to_string(),
         block_size,
         input_tokens,

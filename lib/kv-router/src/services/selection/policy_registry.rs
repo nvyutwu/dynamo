@@ -237,14 +237,30 @@ impl WorkerSelectionPolicyRegistry {
                 available: self.available_policy_types(),
             }
         })?;
-        provider(&WorkerSelectionPolicyParameters::new(
+        let factory = provider(&WorkerSelectionPolicyParameters::new(
             instance.parameters().clone(),
         ))
-        .map(Some)
         .map_err(|source| WorkerSelectionPolicyRegistryError::Provider {
             policy_type: instance.policy_type().to_owned(),
             source,
-        })
+        })?;
+        let policy_type = instance.policy_type().to_owned();
+        let instance_name = selected.to_owned();
+        // Hash the configured representation at startup; the picker separately records resolved
+        // parameters. Do not retain or expose arbitrary custom-policy parameter contents.
+        let identity = serde_yaml::to_string(instance.parameters())
+            .ok()
+            .map(|parameters| {
+                format!(
+                    "blake3:{}",
+                    blake3::hash(format!("{policy_type}\0{parameters}").as_bytes())
+                )
+            });
+        Ok(Some(Arc::new(move |config, worker_type, partition| {
+            let mut policy = factory(config, worker_type, partition);
+            policy.set_trace_identity(policy_type.clone(), instance_name.clone(), identity.clone());
+            policy
+        })))
     }
 
     fn available_policy_types(&self) -> String {

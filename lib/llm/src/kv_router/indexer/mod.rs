@@ -584,8 +584,9 @@ mod tests {
         approx::PruneConfig,
         indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics, RoutingDecisionHashes},
         protocols::{
-            BlockHashOptions, LocalBlockHash, StorageTier, TokensWithHashes, WorkerWithDpRank,
-            compute_block_hash_for_seq, compute_seq_hash_for_block,
+            BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
+            KvCacheRemoveData, LocalBlockHash, RouterEvent, StorageTier, TokensWithHashes,
+            WorkerWithDpRank, compute_block_hash_for_seq, compute_seq_hash_for_block,
         },
     };
 
@@ -786,6 +787,166 @@ mod tests {
                 .get(&StorageTier::Disk)
                 .and_then(|tier| tier.hits.get(&worker)),
             Some(&1)
+        );
+    }
+
+    /// Exact Device/HostPinned membership lifecycle used by the Kimi-K3
+    /// cache-observability qualification. A duplicate host residency must not
+    /// inflate overlap while Device is present; it must become visible after
+    /// Device removal, disappear on host removal, and support restoration.
+    #[tokio::test]
+    async fn routing_decision_gpu_cpu_store_remove_membership_transition() {
+        let indexer = make_test_indexer();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let other_rank = WorkerWithDpRank::new(7, 1);
+        let hashes = vec![LocalBlockHash(41), LocalBlockHash(42)];
+        let sequence_hashes: Vec<ExternalSequenceBlockHash> = compute_seq_hash_for_block(&hashes)
+            .into_iter()
+            .map(ExternalSequenceBlockHash)
+            .collect();
+        let remove_event = |event_id, dp_rank, storage_tier| {
+            RouterEvent::with_storage_tier(
+                worker.worker_id,
+                KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Removed(KvCacheRemoveData {
+                        block_hashes: sequence_hashes.clone(),
+                    }),
+                    dp_rank,
+                },
+                storage_tier,
+            )
+        };
+
+        // 0 -> GPU(2), CPU(0).
+        indexer
+            .apply_event(store_event(7, 0, 1, &[], &[41, 42], StorageTier::Device))
+            .await;
+        flush_indexer(&indexer).await;
+        let after_gpu_store = indexer.find_matches_by_tier(hashes.clone()).await.unwrap();
+        assert_eq!(
+            after_gpu_store.device.overlap_scores.scores.get(&worker),
+            Some(&2)
+        );
+        assert!(after_gpu_store.lower_tier.is_empty());
+
+        // Same blocks also become host-resident. The query remains Device(2),
+        // HostPinned continuation(0): dual residency cannot double count.
+        indexer
+            .apply_event(store_event(
+                7,
+                0,
+                2,
+                &[],
+                &[41, 42],
+                StorageTier::HostPinned,
+            ))
+            .await;
+        flush_indexer(&indexer).await;
+        let after_cpu_store = indexer.find_matches_by_tier(hashes.clone()).await.unwrap();
+        assert_eq!(
+            after_cpu_store.device.overlap_scores.scores.get(&worker),
+            Some(&2)
+        );
+        assert_eq!(
+            after_cpu_store
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|tier| tier.hits.get(&worker))
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+
+        // GPU eviction reveals the surviving CPU copy: GPU(0), CPU(2).
+        indexer
+            .apply_event(remove_event(3, 0, StorageTier::Device))
+            .await;
+        flush_indexer(&indexer).await;
+        let after_gpu_remove = indexer.find_matches_by_tier(hashes.clone()).await.unwrap();
+        assert!(
+            !after_gpu_remove
+                .device
+                .overlap_scores
+                .scores
+                .contains_key(&worker)
+        );
+        assert_eq!(
+            after_gpu_remove
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|tier| tier.hits.get(&worker)),
+            Some(&2)
+        );
+
+        // CPU eviction clears the final residency: GPU(0), CPU(0).
+        indexer
+            .apply_event(remove_event(4, 0, StorageTier::HostPinned))
+            .await;
+        flush_indexer(&indexer).await;
+        let after_cpu_remove = indexer.find_matches_by_tier(hashes.clone()).await.unwrap();
+        assert!(
+            !after_cpu_remove
+                .device
+                .overlap_scores
+                .scores
+                .contains_key(&worker)
+        );
+        assert!(
+            after_cpu_remove
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|tier| tier.hits.get(&worker))
+                .is_none()
+        );
+
+        // A later CPU store restores HostPinned membership.
+        indexer
+            .apply_event(store_event(
+                7,
+                0,
+                5,
+                &[],
+                &[41, 42],
+                StorageTier::HostPinned,
+            ))
+            .await;
+        flush_indexer(&indexer).await;
+        let after_restore = indexer.find_matches_by_tier(hashes.clone()).await.unwrap();
+        assert_eq!(
+            after_restore
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|tier| tier.hits.get(&worker)),
+            Some(&2)
+        );
+        assert!(
+            after_restore
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|tier| tier.hits.get(&other_rank))
+                .is_none(),
+            "rank 0 events must not create rank 1 membership"
+        );
+
+        indexer
+            .reset_worker_dp_rank_and_wait(worker.worker_id, worker.dp_rank)
+            .await
+            .unwrap();
+        let after_reset = indexer.find_matches_by_tier(hashes).await.unwrap();
+        assert!(
+            !after_reset
+                .device
+                .overlap_scores
+                .scores
+                .contains_key(&worker)
+        );
+        assert!(
+            after_reset
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|tier| tier.hits.get(&worker))
+                .is_none()
         );
     }
 

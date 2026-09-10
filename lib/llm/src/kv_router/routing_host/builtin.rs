@@ -85,6 +85,8 @@ impl WorkerSelector<ModelRuntimeConfig> for BuiltinWorkerSelector {
 
 fn selection(worker_id: u64) -> WorkerSelectionResult {
     WorkerSelectionResult {
+        score_decision: None,
+        decision_explanation: None,
         worker: WorkerWithDpRank::from_worker_id(worker_id),
         required_blocks: 0,
         effective_overlap_blocks: 0.0,

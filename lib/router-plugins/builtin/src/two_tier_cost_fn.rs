@@ -100,37 +100,86 @@ fn select_row(
     load: &[WorkerLoadInput],
     request_blocks: u64,
 ) -> Option<usize> {
+    select_row_with_evidence(parameters, cache, load, request_blocks, false).map(|(row, _)| row)
+}
+
+fn select_row_with_evidence(
+    parameters: &Parameters,
+    cache: &[WorkerCacheInput],
+    load: &[WorkerLoadInput],
+    request_blocks: u64,
+    capture: bool,
+) -> Option<(
+    usize,
+    Option<dynamo_kv_router::protocols::RoutingTwoTierRule>,
+)> {
     if cache.is_empty() || cache.len() != load.len() {
         return None;
     }
-
     let min_load = load.iter().map(|item| item.active_requests()).min()?;
     let max_load = load.iter().map(|item| item.active_requests()).max()?;
-    if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
-        && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
-    {
-        return least_loaded(load, 0..load.len());
-    }
-
-    let max_overlap = cache
-        .iter()
-        .map(|item| item.device_overlap_blocks())
-        .max_by(f64::total_cmp)?;
+    let absolute_load_gate = max_load.saturating_sub(min_load) > parameters.balance_abs_threshold;
+    let relative_load_gate =
+        (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64);
+    // Preserve the ordinary load-tier early return's work when tracing is off.
+    let max_overlap = if capture || !(absolute_load_gate && relative_load_gate) {
+        cache
+            .iter()
+            .map(|item| item.device_overlap_blocks())
+            .max_by(f64::total_cmp)?
+    } else {
+        0.0
+    };
     let cache_ratio = if request_blocks == 0 {
         0.0
     } else {
         max_overlap / request_blocks as f64
     };
-    if cache_ratio > parameters.cache_threshold {
-        return least_loaded(
-            load,
-            cache.iter().enumerate().filter_map(|(row, item)| {
-                (item.device_overlap_blocks() == max_overlap).then_some(row)
-            }),
-        );
-    }
-
-    least_loaded(load, 0..load.len())
+    let cache_gate = cache_ratio > parameters.cache_threshold;
+    let (row, rule) = if absolute_load_gate && relative_load_gate {
+        (least_loaded(load, 0..load.len())?, "load_imbalance")
+    } else if cache_gate {
+        (
+            least_loaded(
+                load,
+                cache.iter().enumerate().filter_map(|(row, item)| {
+                    (item.device_overlap_blocks() == max_overlap).then_some(row)
+                }),
+            )?,
+            "device_cache_affinity",
+        )
+    } else {
+        (least_loaded(load, 0..load.len())?, "least_loaded_fallback")
+    };
+    let evidence = capture.then(|| dynamo_kv_router::protocols::RoutingTwoTierRule {
+        cache_threshold: parameters.cache_threshold,
+        balance_abs_threshold: parameters.balance_abs_threshold,
+        balance_rel_threshold: parameters.balance_rel_threshold,
+        request_blocks,
+        min_active_requests: min_load,
+        max_active_requests: max_load,
+        max_device_overlap_blocks: max_overlap,
+        cache_ratio,
+        absolute_load_gate,
+        relative_load_gate,
+        cache_gate,
+        selected_rule: rule.into(),
+        selected_row: row,
+        selected_device_overlap_blocks: cache[row].device_overlap_blocks(),
+        selected_active_requests: load[row].active_requests(),
+        tie_strategy: "first_candidate_row".into(),
+        tie_count: (0..load.len())
+            .filter(|&other| {
+                load[other].active_requests() == load[row].active_requests()
+                    && (rule != "device_cache_affinity"
+                        || cache[other].device_overlap_blocks() == max_overlap)
+            })
+            .count(),
+        candidate_count: load.len(),
+        load_observed_candidate_count: None,
+        selected_load_observed: None,
+    });
+    Some((row, evidence))
 }
 
 struct TwoTierCostFnPicker {
@@ -155,6 +204,41 @@ impl WorkerPicker for TwoTierCostFnPicker {
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
         select_row(&self.parameters, cache, load, context.request_blocks())
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+    }
+    fn pick_with_explanation(
+        &mut self,
+        context: &WorkerSelectionContext<'_>,
+        input: WorkerInputView<'_>,
+    ) -> Result<
+        (
+            usize,
+            Option<dynamo_kv_router::protocols::RoutingDecisionExplanation>,
+        ),
+        WorkerSelectionPolicyError,
+    > {
+        let cache = input
+            .cache()
+            .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?;
+        let load = input
+            .load()
+            .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
+        let (row, evidence) = select_row_with_evidence(
+            &self.parameters,
+            cache,
+            load,
+            context.request_blocks(),
+            true,
+        )
+        .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))?;
+        let mut explanation = dynamo_kv_router::protocols::RoutingDecisionExplanation::unavailable(
+            POLICY_TYPE,
+            input.candidates()[row].worker(),
+            "",
+        );
+        explanation.kind = "two_tier_rule".into();
+        explanation.reason = None;
+        explanation.two_tier_rule = evidence;
+        Ok((row, Some(explanation)))
     }
 }
 
@@ -227,6 +311,38 @@ mod tests {
     }
 
     fn select_with(parameters: Parameters, workers: [(u64, usize, usize); 2]) -> WorkerWithDpRank {
+        select_result(parameters, workers).worker
+    }
+
+    fn select_result(
+        parameters: Parameters,
+        workers: [(u64, usize, usize); 2],
+    ) -> dynamo_kv_router::protocols::WorkerSelectionResult {
+        select_configured(parameters, workers, |_| {})
+    }
+
+    fn select_configured(
+        parameters: Parameters,
+        workers: [(u64, usize, usize); 2],
+        configure: impl FnOnce(&mut SchedulingRequest),
+    ) -> dynamo_kv_router::protocols::WorkerSelectionResult {
+        select_with_policy(
+            workers,
+            configure,
+            WorkerSelectionPolicy::new(
+                KvRouterConfig::default(),
+                "test",
+                Vec::new(),
+                Box::new(TwoTierCostFnPicker { parameters }),
+            ),
+        )
+    }
+
+    fn select_with_policy(
+        workers: [(u64, usize, usize); 2],
+        configure: impl FnOnce(&mut SchedulingRequest),
+        policy: WorkerSelectionPolicy,
+    ) -> dynamo_kv_router::protocols::WorkerSelectionResult {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
             token_seq: None,
@@ -264,21 +380,160 @@ mod tests {
                 },
             );
         }
+        configure(&mut request);
         let configs = HashMap::from(workers.map(|(id, _, _)| (id, TestWorker)));
-        WorkerSelectionPolicy::new(
-            KvRouterConfig::default(),
-            "test",
-            Vec::new(),
-            Box::new(TwoTierCostFnPicker { parameters }),
-        )
-        .select_worker(WorkerSelectionInput::configured(
-            &configs,
-            &request,
-            request.eligibility(),
-            BLOCK_SIZE,
-        ))
-        .unwrap()
-        .worker
+        policy
+            .select_worker(WorkerSelectionInput::configured(
+                &configs,
+                &request,
+                request.eligibility(),
+                BLOCK_SIZE,
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn configured_policy_identity_and_resolved_parameters_follow_registry_activation() {
+        let mut identities = Vec::new();
+        for (threshold, expected) in [(0.2, B), (0.4, A)] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), format!("worker_selection:\n  aggregated: tuned\n  instances:\n    - name: tuned\n      type: dynamo-two-tier-cost-fn\n      parameters:\n        cache_threshold: {threshold}\n        balance_abs_threshold: 7\n        balance_rel_threshold: 1.5\n")).unwrap();
+            let config = KvRouterConfig {
+                router_policy_config: Some(file.path().display().to_string()),
+                ..Default::default()
+            };
+            let mut registry = WorkerSelectionPolicyRegistry::default();
+            register(&mut registry).unwrap();
+            let factory = registry
+                .resolve_for_worker_type(&config, dynamo_kv_router::WorkerType::Aggregated)
+                .unwrap()
+                .unwrap();
+            let policy = factory(
+                &config,
+                dynamo_kv_router::WorkerType::Aggregated,
+                dynamo_kv_router::RoutingPartitionRef::new("synthetic-model", "default"),
+            );
+            let result = select_with_policy([(A, 0, 0), (B, 3, 4)], |_| {}, policy);
+            assert_eq!(result.worker, worker(expected));
+            if dynamo_kv_router::protocols::routing_decision_trace_enabled() {
+                let explanation = result.decision_explanation.unwrap();
+                assert_eq!(explanation.policy_instance.as_deref(), Some("tuned"));
+                assert_eq!(explanation.policy_type, POLICY_TYPE);
+                let identity = explanation.configuration_identity.as_ref().unwrap();
+                assert!(identity.starts_with("blake3:"));
+                identities.push(identity.clone());
+                let evidence = explanation.two_tier_rule.as_ref().unwrap();
+                assert_eq!(evidence.cache_threshold, threshold);
+                assert_eq!(evidence.balance_abs_threshold, 7);
+                assert_eq!(evidence.balance_rel_threshold, 1.5);
+                assert_eq!(evidence.candidate_count, 2);
+                assert_eq!(evidence.load_observed_candidate_count, Some(2));
+                println!(
+                    "DECISION_EXPLANATION_FIXTURE={}",
+                    serde_json::to_string(&explanation).unwrap()
+                );
+            }
+        }
+        if !identities.is_empty() {
+            assert_ne!(identities[0], identities[1]);
+        }
+    }
+
+    #[test]
+    fn decision_explanation_records_strict_gates_and_first_row_ties() {
+        // These are real host selections, including input materialization.
+        for (rows, rule) in [
+            ([(A, 0, 0), (B, 10, 32)], "device_cache_affinity"),
+            ([(A, 0, 0), (B, 10, 33)], "load_imbalance"),
+            ([(A, 0, 640), (B, 10, 704)], "device_cache_affinity"),
+            ([(A, 0, 640), (B, 10, 705)], "load_imbalance"),
+            ([(A, 0, 0), (B, 5, 4)], "least_loaded_fallback"),
+        ] {
+            let result = select_result(Parameters::default(), rows);
+            if !dynamo_kv_router::protocols::routing_decision_trace_enabled() {
+                assert!(result.decision_explanation.is_none());
+                assert!(result.score_decision.is_none());
+                continue;
+            }
+            let explanation = result.decision_explanation.expect("decision explanation");
+            assert_eq!(explanation.kind, "two_tier_rule");
+            assert_eq!(explanation.policy_type, POLICY_TYPE);
+            assert_eq!(explanation.selected_worker, result.worker);
+            let json = serde_json::to_string(&explanation).unwrap();
+            let decoded: dynamo_kv_router::protocols::RoutingDecisionExplanation =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.selected_worker, result.worker);
+            println!("DECISION_EXPLANATION_FIXTURE={json}");
+            let evidence = explanation.two_tier_rule.unwrap();
+            assert_eq!(evidence.selected_rule, rule);
+            assert_eq!(evidence.request_blocks, 10);
+            assert_eq!(evidence.cache_threshold, 0.5);
+            assert_eq!(evidence.balance_abs_threshold, 32);
+            assert_eq!(evidence.balance_rel_threshold, 1.1);
+            assert_eq!(evidence.tie_strategy, "first_candidate_row");
+            assert!(result.score_decision.is_none());
+        }
+        let result = select_result(Parameters::default(), [(A, 6, 3), (B, 6, 3)]);
+        if !dynamo_kv_router::protocols::routing_decision_trace_enabled() {
+            assert!(result.decision_explanation.is_none());
+            return;
+        }
+        let evidence = result.decision_explanation.unwrap().two_tier_rule.unwrap();
+        assert_eq!(evidence.tie_count, 2);
+        assert_eq!(evidence.selected_row, 0);
+    }
+
+    #[test]
+    fn decision_explanation_cpu_overlap_does_not_change_policy_and_pin_is_real_input() {
+        let rows = [(A, 0, 0), (B, 6, 4)];
+        let selected = select_configured(Parameters::default(), rows, |request| {
+            request
+                .overlap
+                .tier_overlap_blocks
+                .host_pinned
+                .insert(worker(A), 10);
+        });
+        assert_eq!(selected.worker, worker(B));
+        let pinned = select_configured(Parameters::default(), rows, |request| {
+            request.pinned_worker = Some(worker(A));
+        });
+        assert_eq!(pinned.worker, worker(A));
+        if dynamo_kv_router::protocols::routing_decision_trace_enabled() {
+            let evidence = selected
+                .decision_explanation
+                .unwrap()
+                .two_tier_rule
+                .unwrap();
+            assert_eq!(evidence.selected_rule, "device_cache_affinity");
+            assert_eq!(evidence.max_device_overlap_blocks, 6.0);
+            let evidence = pinned.decision_explanation.unwrap().two_tier_rule.unwrap();
+            assert_eq!(evidence.selected_rule, "least_loaded_fallback");
+            assert_eq!(evidence.min_active_requests, 0);
+            assert_eq!(evidence.max_active_requests, 0);
+        }
+    }
+
+    #[test]
+    fn zero_request_blocks_and_empty_inputs_have_explicit_policy_behavior() {
+        assert_eq!(select_row(&Parameters::default(), &[], &[], 0), None);
+        assert_eq!(
+            select_row(
+                &Parameters::default(),
+                &[WorkerCacheInput::default()],
+                &[],
+                1
+            ),
+            None
+        );
+        assert_eq!(
+            select_row(
+                &Parameters::default(),
+                &[WorkerCacheInput::default()],
+                &[WorkerLoadInput::default()],
+                0
+            ),
+            Some(0)
+        );
     }
 
     #[test]

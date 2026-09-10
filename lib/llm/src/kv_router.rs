@@ -354,6 +354,8 @@ pub enum FindBestMatchOutcome {
         resident_oracle_cached_tokens: usize,
         eligible_oracle_worker: Option<WorkerWithDpRank>,
         eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+        score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
+        decision_explanation: Option<Box<dynamo_kv_router::protocols::RoutingDecisionExplanation>>,
         selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
@@ -378,6 +380,8 @@ pub enum FindBestMatchAdvisoryOutcome {
         resident_oracle_cached_tokens: usize,
         eligible_oracle_worker: Option<WorkerWithDpRank>,
         eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+        score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
+        decision_explanation: Option<Box<dynamo_kv_router::protocols::RoutingDecisionExplanation>>,
         selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
         potential_decode_blocks: u64,
         selected_worker_load: scheduling::AdvisoryWorkerLoad,
@@ -1800,6 +1804,8 @@ where
                         resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                         eligible_oracle_worker: response.eligible_oracle_worker,
                         eligible_oracle_tiers: response.eligible_oracle_tiers,
+                        score_decision: response.score_decision,
+                        decision_explanation: response.decision_explanation,
                         selected_worker_tiers: response.selected_worker_tiers,
 
                         potential_decode_blocks: response.potential_decode_blocks as u64,
@@ -1819,6 +1825,8 @@ where
                     resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                     eligible_oracle_worker: response.eligible_oracle_worker,
                     eligible_oracle_tiers: response.eligible_oracle_tiers,
+                    score_decision: response.score_decision,
+                    decision_explanation: response.decision_explanation,
                     selected_worker_tiers: response.selected_worker_tiers,
 
                     potential_decode_blocks: response.potential_decode_blocks as u64,
@@ -2655,6 +2663,8 @@ mod tests {
             assert_eq!(observed_hits, self.expected_hits);
 
             Ok(dynamo_kv_router::protocols::WorkerSelectionResult {
+                score_decision: None,
+                decision_explanation: None,
                 worker: self.selected_worker,
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,

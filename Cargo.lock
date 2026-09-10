@@ -2456,6 +2456,7 @@ version = "1.5.0"
 dependencies = [
  "dynamo-kv-router",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

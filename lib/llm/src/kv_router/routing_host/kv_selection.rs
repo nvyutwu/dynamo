@@ -30,6 +30,9 @@ use crate::{
 };
 
 pub(super) struct WorkerSelection {
+    pub(super) score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
+    pub(super) decision_explanation:
+        Option<Box<dynamo_kv_router::protocols::RoutingDecisionExplanation>>,
     pub(super) worker: WorkerWithDpRank,
     pub(super) attempt: AdmissionAttempt,
     pub(super) overlap_amount: u32,
@@ -147,6 +150,8 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    score_decision,
+                    decision_explanation,
                     selected_worker_tiers,
 
                     potential_decode_blocks,
@@ -162,6 +167,8 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    score_decision,
+                    decision_explanation,
                     selected_worker_tiers,
 
                     potential_decode_blocks,
@@ -183,6 +190,8 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    score_decision,
+                    decision_explanation,
                     selected_worker_tiers,
 
                     potential_decode_blocks,
@@ -198,6 +207,8 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    score_decision,
+                    decision_explanation,
                     selected_worker_tiers,
 
                     potential_decode_blocks,

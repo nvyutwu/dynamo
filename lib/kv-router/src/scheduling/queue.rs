@@ -77,7 +77,7 @@ struct SelectedWorkerForRequest {
     non_max_overlap_selection: Option<NonMaxOverlapSelection>,
 }
 
-fn oracle_cached_entry<C: WorkerConfigLike>(
+pub(super) fn oracle_cached_entry<C: WorkerConfigLike>(
     workers: &HashMap<WorkerId, C>,
     request: &SchedulingRequest,
     eligibility: RoutingEligibility<'_>,
@@ -1433,6 +1433,8 @@ impl<
         Ok(AdvisorySchedulingResponse {
             selected_worker_load: selected.selected_worker_load,
             response: SchedulingResponse {
+                score_decision: selected.selection.score_decision,
+                decision_explanation: selected.selection.decision_explanation,
                 best_worker: selected.selection.worker,
                 effective_overlap_blocks: selected.selection.effective_overlap_blocks,
                 cached_tokens: selected.selection.cached_tokens,
@@ -1470,6 +1472,8 @@ impl<
         let target_cached_prefix_blocks =
             target_cached_prefix_blocks(&request, selected.selection.worker);
         let response = SchedulingResponse {
+            score_decision: selected.selection.score_decision,
+            decision_explanation: selected.selection.decision_explanation,
             best_worker: selected.selection.worker,
             effective_overlap_blocks: selected.selection.effective_overlap_blocks,
             cached_tokens: selected.selection.cached_tokens,
@@ -1854,6 +1858,8 @@ mod tests {
             };
 
             Ok(WorkerSelectionResult {
+                score_decision: None,
+                decision_explanation: None,
                 worker,
                 required_blocks: request.request_blocks(block_size),
                 effective_overlap_blocks: request.effective_overlap_blocks_for(worker),

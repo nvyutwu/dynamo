@@ -268,13 +268,15 @@ fn default_row(
 }
 
 impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
-    fn worker_logit(
+    #[inline]
+    fn worker_score(
         &self,
         context: &WorkerSelectionContext<'_>,
         default_context: DefaultScoringContext,
         row: &WorkerCandidate,
         formula_name: &'static str,
-    ) -> f64 {
+        capture: bool,
+    ) -> crate::protocols::RoutingCandidateScore {
         let kv_router_config = self.kv_router_config.borrow();
         let weights = context.weights;
         let worker = row.worker;
@@ -310,6 +312,43 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
         let active_request_cost_blocks =
             kv_router_config.decode_active_request_weight * load.active_requests as f64;
 
+        let snapshot =
+            |prefill_cost_blocks, decode_overlap_adjusted_blocks, logit, formula: &str| {
+                let observed_load = if capture {
+                    context.request.worker_loads.get(&worker).copied()
+                } else {
+                    None
+                };
+                let observed = observed_load.unwrap_or_default();
+                crate::protocols::RoutingCandidateScore {
+                    worker,
+                    cached_tokens: if capture {
+                        context.request.effective_cached_tokens_for(worker)
+                    } else {
+                        0
+                    },
+                    load_observed: observed_load.is_some(),
+                    active_prefill_tokens: observed.active_prefill_tokens,
+                    active_decode_blocks: observed.active_decode_blocks,
+                    additional_active_blocks: observed.additional_active_blocks,
+                    raw_prefill_blocks: load.raw_prefill_blocks,
+                    device_overlap_blocks,
+                    host_overlap_blocks: cache.host_overlap_blocks,
+                    disk_overlap_blocks: cache.disk_overlap_blocks,
+                    shared_overlap_blocks,
+                    overlap_credit_decay,
+                    overlap_credit_blocks,
+                    prefill_cost_blocks,
+                    decode_cost_blocks,
+                    preference_multiplier: 1.0,
+                    total_cost: logit,
+                    formula: capture.then(|| formula.into()),
+                    active_requests: Some(load.active_requests),
+                    active_request_cost_blocks: Some(active_request_cost_blocks),
+                    decode_overlap_adjusted_blocks,
+                }
+            };
+
         // Decode routers normally force `overlap_score_credit=0` through the
         // per-request override, which preserves load-only disagg routing. When
         // conditional disagg leaves a positive overlap credit in place, prefer
@@ -336,7 +375,12 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                 worker.worker_id,
                 worker.dp_rank,
             );
-            return logit;
+            return snapshot(
+                0.0,
+                Some(overlap_adjusted_decode_blocks),
+                logit,
+                "decode_overlap_clamped",
+            );
         }
 
         let adjusted_prefill_blocks = (load.raw_prefill_blocks - overlap_credit_blocks).max(0.0);
@@ -382,7 +426,19 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             );
         }
 
-        logit
+        snapshot(prefill_cost_blocks, None, logit, "prefill_plus_decode")
+    }
+
+    #[inline]
+    fn worker_logit(
+        &self,
+        context: &WorkerSelectionContext<'_>,
+        default_context: DefaultScoringContext,
+        row: &WorkerCandidate,
+        formula_name: &'static str,
+    ) -> f64 {
+        self.worker_score(context, default_context, row, formula_name, false)
+            .total_cost
     }
 
     #[inline]
@@ -399,6 +455,72 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             Some(multiplier) => base_score * multiplier,
             None => base_score,
         }
+    }
+    pub(super) fn score_decision<W: WorkerConfigLike>(
+        &self,
+        input: &MaterializedSelectionInput<'_>,
+        workers: &HashMap<WorkerId, W>,
+        request: &SchedulingRequest,
+        eligibility: RoutingEligibility<'_>,
+        worker: WorkerWithDpRank,
+    ) -> Box<crate::protocols::RoutingScoreDecision> {
+        let config = self.kv_router_config.borrow();
+        let weights = input.context.weights;
+        let context = DefaultScoringContext::new(workers, request, eligibility, weights);
+        let pinned = eligibility.pinned_worker().is_some();
+        let temperature = input
+            .context
+            .router_temperature_override
+            .unwrap_or(config.router_temperature);
+        let snapshot = |worker: WorkerWithDpRank| {
+            let preference = if pinned {
+                None
+            } else {
+                workers.get(&worker.worker_id).and_then(|config| {
+                    request
+                        .routing_constraints
+                        .preferred_taint_multiplier(config.taints())
+                })
+            };
+            let row = default_row(input, context, worker, preference);
+            let mut score =
+                self.worker_score(&input.context, context, &row, "Decision snapshot", true);
+            score.preference_multiplier = preference.unwrap_or(1.0);
+            score.total_cost *= score.preference_multiplier;
+            score
+        };
+        Box::new(crate::protocols::RoutingScoreDecision {
+            selection_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            method: if pinned {
+                "pinned"
+            } else if temperature == 0.0 {
+                "minimum_cost"
+            } else {
+                "softmax"
+            }
+            .into(),
+            router_temperature: temperature,
+            track_prefill_tokens: request.track_prefill_tokens,
+            min_active_prefill_tokens: context.min_active_prefill_tokens,
+            overlap_score_credit: weights.overlap_score_credit,
+            overlap_score_credit_decay: weights.overlap_score_credit_decay,
+            prefill_load_scale: weights.prefill_load_scale,
+            shared_cache_multiplier: weights.shared_cache_multiplier,
+            host_cache_hit_weight: config.host_cache_hit_weight,
+            disk_cache_hit_weight: config.disk_cache_hit_weight,
+            decode_active_request_weight: Some(config.decode_active_request_weight),
+            request_override_present: request.router_config_override.is_some(),
+            selected: snapshot(worker),
+            eligible_oracle: super::super::queue::oracle_cached_entry(
+                workers,
+                request,
+                eligibility,
+            )
+            .map(|(worker, _)| snapshot(worker)),
+        })
     }
 }
 
@@ -595,6 +717,168 @@ mod tests {
                 &default_row(&input, default_context, worker, None),
                 "test",
             )
+    }
+
+    #[test]
+    fn decision_score_records_actual_clamped_cost_and_missing_load() {
+        let workers = HashMap::from([(0, TaintedWorkerConfig::default())]);
+        let worker = WorkerWithDpRank::from_worker_id(0);
+        let mut request = base_request(64);
+        request.overlap.tier_overlap_blocks.device.insert(worker, 4);
+        let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "prefill");
+        let result = selector
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+        if !crate::protocols::routing_decision_trace_enabled() {
+            assert!(result.score_decision.is_none());
+            assert!(result.decision_explanation.is_none());
+            return;
+        }
+        let score = result.score_decision.expect("decision-time score");
+        assert_eq!(score.selected.worker, worker);
+        assert!(!score.selected.load_observed);
+        assert_eq!(score.selected.device_overlap_blocks, 4.0);
+        assert_eq!(score.selected.prefill_cost_blocks, 0.0);
+        assert_eq!(score.selected.total_cost, 0.0);
+        assert_eq!(score.method, "minimum_cost");
+    }
+
+    #[test]
+    fn decision_score_records_decode_clamp_active_penalty_preference_and_pin() {
+        let worker = WorkerWithDpRank::from_worker_id(9_007_199_254_740_993);
+        let workers = HashMap::from([(
+            worker.worker_id,
+            TaintedWorkerConfig {
+                taints: HashSet::from(["preferred".into()]),
+            },
+        )]);
+        let mut request = base_request(64);
+        request.track_prefill_tokens = false;
+        request.overlap.tier_overlap_blocks.device.insert(worker, 2);
+        request.worker_loads.insert(
+            worker,
+            crate::sequences::WorkerLoadProjection {
+                active_decode_blocks: 8,
+                additional_active_blocks: 2,
+                active_requests: 3,
+                active_prefill_tokens: 0,
+            },
+        );
+        request
+            .routing_constraints
+            .preferred_taints
+            .insert("preferred".into(), 0.5);
+        let config = KvRouterConfig {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            decode_active_request_weight: 2.0,
+            ..Default::default()
+        };
+        let selector = DefaultWorkerSelector::new(Some(config), "decode");
+        for pinned in [false, true] {
+            request.pinned_worker = pinned.then_some(worker);
+            let result = selector
+                .select_worker(WorkerSelectionInput::configured(
+                    &workers,
+                    &request,
+                    request.eligibility(),
+                    16,
+                ))
+                .unwrap();
+            assert_eq!(result.worker, worker);
+            if !crate::protocols::routing_decision_trace_enabled() {
+                assert!(result.score_decision.is_none());
+                continue;
+            }
+            let score = result.score_decision.unwrap();
+            // Independently: max(0, (8+2)-2) + 2*3 = 14, then preference except pinned.
+            let multiplier = if pinned { 1.0 } else { (-0.5_f64.tanh()).exp() };
+            assert_eq!(
+                score.selected.formula.as_deref(),
+                Some("decode_overlap_clamped")
+            );
+            assert_eq!(score.selected.decode_cost_blocks, 10.0);
+            assert_eq!(score.selected.decode_overlap_adjusted_blocks, Some(8.0));
+            assert_eq!(score.selected.active_request_cost_blocks, Some(6.0));
+            assert!((score.selected.total_cost - 14.0 * multiplier).abs() < 1e-12);
+            assert_eq!(score.selected.preference_multiplier, multiplier);
+            let json = serde_json::to_string(&score).unwrap();
+            let decoded: crate::protocols::RoutingScoreDecision =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.selected.worker.worker_id, worker.worker_id);
+            println!("DECISION_SCORE_FIXTURE={json}");
+        }
+    }
+
+    #[test]
+    fn decision_score_records_decay_override_and_rank_valid_oracle() {
+        let cold = WorkerWithDpRank::new(0, 0);
+        let warm = WorkerWithDpRank::new(1, 0);
+        let workers = HashMap::from([
+            (0, TaintedWorkerConfig::default()),
+            (1, TaintedWorkerConfig::default()),
+        ]);
+        let mut request = base_request(64);
+        request.overlap.tier_overlap_blocks.device.insert(warm, 4);
+        request.overlap.effective_cached_tokens.insert(warm, 64);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(WorkerWithDpRank::new(1, 99), 128);
+        request.worker_loads.insert(cold, Default::default());
+        request.worker_loads.insert(
+            warm,
+            crate::sequences::WorkerLoadProjection {
+                active_prefill_tokens: 64,
+                active_decode_blocks: 3,
+                active_requests: 2,
+                additional_active_blocks: 0,
+            },
+        );
+        request.router_config_override = Some(RouterConfigOverride {
+            prefill_load_scale: Some(2.0),
+            ..Default::default()
+        });
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.0,
+                overlap_score_credit_decay: 1.0,
+                prefill_load_scale: 1.0,
+                decode_active_request_weight: 1.0,
+                ..Default::default()
+            }),
+            "prefill",
+        );
+        let result = selector
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+        assert_eq!(result.worker, cold);
+        if !crate::protocols::routing_decision_trace_enabled() {
+            assert!(result.score_decision.is_none());
+            return;
+        }
+        let score = result.score_decision.unwrap();
+        assert!(score.request_override_present);
+        assert_eq!(score.prefill_load_scale, 2.0);
+        assert_eq!(score.min_active_prefill_tokens, 0);
+        assert_eq!(score.selected.total_cost, 8.0); // 4 prompt blocks * override scale 2.
+        let oracle = score.eligible_oracle.unwrap();
+        assert_eq!(oracle.worker, warm); // rank 99 is stale/invalid despite its larger cached count.
+        assert_eq!(oracle.overlap_credit_decay, 0.5); // 1 / (1 + (64/16)/(64/16)).
+        assert_eq!(oracle.raw_prefill_blocks, 8.0);
+        assert_eq!(oracle.overlap_credit_blocks, 2.0);
+        assert_eq!(oracle.prefill_cost_blocks, 12.0);
+        assert_eq!(oracle.total_cost, 17.0); // 2*(8-2) + 3 decode + 2 active requests.
     }
 
     #[test]

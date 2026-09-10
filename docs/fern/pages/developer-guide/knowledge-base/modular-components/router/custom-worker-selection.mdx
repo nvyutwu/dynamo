@@ -496,3 +496,13 @@ Standalone EPP supplies `WorkerType::Aggregated` because it selects from one ful
 - If a signal adds work, storage, allocation, or another scan, run the worker-selection benchmark.
 
 The [example README](https://github.com/ai-dynamo/dynamo/blob/main/examples/router/custom-policy-example/README.md) contains the in-tree package names and build-check commands. For the built-in cost model, see [Routing Concepts](routing-concepts.md). For the standalone selection lifecycle, see [Standalone Selection Service](standalone-selection.md).
+
+## Decision-Time Explanations
+
+With `DYN_ROUTER_DECISION_TRACE_ENABLED=1`, the host calls `WorkerPicker::pick_with_explanation` instead of `pick`. The default implementation calls `pick` once and reports that explanation evidence is unavailable. Existing policies need no changes. An implementation that supplies evidence must preserve ordinary row order, random draws, state transitions, and selection outcome; the host still validates the row and records its authoritative worker identity before reservation.
+
+The optional `decision_explanation` envelope uses `dynamo.router.explanation.v1`. Registered policies include their type, instance, and a hash of the configured parameter representation. The picker records resolved parameters separately. An unregistered policy has no instance or configuration identity. Unsupported explanations carry an explicit reason and no additive score.
+
+The shipped `dynamo-two-tier-cost-fn` policy records its resolved thresholds, exact request block denominator, effective active-load extrema, maximum device overlap, strict gate results, selected rule and row, and first-row tie count. Missing host load defaults to zero in the existing picker input; observation counts distinguish it from measured zero. Tracing does not sort candidate rows. The policy emits no `score_decision`, because its ordered rules do not compute additive costs.
+
+The default selector retains optional `score_decision` evidence in scheduler model units. Its formula discriminator distinguishes prefill/decode addition from the decode-only overlap clamp; active-request penalties and preference multipliers are explicit. These quantities are not milliseconds. Legacy v1 tier fields retain their existing cumulative/weighted meanings.

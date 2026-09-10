@@ -153,6 +153,21 @@ pub trait WorkerPicker: Send {
         context: &WorkerSelectionContext<'_>,
         input: WorkerInputView<'_>,
     ) -> Result<usize, WorkerSelectionPolicyError>;
+
+    /// Opt-in decision-time explanation using the same immutable input table as `pick`.
+    /// Called instead of `pick` when tracing is enabled. Implementations must select exactly
+    /// once and preserve their ordinary row order, random draws, and state transitions.
+    /// Default behavior keeps existing policies compatible and reports unavailable evidence.
+    fn pick_with_explanation(
+        &mut self,
+        context: &WorkerSelectionContext<'_>,
+        input: WorkerInputView<'_>,
+    ) -> Result<
+        (usize, Option<crate::protocols::RoutingDecisionExplanation>),
+        WorkerSelectionPolicyError,
+    > {
+        self.pick(context, input).map(|row| (row, None))
+    }
 }
 
 impl WorkerSelectionContext<'_> {
@@ -371,9 +386,19 @@ pub struct WorkerSelectionPolicy {
     kv_router_config: KvRouterConfig,
     worker_label: &'static str,
     state: WorkerSelectionPolicyState,
+    trace_identity: Option<(String, String, Option<String>)>,
 }
 
 impl WorkerSelectionPolicy {
+    pub(crate) fn set_trace_identity(
+        &mut self,
+        policy_type: String,
+        instance: String,
+        configuration_identity: Option<String>,
+    ) {
+        self.trace_identity = Some((policy_type, instance, configuration_identity));
+    }
+
     /// Build a custom policy with no filters.
     ///
     /// `worker_label` identifies the worker pool in routing logs. A typed policy factory normally
@@ -408,6 +433,7 @@ impl WorkerSelectionPolicy {
         Self {
             kv_router_config,
             worker_label,
+            trace_identity: None,
             state: WorkerSelectionPolicyState::Custom(RefCell::new(CustomWorkerSelectionState {
                 filters,
                 scorers,
@@ -431,6 +457,7 @@ impl WorkerSelectionPolicy {
         Self {
             kv_router_config,
             worker_label,
+            trace_identity: None,
             state: WorkerSelectionPolicyState::Default(picker),
         }
     }
@@ -617,7 +644,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
                 WorkerSelectionPolicyStateRef::Custom(state)
             }
         };
-        select_worker_with_policy(
+        let mut result = select_worker_with_policy(
             &self.kv_router_config,
             self.worker_label,
             state,
@@ -625,7 +652,16 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
             request,
             eligibility,
             block_size,
-        )
+        )?;
+        if let (Some(explanation), Some((policy_type, instance, identity))) = (
+            result.decision_explanation.as_mut(),
+            self.trace_identity.as_ref(),
+        ) {
+            explanation.policy_type.clone_from(policy_type);
+            explanation.policy_instance = Some(instance.clone());
+            explanation.configuration_identity.clone_from(identity);
+        }
+        Ok(result)
     }
 }
 
@@ -656,6 +692,55 @@ mod tests {
             _input: WorkerInputView<'_>,
         ) -> Result<usize, WorkerSelectionPolicyError> {
             Ok(0)
+        }
+    }
+
+    #[test]
+    fn explanation_default_callback_selects_once_and_reports_unavailable() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct CountingPicker(Arc<AtomicUsize>);
+        impl WorkerPicker for CountingPicker {
+            fn pick(
+                &mut self,
+                _: &WorkerSelectionContext<'_>,
+                _: WorkerInputView<'_>,
+            ) -> Result<usize, WorkerSelectionPolicyError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(0)
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let policy = WorkerSelectionPolicy::new(
+            KvRouterConfig::default(),
+            "test",
+            Vec::new(),
+            Box::new(CountingPicker(calls.clone())),
+        );
+        let workers = HashMap::from([(1, TaintedWorkerConfig::default())]);
+        let request = base_request(16);
+        let result = policy
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(result.score_decision.is_none());
+        if crate::protocols::routing_decision_trace_enabled() {
+            let explanation = result.decision_explanation.unwrap();
+            assert_eq!(explanation.kind, "unavailable");
+            assert_eq!(
+                explanation.reason.as_deref(),
+                Some("picker_does_not_supply_explanation")
+            );
+            assert_eq!(explanation.selected_worker, result.worker);
+        } else {
+            assert!(result.decision_explanation.is_none());
         }
     }
 
