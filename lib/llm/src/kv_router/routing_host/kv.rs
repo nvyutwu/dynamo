@@ -376,8 +376,9 @@ where
                 CacheLossTracking::new(
                     prompt_tokens,
                     tracked.previously_computed_tokens(&history.lock()),
-                    selection.eligible_oracle_cached_tokens.min(routing_parts.token_ids.len())
-                        as u64,
+                    selection
+                        .eligible_oracle_cached_tokens
+                        .min(routing_parts.token_ids.len()) as u64,
                     selection.cached_tokens.min(routing_parts.token_ids.len()) as u64,
                     Arc::clone(history),
                     tracked,
@@ -449,7 +450,12 @@ where
             }
 
             if let Some(ref tracker) = request.tracker {
-                record_routing_decision_trace(tracker, selection, routing_parts.token_ids.len(), chooser.block_size());
+                record_routing_decision_trace(
+                    tracker,
+                    selection,
+                    routing_parts.token_ids.len(),
+                    chooser.block_size(),
+                );
                 let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
                 tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
@@ -486,7 +492,7 @@ where
                 .inc_by(
                     selection
                         .resident_oracle_cached_tokens
-                    .min(routing_parts.token_ids.len()) as u64,
+                        .min(routing_parts.token_ids.len()) as u64,
                 );
             record_cache_residency_metrics(
                 guard.request_metrics(),

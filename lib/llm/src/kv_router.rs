@@ -1815,11 +1815,11 @@ where
                     overlap_blocks: response.effective_overlap_blocks.round() as u32,
                     effective_overlap_blocks: response.effective_overlap_blocks,
                     cached_tokens: response.cached_tokens,
-                        eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
-                        resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
-                        eligible_oracle_worker: response.eligible_oracle_worker,
-                        eligible_oracle_tiers: response.eligible_oracle_tiers,
-                        selected_worker_tiers: response.selected_worker_tiers,
+                    eligible_oracle_cached_tokens: response.eligible_oracle_cached_tokens,
+                    resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
+                    eligible_oracle_worker: response.eligible_oracle_worker,
+                    eligible_oracle_tiers: response.eligible_oracle_tiers,
+                    selected_worker_tiers: response.selected_worker_tiers,
 
                     potential_decode_blocks: response.potential_decode_blocks as u64,
                     selected_worker_load: selected_worker_load

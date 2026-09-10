@@ -93,9 +93,7 @@ fn oracle_cached_entry<C: WorkerConfigLike>(
         .overlap
         .effective_cached_tokens
         .iter()
-        .filter(|(worker, _)| {
-            eligibility.validate_worker_rank(workers, **worker).is_ok()
-        })
+        .filter(|(worker, _)| eligibility.validate_worker_rank(workers, **worker).is_ok())
         .map(|(worker, cached_tokens)| (*worker, *cached_tokens))
         .max_by_key(|(worker, cached_tokens)| (*cached_tokens, *worker))
 }
@@ -1349,7 +1347,8 @@ impl<
             }
             let eligible_oracle = oracle_cached_entry(&workers, request, eligibility);
             // Retain availability, pins and routing constraints while ignoring overload.
-            let mut resident_eligibility = request.eligibility()
+            let mut resident_eligibility = request
+                .eligibility()
                 .with_available_workers(available_worker_ids.as_deref());
             if self.selector.uses_exclusive_affinity_target()
                 && let Some(target) = request.affinity_target
@@ -1357,8 +1356,9 @@ impl<
             {
                 resident_eligibility = resident_eligibility.with_affinity_target(target);
             }
-            let resident_oracle_cached_tokens = oracle_cached_entry(&workers, request, resident_eligibility)
-                .map_or(0, |(_, tokens)| tokens);
+            let resident_oracle_cached_tokens =
+                oracle_cached_entry(&workers, request, resident_eligibility)
+                    .map_or(0, |(_, tokens)| tokens);
             self.selector
                 .select_worker(WorkerSelectionInput::configured(
                     &workers,
@@ -1400,11 +1400,15 @@ impl<
                     };
                     let eligible_oracle_worker = eligible_oracle.map(|(worker, _)| worker);
                     let eligible_oracle_tiers = eligible_oracle_worker
-                        .and_then(|worker| workers.get(&worker.worker_id)
-                            .map(|config| request.overlap.selected_worker_tiers(worker, config)))
+                        .and_then(|worker| {
+                            workers
+                                .get(&worker.worker_id)
+                                .map(|config| request.overlap.selected_worker_tiers(worker, config))
+                        })
                         .unwrap_or_default();
                     SelectedWorkerForRequest {
-                        eligible_oracle_cached_tokens: eligible_oracle.map_or(0, |(_, tokens)| tokens),
+                        eligible_oracle_cached_tokens: eligible_oracle
+                            .map_or(0, |(_, tokens)| tokens),
                         resident_oracle_cached_tokens,
                         eligible_oracle_worker,
                         eligible_oracle_tiers,
@@ -1470,10 +1474,10 @@ impl<
             effective_overlap_blocks: selected.selection.effective_overlap_blocks,
             cached_tokens: selected.selection.cached_tokens,
             selected_worker_tiers: selected.selected_worker_tiers,
-                eligible_oracle_cached_tokens: selected.eligible_oracle_cached_tokens,
-                resident_oracle_cached_tokens: selected.resident_oracle_cached_tokens,
-                eligible_oracle_worker: selected.eligible_oracle_worker,
-                eligible_oracle_tiers: selected.eligible_oracle_tiers,
+            eligible_oracle_cached_tokens: selected.eligible_oracle_cached_tokens,
+            resident_oracle_cached_tokens: selected.resident_oracle_cached_tokens,
+            eligible_oracle_worker: selected.eligible_oracle_worker,
+            eligible_oracle_tiers: selected.eligible_oracle_tiers,
 
             target_cached_prefix_blocks,
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
@@ -2347,37 +2351,86 @@ mod tests {
 
     #[test]
     fn cache_oracle_respects_overload_pins_allowlists_availability_and_valid_ranks() {
-        let workers = HashMap::from([(0, SimpleWorkerConfig::default()), (1, SimpleWorkerConfig::default())]);
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+        ]);
         let cold = WorkerWithDpRank::new(0, 0);
         let warm = WorkerWithDpRank::new(1, 0);
         let (mut request, _rx) = make_request("oracle", 128);
         request.overlap.effective_cached_tokens.extend([
-            (cold, 16), (warm, 64), (WorkerWithDpRank::new(1, 99), 128),
+            (cold, 16),
+            (warm, 64),
+            (WorkerWithDpRank::new(1, 99), 128),
             (WorkerWithDpRank::new(99, 0), 128),
         ]);
         let overloaded = HashSet::from([1]);
-        assert_eq!(oracle_cached_entry(&workers, &request, request.eligibility()), Some((warm, 64)));
-        assert_eq!(oracle_cached_entry(&workers, &request, request.eligibility_with_overloaded(Some(&overloaded))), Some((cold, 16)));
+        assert_eq!(
+            oracle_cached_entry(&workers, &request, request.eligibility()),
+            Some((warm, 64))
+        );
+        assert_eq!(
+            oracle_cached_entry(
+                &workers,
+                &request,
+                request.eligibility_with_overloaded(Some(&overloaded))
+            ),
+            Some((cold, 16))
+        );
         let available = HashSet::from([0]);
-        assert_eq!(oracle_cached_entry(&workers, &request, request.eligibility().with_available_workers(Some(&available))), Some((cold, 16)));
+        assert_eq!(
+            oracle_cached_entry(
+                &workers,
+                &request,
+                request
+                    .eligibility()
+                    .with_available_workers(Some(&available))
+            ),
+            Some((cold, 16))
+        );
         request.pinned_worker = Some(cold);
-        assert_eq!(oracle_cached_entry(&workers, &request, request.eligibility()), Some((cold, 16)));
+        assert_eq!(
+            oracle_cached_entry(&workers, &request, request.eligibility()),
+            Some((cold, 16))
+        );
         request.pinned_worker = None;
         request.allowed_worker_ids = Some(HashSet::from([0]));
-        assert_eq!(oracle_cached_entry(&workers, &request, request.eligibility()), Some((cold, 16)));
+        assert_eq!(
+            oracle_cached_entry(&workers, &request, request.eligibility()),
+            Some((cold, 16))
+        );
         request.overlap.effective_cached_tokens.clear();
-        assert_eq!(oracle_cached_entry(&workers, &request, request.eligibility()), None);
+        assert_eq!(
+            oracle_cached_entry(&workers, &request, request.eligibility()),
+            None
+        );
     }
 
     #[tokio::test]
     async fn cache_oracle_follows_custom_selection_without_changing_its_choice() {
-        let (queue, _slots) = make_queue_with_custom_selector(2, 16, 128, None, MinDecodeSelector { rendezvous: None });
+        let (queue, _slots) = make_queue_with_custom_selector(
+            2,
+            16,
+            128,
+            None,
+            MinDecodeSelector { rendezvous: None },
+        );
         let cold = WorkerWithDpRank::new(0, 0);
         let warm = WorkerWithDpRank::new(1, 0);
         let (mut request, response_rx) = make_request("oracle-custom", 128);
-        request.overlap.effective_cached_tokens.extend([(cold, 16), (warm, 64)]);
+        // Make the custom policy's choice independent of cache-aware prefill
+        // cost so this test deliberately chooses less than the cache oracle.
+        request.track_prefill_tokens = false;
+        request
+            .overlap
+            .effective_cached_tokens
+            .extend([(cold, 16), (warm, 64)]);
         request.overlap.tier_overlap_blocks.device.insert(warm, 2);
-        request.overlap.tier_overlap_blocks.host_pinned.insert(warm, 2);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned
+            .insert(warm, 2);
         queue.enqueue(request).await;
         let response = response_rx.await.unwrap().unwrap();
         assert_eq!(response.best_worker, cold);

@@ -2859,7 +2859,12 @@ async fn kv_stopped_decode_request_without_staged_kv_never_reaches_a_worker() {
 #[serial_test::serial]
 async fn cache_funnel_commits_only_after_successful_transport_completion() {
     let (router, runtime) = router(None).await;
-    for scenario in ["success", "trailing_error", "client_cancel", "consumer_drop"] {
+    for scenario in [
+        "success",
+        "trailing_error",
+        "client_cancel",
+        "consumer_drop",
+    ] {
         let history = Arc::new(parking_lot::Mutex::new(CacheHistory::new(16, 1)));
         let controller = Controller::new(format!("cache-funnel-{scenario}"));
         let context = Context::with_controller((), controller).context();
@@ -2882,20 +2887,37 @@ async fn cache_funnel_commits_only_after_successful_transport_completion() {
             Arc::clone(&context),
         );
         let mut guard = RequestGuard::new_kv(
-            Arc::clone(router.kv_router()), Arc::clone(&router.request_metrics),
-            format!("cache-funnel-{scenario}"), WorkerWithDpRank::from_worker_id(0),
-            dynamo_kv_router::scheduling::AdmissionAttempt::Untracked, &request(),
+            Arc::clone(router.kv_router()),
+            Arc::clone(&router.request_metrics),
+            format!("cache-funnel-{scenario}"),
+            WorkerWithDpRank::from_worker_id(0),
+            dynamo_kv_router::scheduling::AdmissionAttempt::Untracked,
+            &request(),
         );
         guard.set_cache_loss(CacheLossTracking::new(
-            1, 1, 1, 1, Arc::clone(&history),
+            1,
+            1,
+            1,
+            1,
+            Arc::clone(&history),
             CacheHistoryRequest::new(vec![1], None, None, None, 1, false),
         ));
-        let complete = router.request_metrics.cache_loss_observations_total.with_label_values(&["complete"]);
-        let incomplete = router.request_metrics.cache_loss_observations_total.with_label_values(&["incomplete"]);
+        let complete = router
+            .request_metrics
+            .cache_loss_observations_total
+            .with_label_values(&["complete"]);
+        let incomplete = router
+            .request_metrics
+            .cache_loss_observations_total
+            .with_label_values(&["incomplete"]);
         let before = (complete.get(), incomplete.get());
         let mut monitored = Box::pin(monitor_response_stream(source, Arc::clone(&context), guard));
         assert!(monitored.next().await.is_some());
-        assert_eq!((complete.get(), incomplete.get()), before, "terminal frame must not commit");
+        assert_eq!(
+            (complete.get(), incomplete.get()),
+            before,
+            "terminal frame must not commit"
+        );
         assert_eq!(history.lock().stats().retained_records, 0);
         if scenario == "client_cancel" {
             context.stop();
@@ -2907,7 +2929,11 @@ async fn cache_funnel_commits_only_after_successful_transport_completion() {
         let success = u64::from(scenario == "success");
         assert_eq!(complete.get(), before.0 + success, "{scenario}");
         assert_eq!(incomplete.get(), before.1 + 1 - success, "{scenario}");
-        assert_eq!(history.lock().stats().retained_records > 0, scenario == "success", "{scenario}");
+        assert_eq!(
+            history.lock().stats().retained_records > 0,
+            scenario == "success",
+            "{scenario}"
+        );
     }
     drop(router);
     runtime.shutdown();

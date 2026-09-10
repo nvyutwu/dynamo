@@ -743,7 +743,8 @@ where
     }
 
     pub(super) fn set_cache_loss(&mut self, tracking: CacheLossTracking) {
-        self.request_metrics().observe_cache_loss_input(tracking.route.prompt_tokens);
+        self.request_metrics()
+            .observe_cache_loss_input(tracking.route.prompt_tokens);
         self.cache_loss = Some(tracking);
     }
 
@@ -793,7 +794,10 @@ where
         if self.cache_loss_recorded {
             return;
         }
-        let stages = self.cache_loss.as_mut().and_then(|tracking| tracking.pending_stages.take());
+        let stages = self
+            .cache_loss
+            .as_mut()
+            .and_then(|tracking| tracking.pending_stages.take());
         let Some(stages) = stages else {
             self.record_cache_loss_incomplete();
             return;
@@ -896,7 +900,9 @@ where
             && let Some(data) = item.data.as_ref()
             && !data.token_ids.is_empty()
         {
-            cache_loss.request.observe_output(data.index.unwrap_or(0), &data.token_ids);
+            cache_loss
+                .request
+                .observe_output(data.index.unwrap_or(0), &data.token_ids);
         }
         self.observe_cache_loss_worker_outcome(item);
 

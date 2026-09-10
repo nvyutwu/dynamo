@@ -38,8 +38,10 @@ pub(super) struct WorkerSelection {
     pub(super) eligible_oracle_cached_tokens: usize,
     pub(super) resident_oracle_cached_tokens: usize,
     pub(super) eligible_oracle_worker: Option<WorkerWithDpRank>,
-    pub(super) eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
-    pub(super) selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+    pub(super) eligible_oracle_tiers:
+        dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+    pub(super) selected_worker_tiers:
+        dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
 
     pub(super) potential_decode_blocks: u64,
     pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,

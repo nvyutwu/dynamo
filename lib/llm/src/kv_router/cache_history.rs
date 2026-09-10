@@ -65,7 +65,8 @@ impl CacheHistory {
         }
         let requested_blocks = parse_positive_env(HISTORY_BLOCK_CAPACITY_ENV)
             .unwrap_or(DEFAULT_HISTORY_BLOCK_CAPACITY);
-        let requested_bytes = parse_positive_env(HISTORY_BYTES_ENV).unwrap_or(DEFAULT_HISTORY_BYTES);
+        let requested_bytes =
+            parse_positive_env(HISTORY_BYTES_ENV).unwrap_or(DEFAULT_HISTORY_BYTES);
         let capacity_bytes = requested_bytes.max(ESTIMATED_BYTES_PER_HISTORY_RECORD);
         let byte_limited_blocks = capacity_bytes / ESTIMATED_BYTES_PER_HISTORY_RECORD;
         let capacity_blocks = requested_blocks.min(byte_limited_blocks.max(1));
@@ -85,8 +86,14 @@ impl CacheHistory {
     }
 
     fn new_with_budget(capacity_blocks: usize, block_tokens: u32, capacity_bytes: usize) -> Self {
-        assert!(capacity_blocks > 0, "cache history capacity must be positive");
-        assert!(block_tokens > 0, "cache history block size must be positive");
+        assert!(
+            capacity_blocks > 0,
+            "cache history capacity must be positive"
+        );
+        assert!(
+            block_tokens > 0,
+            "cache history block size must be positive"
+        );
         Self {
             capacity_blocks,
             capacity_bytes,

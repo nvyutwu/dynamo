@@ -9,8 +9,8 @@ use std::{
 };
 
 use dynamo_kv_router::{
-    scheduling::overlap::SelectedWorkerTierSnapshot,
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
+    scheduling::overlap::SelectedWorkerTierSnapshot,
     selector::{WorkerInputs, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -30,7 +30,10 @@ use tracing::Instrument;
 
 use crate::{
     kv_router::{
-        KvRouter, cache_history::{CacheHistory, CacheHistoryRequest}, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector,
+        KvRouter,
+        cache_history::{CacheHistory, CacheHistoryRequest},
+        metrics::RouterRequestMetrics,
+        scheduler::DefaultWorkerSelector,
         to_worker_selection_session_context,
     },
     local_model::runtime_config::ModelRuntimeConfig,
@@ -40,7 +43,10 @@ use crate::{
         FinishReason,
         extensions::SessionAffinityId,
         llm_backend::LLMEngineOutput,
-        timing::{RequestTracker, RoutingDecisionCandidate, RoutingDecisionTrace, RequestPhase, RoutingData, WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL},
+        timing::{
+            RequestPhase, RequestTracker, RoutingData, RoutingDecisionCandidate,
+            RoutingDecisionTrace, WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL,
+        },
     },
     session_affinity::{
         AffinityAcquire, AffinityCoordinator, AffinityTarget, SessionAffinityMode, affinity_id,
@@ -70,7 +76,12 @@ const CACHE_RESIDENCY_TIERS: [&str; 2] = ["hbm", "cpu"];
 fn router_decision_trace_enabled() -> bool {
     std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED")
         .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 fn routing_decision_candidate(
@@ -100,7 +111,8 @@ fn record_routing_decision_trace(
     if !router_decision_trace_enabled() {
         return;
     }
-    let selected_worker = WorkerWithDpRank::new(selection.worker.worker_id, selection.worker.dp_rank);
+    let selected_worker =
+        WorkerWithDpRank::new(selection.worker.worker_id, selection.worker.dp_rank);
     let eligible_oracle = selection.eligible_oracle_worker.map(|worker| {
         routing_decision_candidate(
             worker,
@@ -150,8 +162,7 @@ fn record_cache_residency_metrics(
     block_size: u32,
 ) {
     let selected_tokens = cache_residency_tokens(selected, input_tokens, block_size);
-    let eligible_oracle_tokens =
-        cache_residency_tokens(eligible_oracle, input_tokens, block_size);
+    let eligible_oracle_tokens = cache_residency_tokens(eligible_oracle, input_tokens, block_size);
 
     for ((tier, selected), eligible_oracle) in CACHE_RESIDENCY_TIERS
         .iter()
@@ -173,7 +184,6 @@ fn record_cache_residency_metrics(
             .inc_by(eligible_oracle.saturating_sub(selected));
     }
 }
-
 
 /// Bounds the wait for a worker's trailing typed error after a terminal frame.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -537,9 +547,12 @@ where
         if let Some(history) = cache_history.as_ref() {
             let stats = history.lock().stats();
             request_metrics.set_cache_loss_history_stats(
-                stats.retained_records, stats.retained_unique_hashes,
-                stats.represented_tokens, stats.estimated_retained_bytes,
-                stats.capacity_bytes, stats.capacity_blocks,
+                stats.retained_records,
+                stats.retained_unique_hashes,
+                stats.represented_tokens,
+                stats.estimated_retained_bytes,
+                stats.capacity_bytes,
+                stats.capacity_blocks,
             );
         }
         RoutingHost {
@@ -942,7 +955,7 @@ where
                 .inc_by(
                     selection
                         .resident_oracle_cached_tokens
-                    .min(routing_parts.token_ids.len()) as u64,
+                        .min(routing_parts.token_ids.len()) as u64,
                 );
             record_cache_residency_metrics(
                 &self.request_metrics,
@@ -1044,7 +1057,9 @@ mod cache_residency_tests {
     #[test]
     fn cpu_residency_is_extension_and_total_is_capped_by_prompt() {
         let snapshot = SelectedWorkerTierSnapshot {
-            gpu_blocks: 2, host_pinned_blocks: 5, disk_blocks: 8,
+            gpu_blocks: 2,
+            host_pinned_blocks: 5,
+            disk_blocks: 8,
             ..Default::default()
         };
         assert_eq!(cache_residency_tokens(&snapshot, 64, 16), [32, 32]);

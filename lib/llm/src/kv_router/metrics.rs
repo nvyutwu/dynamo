@@ -1200,7 +1200,8 @@ impl RouterRequestMetrics {
         capacity_blocks: usize,
     ) {
         let as_i64 = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
-        self.cache_loss_history_block_records.set(as_i64(retained_records));
+        self.cache_loss_history_block_records
+            .set(as_i64(retained_records));
         self.cache_loss_history_unique_hashes
             .set(as_i64(retained_unique_hashes));
         self.cache_loss_history_represented_tokens
@@ -1406,7 +1407,6 @@ impl ApproximateLruMetrics {
         }
         *previous = current;
     }
-
 }
 
 pub struct RemoteIndexerMetrics {
