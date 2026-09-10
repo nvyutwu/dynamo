@@ -2684,15 +2684,15 @@ impl OpenAIPreprocessor {
         // rendered token count.
         let segments = [
             crate::tokenizers::EncodeSegment {
-                text: OPEN.to_string(),
+                text: OPEN,
                 allow_special: true,
             },
             crate::tokenizers::EncodeSegment {
-                text: channel.to_string(),
+                text: channel,
                 allow_special: false,
             },
             crate::tokenizers::EncodeSegment {
-                text: SEP.to_string(),
+                text: SEP,
                 allow_special: true,
             },
         ];
