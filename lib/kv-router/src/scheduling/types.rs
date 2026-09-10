@@ -72,6 +72,7 @@ impl KvSchedulerError {
 
 #[derive(Debug)]
 pub struct SchedulingResponse {
+    pub score_decision: Option<Box<crate::protocols::RoutingScoreDecision>>,
     pub best_worker: WorkerWithDpRank,
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,

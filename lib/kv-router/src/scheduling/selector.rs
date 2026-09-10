@@ -105,7 +105,7 @@ impl DefaultWorkerSelector {
         }
     }
 
-    fn worker_logit(
+    fn worker_score(
         &self,
         request: &SchedulingRequest,
         worker: WorkerWithDpRank,
@@ -113,7 +113,7 @@ impl DefaultWorkerSelector {
         min_active_prefill_tokens: usize,
         weights: LogitWeights,
         formula_name: &'static str,
-    ) -> f64 {
+    ) -> crate::protocols::RoutingCandidateScore {
         let block_size_f64 = block_size as f64;
         let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
         let has_tier_overlap_blocks = !request.overlap.tier_overlap_blocks.device.is_empty()
@@ -202,6 +202,7 @@ impl DefaultWorkerSelector {
             + shared_overlap_blocks;
         let adjusted_prefill_blocks = raw_prefill_blocks - overlap_credit_blocks;
         let prefill_cost_blocks = weights.prefill_load_scale * adjusted_prefill_blocks;
+        let load_observed = worker_load.is_some();
         let worker_load = worker_load.unwrap_or_default();
         let decode_cost_blocks = worker_load.potential_decode_blocks() as f64;
         let logit = prefill_cost_blocks + decode_cost_blocks;
@@ -232,7 +233,120 @@ impl DefaultWorkerSelector {
             );
         }
 
-        logit
+        crate::protocols::RoutingCandidateScore {
+            worker,
+            cached_tokens: request.effective_cached_tokens_for(worker),
+            load_observed,
+            active_prefill_tokens: worker_load.active_prefill_tokens,
+            active_decode_blocks: worker_load.active_decode_blocks,
+            additional_active_blocks: worker_load.additional_active_blocks,
+            raw_prefill_blocks,
+            device_overlap_blocks,
+            host_overlap_blocks,
+            disk_overlap_blocks,
+            shared_overlap_blocks,
+            overlap_credit_decay,
+            overlap_credit_blocks,
+            prefill_cost_blocks,
+            decode_cost_blocks,
+            preference_multiplier: 1.0,
+            total_cost: logit,
+        }
+    }
+
+    fn worker_logit(
+        &self,
+        request: &SchedulingRequest,
+        worker: WorkerWithDpRank,
+        block_size: u32,
+        min_active_prefill_tokens: usize,
+        weights: LogitWeights,
+        formula_name: &'static str,
+    ) -> f64 {
+        self.worker_score(
+            request,
+            worker,
+            block_size,
+            min_active_prefill_tokens,
+            weights,
+            formula_name,
+        )
+        .total_cost
+    }
+
+    fn score_decision<C: WorkerConfigLike>(
+        &self,
+        workers: &HashMap<WorkerId, C>,
+        request: &SchedulingRequest,
+        eligibility: RoutingEligibility<'_>,
+        worker: WorkerWithDpRank,
+        block_size: u32,
+        min_active_prefill_tokens: usize,
+        weights: LogitWeights,
+        temperature: f64,
+    ) -> Option<Box<crate::protocols::RoutingScoreDecision>> {
+        // Match the existing trace opt-in. Never retain a fleet-sized score map.
+        if !std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        {
+            return None;
+        }
+        let pinned = eligibility.pinned_worker().is_some();
+        let candidate = |worker| {
+            let mut score = self.worker_score(
+                request,
+                worker,
+                block_size,
+                min_active_prefill_tokens,
+                weights,
+                "Decision snapshot",
+            );
+            if !pinned {
+                score.preference_multiplier = workers
+                    .get(&worker.worker_id)
+                    .and_then(|cfg| {
+                        request
+                            .routing_constraints
+                            .preferred_taint_multiplier(cfg.taints())
+                    })
+                    .unwrap_or(1.0);
+                score.total_cost *= score.preference_multiplier;
+            }
+            score
+        };
+        Some(Box::new(crate::protocols::RoutingScoreDecision {
+            selection_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            method: if pinned {
+                "pinned"
+            } else if temperature == 0.0 {
+                "minimum_cost"
+            } else {
+                "softmax"
+            }
+            .into(),
+            router_temperature: temperature,
+            track_prefill_tokens: request.track_prefill_tokens,
+            min_active_prefill_tokens,
+            overlap_score_credit: weights.overlap_score_credit,
+            overlap_score_credit_decay: weights.overlap_score_credit_decay,
+            prefill_load_scale: weights.prefill_load_scale,
+            shared_cache_multiplier: weights.shared_cache_multiplier,
+            host_cache_hit_weight: self.kv_router_config.host_cache_hit_weight,
+            disk_cache_hit_weight: self.kv_router_config.disk_cache_hit_weight,
+            request_override_present: request.router_config_override.is_some(),
+            selected: candidate(worker),
+            eligible_oracle: oracle_cached_entry(workers, request, eligibility)
+                .map(|(w, _)| candidate(w)),
+        }))
     }
 }
 
@@ -295,6 +409,12 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 .unwrap_or(self.kv_router_config.shared_cache_multiplier),
         };
 
+        let temperature = request
+            .router_config_override
+            .as_ref()
+            .and_then(|cfg| cfg.router_temperature)
+            .unwrap_or(self.kv_router_config.router_temperature);
+
         if let Some(worker) = pinned_worker {
             match eligibility.validate_worker_rank(workers, worker) {
                 Ok(_) => {}
@@ -328,6 +448,16 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             );
 
             return Ok(WorkerSelectionResult {
+                score_decision: self.score_decision(
+                    workers,
+                    request,
+                    eligibility,
+                    worker,
+                    block_size,
+                    min_active_prefill_tokens,
+                    weights,
+                    temperature,
+                ),
                 worker,
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
@@ -337,11 +467,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             });
         }
 
-        let temperature = request
-            .router_config_override
-            .as_ref()
-            .and_then(|cfg| cfg.router_temperature)
-            .unwrap_or(self.kv_router_config.router_temperature);
         let min_active_prefill_tokens =
             if request.track_prefill_tokens && weights.overlap_score_credit_decay > 0.0 {
                 let mut minimum = usize::MAX;
@@ -442,6 +567,16 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             let cached_tokens = request.effective_cached_tokens_for(best_worker);
 
             return Ok(WorkerSelectionResult {
+                score_decision: self.score_decision(
+                    workers,
+                    request,
+                    eligibility,
+                    best_worker,
+                    block_size,
+                    min_active_prefill_tokens,
+                    weights,
+                    temperature,
+                ),
                 worker: best_worker,
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
@@ -472,6 +607,16 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         );
 
         Ok(WorkerSelectionResult {
+            score_decision: self.score_decision(
+                workers,
+                request,
+                eligibility,
+                best_worker,
+                block_size,
+                min_active_prefill_tokens,
+                weights,
+                temperature,
+            ),
             worker: best_worker,
             required_blocks: request_blocks,
             effective_overlap_blocks: best_overlap,
@@ -543,6 +688,77 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: None,
+        }
+    }
+
+    #[test]
+    fn decision_scores_explain_cache_sacrifice() {
+        let selector = DefaultWorkerSelector::new(None, "decode");
+        let mut request = base_request(8 * 12288);
+        let oracle = WorkerWithDpRank::new(1, 0);
+        let selected = WorkerWithDpRank::new(2, 0);
+        for (worker, hits, backlog) in [(oracle, 8, 10), (selected, 6, 2)] {
+            request
+                .overlap
+                .effective_cached_tokens
+                .insert(worker, hits * 12288);
+            request
+                .overlap
+                .effective_overlap_blocks
+                .insert(worker, hits as f64);
+            request.worker_loads.insert(
+                worker,
+                crate::sequences::WorkerLoadProjection {
+                    active_prefill_tokens: backlog * 12288,
+                    active_decode_blocks: 20,
+                    additional_active_blocks: 0,
+                },
+            );
+        }
+        let weights = LogitWeights {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            prefill_load_scale: 1.5,
+            shared_cache_multiplier: 0.0,
+        };
+        let a = selector.worker_score(&request, oracle, 12288, 0, weights, "test");
+        let b = selector.worker_score(&request, selected, 12288, 0, weights, "test");
+        assert_eq!(a.total_cost, 35.0);
+        assert_eq!(b.total_cost, 26.0);
+        assert_eq!(a.active_prefill_tokens, 10 * 12288);
+        assert_eq!(b.cached_tokens, 6 * 12288);
+        assert_eq!(b.total_cost, b.prefill_cost_blocks + b.decode_cost_blocks);
+        assert!(a.cached_tokens > b.cached_tokens && a.total_cost > b.total_cost);
+        let encoded = serde_json::to_value(&b).unwrap();
+        assert_eq!(encoded["worker"]["worker_id"], 2);
+        assert_eq!(encoded["load_observed"], true);
+        let workers = HashMap::from([
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]);
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 12288)
+            .unwrap();
+        assert_eq!(result.worker, selected);
+        // Run this test both with and without the production trace opt-in.
+        if std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED").as_deref() == Ok("1") {
+            let trace = result.score_decision.expect("enabled decision snapshot");
+            assert_eq!(trace.method, "minimum_cost");
+            assert_eq!(trace.selected.worker, result.worker);
+            assert_eq!(trace.selected.cached_tokens, result.cached_tokens);
+            let oracle = trace.eligible_oracle.as_ref().unwrap();
+            assert_eq!(oracle.cached_tokens, result.eligible_oracle_cached_tokens);
+            assert!(trace.selected.total_cost < oracle.total_cost);
+            assert!(trace.selection_unix_ms > 0);
+            request.pinned_worker = Some(oracle.worker);
+            let pinned = selector
+                .select_worker(&workers, &request, request.eligibility(), 12288)
+                .unwrap();
+            let trace = pinned.score_decision.unwrap();
+            assert_eq!(trace.method, "pinned");
+            assert_eq!(trace.selected.worker, trace.eligible_oracle.unwrap().worker);
+        } else {
+            assert!(result.score_decision.is_none());
         }
     }
 

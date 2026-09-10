@@ -36,6 +36,10 @@ const UNSET_DP_RANK_LABEL: &str = "none";
 /// that a CPU-RAM-only transfer mechanism could potentially reuse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingDecisionTrace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_instance: Option<String>,
     pub schema: String,
     pub candidate_scope: String,
     pub block_size: u32,
@@ -890,6 +894,22 @@ mod tests {
     }
 
     #[test]
+    fn routing_decision_v1_remains_readable() {
+        let trace: RoutingDecisionTrace = serde_json::from_value(serde_json::json!({
+            "schema": "dynamo.router.decision.v44.v1",
+            "candidate_scope": "selected_and_best_eligible_cache_holder",
+            "block_size": 12288, "input_tokens": 24576,
+            "selected": {"worker_id": 1, "dp_rank": 0, "effective_overlap_blocks": 1.0,
+                "cached_tokens": 12288, "hbm_blocks": 1, "cpu_ram_cumulative_blocks": 1,
+                "cpu_ram_only_blocks": 0, "disk_cumulative_blocks": 1}
+        }))
+        .unwrap();
+        assert!(trace.score_decision.is_none());
+        assert!(trace.frontend_instance.is_none());
+        assert_eq!(trace.selected.cached_tokens, 12288);
+    }
+
+    #[test]
     fn routing_decision_trace_is_first_write_wins() {
         let tracker = RequestTracker::new();
         let trace = RoutingDecisionTrace {
@@ -908,6 +928,8 @@ mod tests {
                 disk_cumulative_blocks: 2,
             },
             eligible_oracle: None,
+            score_decision: None,
+            frontend_instance: None,
         };
         tracker.record_routing_decision_trace(trace);
         tracker.record_routing_decision_trace(RoutingDecisionTrace {
@@ -926,6 +948,8 @@ mod tests {
                 disk_cumulative_blocks: 0,
             },
             eligible_oracle: None,
+            score_decision: None,
+            frontend_instance: None,
         });
 
         let trace = tracker.routing_decision_trace().unwrap();

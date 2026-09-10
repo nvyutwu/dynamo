@@ -34,6 +34,7 @@ pub(super) struct WorkerSelection {
     pub(super) selected_worker_tiers: SelectedWorkerTierSnapshot,
     pub(super) eligible_oracle_worker: Option<WorkerWithDpRank>,
     pub(super) eligible_oracle_tiers: SelectedWorkerTierSnapshot,
+    pub(super) score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
 }
@@ -113,6 +114,7 @@ impl KvPushRouter {
                 selected_worker_tiers,
                 eligible_oracle_worker,
                 eligible_oracle_tiers,
+                score_decision,
                 routing_hashes,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
@@ -125,6 +127,7 @@ impl KvPushRouter {
                 selected_worker_tiers,
                 eligible_oracle_worker,
                 eligible_oracle_tiers,
+                score_decision,
                 routing_hashes,
                 lifecycle,
             }),

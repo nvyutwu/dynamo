@@ -1474,6 +1474,7 @@ impl<
         };
 
         let response = SchedulingResponse {
+            score_decision: selection.score_decision,
             best_worker: selection.worker,
             effective_overlap_blocks: selection.effective_overlap_blocks,
             cached_tokens: selection.cached_tokens,
@@ -1843,6 +1844,7 @@ mod tests {
             };
 
             Ok(WorkerSelectionResult {
+                score_decision: None,
                 worker,
                 required_blocks: request.request_blocks(block_size),
                 effective_overlap_blocks: request.effective_overlap_blocks_for(worker),
@@ -4397,6 +4399,14 @@ policy_classes:
         assert_eq!(resp3.best_worker, WorkerWithDpRank::new(1, 0));
         assert_eq!(resp3.effective_overlap_blocks, 9.0);
         assert_eq!(resp3.cached_tokens, 144);
+        if std::env::var("DYN_ROUTER_DECISION_TRACE_ENABLED").as_deref() == Ok("1") {
+            let decision = resp3.score_decision.as_ref().expect("snapshot propagated through queue");
+            assert_eq!(decision.selected.worker, resp3.best_worker);
+            assert_eq!(decision.selected.cached_tokens, 144);
+            assert_eq!(decision.eligible_oracle.as_ref().unwrap().cached_tokens,
+                resp3.eligible_oracle_cached_tokens);
+        }
+
         assert_eq!(queue.pending_count(), 0);
     }
 

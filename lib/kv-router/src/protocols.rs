@@ -533,8 +533,50 @@ pub enum RouterResponse {
     },
 }
 
+/// Decision-time score inputs, captured from the same immutable admission view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingCandidateScore {
+    pub worker: WorkerWithDpRank,
+    pub cached_tokens: usize,
+    pub load_observed: bool,
+    pub active_prefill_tokens: usize,
+    pub active_decode_blocks: usize,
+    pub additional_active_blocks: usize,
+    pub raw_prefill_blocks: f64,
+    pub device_overlap_blocks: f64,
+    pub host_overlap_blocks: f64,
+    pub disk_overlap_blocks: f64,
+    pub shared_overlap_blocks: f64,
+    pub overlap_credit_decay: f64,
+    pub overlap_credit_blocks: f64,
+    pub prefill_cost_blocks: f64,
+    pub decode_cost_blocks: f64,
+    pub preference_multiplier: f64,
+    pub total_cost: f64,
+}
+
+/// Bounded explanation of a selection, before scheduler reservation. No block hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingScoreDecision {
+    pub selection_unix_ms: u64,
+    pub method: String,
+    pub router_temperature: f64,
+    pub track_prefill_tokens: bool,
+    pub min_active_prefill_tokens: usize,
+    pub overlap_score_credit: f64,
+    pub overlap_score_credit_decay: f64,
+    pub prefill_load_scale: f64,
+    pub shared_cache_multiplier: f64,
+    pub host_cache_hit_weight: f64,
+    pub disk_cache_hit_weight: f64,
+    pub request_override_present: bool,
+    pub selected: RoutingCandidateScore,
+    pub eligible_oracle: Option<RoutingCandidateScore>,
+}
+
 #[derive(Debug)]
 pub struct WorkerSelectionResult {
+    pub score_decision: Option<Box<RoutingScoreDecision>>,
     /// The full worker information including dp_rank
     pub worker: WorkerWithDpRank,
 

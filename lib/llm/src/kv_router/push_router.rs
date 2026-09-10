@@ -91,7 +91,9 @@ fn record_routing_decision_trace(
         )
     });
     tracker.record_routing_decision_trace(RoutingDecisionTrace {
-        schema: "dynamo.router.decision.v44.v1".to_string(),
+        schema: "dynamo.router.decision.v44.v2".to_string(),
+        score_decision: selection.score_decision.clone(),
+        frontend_instance: std::env::var("HOSTNAME").ok(),
         candidate_scope: "selected_and_best_eligible_cache_holder".to_string(),
         block_size,
         input_tokens,

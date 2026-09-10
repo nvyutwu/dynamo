@@ -84,6 +84,7 @@ pub enum FindBestMatchOutcome {
         selected_worker_tiers: SelectedWorkerTierSnapshot,
         eligible_oracle_worker: Option<WorkerWithDpRank>,
         eligible_oracle_tiers: SelectedWorkerTierSnapshot,
+        score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
         routing_hashes: Option<RoutingDecisionHashes>,
     },
     QueueRejected {
@@ -771,6 +772,7 @@ where
                 selected_worker_tiers: response.selected_worker_tiers,
                 eligible_oracle_worker: response.eligible_oracle_worker,
                 eligible_oracle_tiers: response.eligible_oracle_tiers,
+                score_decision: response.score_decision,
                 routing_hashes,
             },
             lifecycle,
@@ -1376,6 +1378,7 @@ mod tests {
             assert_eq!(observed_hits, self.expected_hits);
 
             Ok(dynamo_kv_router::protocols::WorkerSelectionResult {
+                score_decision: None,
                 worker: self.selected_worker,
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,
