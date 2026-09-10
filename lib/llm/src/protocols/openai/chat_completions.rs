@@ -345,7 +345,9 @@ fn parse_default_thinking_effort(raw: Option<&str>) -> Option<String> {
 /// to forward as the `thinking_effort` chat-template arg. Errors (surfaced as a
 /// `Validation:`-prefixed 400 by the HTTP layer) on an unsupported value.
 fn openai_thinking_effort(value: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-    let effort = value.as_str().filter(|e| VALID_THINKING_EFFORTS.contains(e));
+    let effort = value
+        .as_str()
+        .filter(|e| VALID_THINKING_EFFORTS.contains(e));
     if effort.is_none() {
         anyhow::bail!("`thinking.effort` must be `low`, `high`, or `max`");
     }
