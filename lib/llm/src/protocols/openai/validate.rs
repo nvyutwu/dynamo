@@ -516,6 +516,11 @@ fn validate_messages_with_lenient_tool_args(
     // these args are history context that is never re-parsed, so malformed
     // arguments must be accepted (Kimi-Vendor-Verifier `k3_tool_bad_arguments`).
     for (message_index, message) in messages.iter().enumerate() {
+        if let dynamo_protocols::types::ChatCompletionRequestMessage::Tool(tool) = message
+            && tool.tool_call_id.trim().is_empty()
+        {
+            anyhow::bail!("`messages[{message_index}].tool_call_id` cannot be empty");
+        }
         if !lenient_tool_args
             && let dynamo_protocols::types::ChatCompletionRequestMessage::Assistant(assistant) =
                 message
