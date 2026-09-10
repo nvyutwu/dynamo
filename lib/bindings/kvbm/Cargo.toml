@@ -65,7 +65,7 @@ cudarc = { version = "=0.19.8", features = ["cuda-version-from-build-system", "f
 # crates arrive transitively via dynamo-llm and must resolve to the same
 # sources as the root workspace.
 [patch.crates-io]
-dynamo-parsers = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
-dynamo-protocols = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
-dynamo-renderer = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
-dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "feat/Kimi-K3" }
+dynamo-parsers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
+dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
+dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
+dynamo-tokenizers = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "ab7387adfc56c0bdf8e018c525ecf919fb2e1bd2" }
