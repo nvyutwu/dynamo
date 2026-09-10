@@ -1179,6 +1179,85 @@ mod prefill_start_tests {
                 .unwrap()
         }
         Arc::new(RouterRequestMetrics {
+            input_tokens_total: prometheus::IntCounter::new("input_tokens_total", "test").unwrap(),
+            selected_cached_tokens_total: prometheus::IntCounter::new(
+                "selected_cached_tokens_total",
+                "test",
+            )
+            .unwrap(),
+            selected_cache_residency_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("selected_cache_residency_tokens_total", "test"),
+                &["cache_tier"],
+            )
+            .unwrap(),
+            eligible_oracle_cached_tokens_total: prometheus::IntCounter::new(
+                "eligible_oracle_cached_tokens_total",
+                "test",
+            )
+            .unwrap(),
+            eligible_oracle_cache_residency_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("eligible_oracle_cache_residency_tokens_total", "test"),
+                &["cache_tier"],
+            )
+            .unwrap(),
+            eligible_oracle_cache_residency_missed_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "eligible_oracle_cache_residency_missed_tokens_total",
+                    "test",
+                ),
+                &["cache_tier"],
+            )
+            .unwrap(),
+            resident_oracle_cached_tokens_total: prometheus::IntCounter::new(
+                "resident_oracle_cached_tokens_total",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_observation_input_tokens_total: prometheus::IntCounter::new(
+                "cache_loss_observation_input_tokens_total",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_funnel_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("cache_loss_funnel_tokens_total", "test"),
+                &["stage"],
+            )
+            .unwrap(),
+            cache_loss_observations_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("cache_loss_observations_total", "test"),
+                &["result"],
+            )
+            .unwrap(),
+            cache_loss_history_block_records: prometheus::IntGauge::new(
+                "cache_loss_history_block_records",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_history_unique_hashes: prometheus::IntGauge::new(
+                "cache_loss_history_unique_hashes",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_history_represented_tokens: prometheus::IntGauge::new(
+                "cache_loss_history_represented_tokens",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_history_estimated_bytes: prometheus::IntGauge::new(
+                "cache_loss_history_estimated_bytes",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_history_capacity_bytes: prometheus::IntGauge::new(
+                "cache_loss_history_capacity_bytes",
+                "test",
+            )
+            .unwrap(),
+            cache_loss_history_capacity_blocks: prometheus::IntGauge::new(
+                "cache_loss_history_capacity_blocks",
+                "test",
+            )
+            .unwrap(),
             requests_total: prometheus::IntCounter::new("requests_total", "test").unwrap(),
             time_to_first_token_seconds: hist("ttft_seconds"),
             inter_token_latency_seconds: hist("itl_seconds"),
