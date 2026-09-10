@@ -3020,7 +3020,17 @@ impl OpenAIPreprocessor {
             .tools()
             .as_ref()
             .and_then(|tools| tools.len())
-            .is_some_and(|len| len > 0);
+            .is_some_and(|len| len > 0)
+            || request.typed_messages().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    use dynamo_protocols::types::ChatCompletionRequestMessage;
+                    match message {
+                        ChatCompletionRequestMessage::System(m) => m.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+                        ChatCompletionRequestMessage::Developer(m) => m.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+                        _ => false,
+                    }
+                })
+            });
         let tool_choice_none = request
             .tool_choice()
             .as_ref()
