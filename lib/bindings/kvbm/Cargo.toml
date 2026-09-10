@@ -60,3 +60,8 @@ dlpark = { version = "0.5", features = ["pyo3", "half"], optional = true }
 cudarc = { version = "=0.19.8", features = ["cuda-version-from-build-system", "fallback-latest"], optional = true }
 
 [dev-dependencies]
+
+# This independent workspace must use the same frontend types as dynamo-llm.
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "f79a1a5dfae551f5b027f41c9cc503297f151dbe" }
+dynamo-renderer = { git = "https://github.com/nvyutwu/frontend-crates.git", rev = "f79a1a5dfae551f5b027f41c9cc503297f151dbe" }
