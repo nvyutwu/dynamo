@@ -93,6 +93,10 @@ pub struct RequestTraceMetrics {
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// Actual cached prompt tokens from backend response usage, not the router estimate.
+    /// Absent when the response path has not observed backend cache usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_actual_cached_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_received_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,6 +329,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: Some(4),
                 cached_tokens: None,
+                backend_actual_cached_tokens: None,
                 request_received_ms: Some(1_000),
                 prefill_wait_time_ms: None,
                 prefill_time_ms: None,

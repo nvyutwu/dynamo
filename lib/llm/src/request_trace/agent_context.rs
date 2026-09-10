@@ -180,6 +180,9 @@ pub(crate) fn record_llm_metric_tokens(
     if input_tokens.is_some() || cached_tokens.is_some() {
         tracker.record_isl(input_tokens.unwrap_or(0), cached_tokens);
     }
+    if let Some(cached_tokens) = cached_tokens {
+        tracker.record_backend_actual_cached_tokens(cached_tokens);
+    }
     tracker.record_osl(output_tokens);
 }
 
@@ -211,6 +214,8 @@ pub(crate) fn request_metrics(
         input_tokens: tracker.and_then(|tracker| tracker.isl_tokens().map(|v| v as u64)),
         output_tokens: tracker.map(RequestTracker::osl_tokens),
         cached_tokens: tracker.and_then(|tracker| tracker.cached_tokens().map(|v| v as u64)),
+        backend_actual_cached_tokens: tracker
+            .and_then(|tracker| tracker.backend_actual_cached_tokens().map(|v| v as u64)),
         request_received_ms: timing.as_ref().map(|timing| timing.request_received_ms),
         prefill_wait_time_ms: timing
             .as_ref()
@@ -545,6 +550,37 @@ mod tests {
         record_chat_finish_reason_metadata, record_completion_finish_reason_metadata,
         request_metrics, request_metrics_from_agent_state,
     };
+
+    #[test]
+    fn test_request_trace_separates_router_estimate_from_backend_actual() {
+        let tracker = RequestTracker::new();
+        tracker.record_isl(12609, Some(12288));
+        super::record_llm_metric_tokens(Some(&tracker), Some(12609), 16, Some(12416));
+        let metrics = request_metrics("actual-cache".into(), None, "model".into(), Some(&tracker));
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["cached_tokens"], 12288);
+        assert_eq!(json["backend_actual_cached_tokens"], 12416);
+    }
+
+    #[test]
+    fn test_request_trace_distinguishes_missing_backend_usage_from_zero() {
+        let tracker = RequestTracker::new();
+        tracker.record_isl(640, Some(640));
+        super::record_llm_metric_tokens(Some(&tracker), Some(640), 1, None);
+        let missing = request_metrics("missing".into(), None, "model".into(), Some(&tracker));
+        assert!(
+            serde_json::to_value(missing)
+                .unwrap()
+                .get("backend_actual_cached_tokens")
+                .is_none()
+        );
+        super::record_llm_metric_tokens(Some(&tracker), Some(640), 16, Some(0));
+        super::record_llm_metric_tokens(Some(&tracker), None, 16, None);
+        let cold = request_metrics("cold".into(), None, "model".into(), Some(&tracker));
+        let json = serde_json::to_value(cold).unwrap();
+        assert_eq!(json["backend_actual_cached_tokens"], 0);
+        assert_eq!(json["cached_tokens"], 640);
+    }
 
     #[test]
     fn test_request_metrics_from_tracker() {

@@ -68,6 +68,7 @@ pub(crate) fn emit_request_end(
         input_tokens: None,
         output_tokens: Some(tracker.osl_tokens()),
         cached_tokens: None,
+        backend_actual_cached_tokens: tracker.backend_actual_cached_tokens().map(|v| v as u64),
         request_received_ms: Some(request_received_ms),
         prefill_wait_time_ms: None,
         prefill_time_ms: None,
@@ -184,7 +185,8 @@ mod tests {
         BUS.init(16);
         let mut rx = BUS.subscribe();
         let tracker = RequestTracker::new();
-        tracker.record_osl(7);
+        tracker.record_isl(12609, Some(12288));
+        crate::request_trace::record_llm_metric_tokens(Some(&tracker), Some(12609), 7, Some(12416));
         tracker.record_finish();
 
         emit_request_end(
@@ -210,6 +212,8 @@ mod tests {
         let request = record.request.as_ref().expect("request payload");
         assert_eq!(request.request_id, "req-1");
         assert_eq!(request.output_tokens, Some(7));
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["backend_actual_cached_tokens"], 12416);
         assert_eq!(
             request.request_received_ms,
             Some(tracker.request_received_epoch_ms())

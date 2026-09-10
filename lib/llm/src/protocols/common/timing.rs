@@ -146,6 +146,9 @@ pub struct RequestTracker {
     /// Number of cached tokens derived from the effective cache hit - set once via OnceLock
     cached_tokens: OnceLock<usize>,
 
+    /// Actual cached prompt tokens reported by backend usage, independent of routing estimates.
+    backend_actual_cached_tokens: OnceLock<usize>,
+
     /// Output sequence length in tokens - updated atomically as tokens stream back
     osl_tokens: AtomicU64,
 
@@ -255,6 +258,7 @@ impl RequestTracker {
             isl_blocks: OnceLock::new(),
             isl_tokens: OnceLock::new(),
             cached_tokens: OnceLock::new(),
+            backend_actual_cached_tokens: OnceLock::new(),
             osl_tokens: AtomicU64::new(0),
             prefill_worker_id: OnceLock::new(),
             prefill_dp_rank: OnceLock::new(),
@@ -311,6 +315,15 @@ impl RequestTracker {
 
     pub fn isl_tokens(&self) -> Option<usize> {
         self.isl_tokens.get().copied()
+    }
+
+    /// Record final backend usage; missing usage must not be converted into a zero hit.
+    pub fn record_backend_actual_cached_tokens(&self, cached_tokens: usize) {
+        let _ = self.backend_actual_cached_tokens.set(cached_tokens);
+    }
+
+    pub fn backend_actual_cached_tokens(&self) -> Option<usize> {
+        self.backend_actual_cached_tokens.get().copied()
     }
 
     pub fn cached_tokens(&self) -> Option<usize> {

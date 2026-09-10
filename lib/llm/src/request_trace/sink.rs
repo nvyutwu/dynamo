@@ -306,6 +306,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: Some(7),
                 cached_tokens: None,
+                backend_actual_cached_tokens: None,
                 request_received_ms: Some(1_000),
                 prefill_wait_time_ms: None,
                 prefill_time_ms: None,
