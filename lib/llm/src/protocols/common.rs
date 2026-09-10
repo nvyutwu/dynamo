@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Engine Protocols
-//! =========//!
+//! ================
+//!
 //! This module contains the protocols in public API for the LLM Engine and AsyncEngine facades.
 //!
 //! The core components are the `CompletionRequest` and `StreamingCompletionResponse` objects.
