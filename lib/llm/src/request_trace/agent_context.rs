@@ -174,12 +174,10 @@ pub(crate) fn record_llm_metric_tokens(
         return;
     };
 
-    // Usage-derived token counts arrive late in the response path. Earlier
-    // router-side observations still win because RequestTracker stores them
-    // with OnceLock.
     if input_tokens.is_some() || cached_tokens.is_some() {
         tracker.record_isl(input_tokens.unwrap_or(0), cached_tokens);
     }
+    tracker.record_backend_cached_tokens(cached_tokens);
     tracker.record_osl(output_tokens);
 }
 
@@ -210,7 +208,10 @@ pub(crate) fn request_metrics(
         model: Some(model),
         input_tokens: tracker.and_then(|tracker| tracker.isl_tokens().map(|v| v as u64)),
         output_tokens: tracker.map(RequestTracker::osl_tokens),
-        cached_tokens: tracker.and_then(|tracker| tracker.cached_tokens().map(|v| v as u64)),
+        cached_tokens: tracker
+            .and_then(|tracker| tracker.cached_tokens().map(|value| value as u64)),
+        backend_actual_cached_tokens: tracker
+            .and_then(|tracker| tracker.backend_cached_tokens().map(|value| value as u64)),
         request_received_ms: timing.as_ref().map(|timing| timing.request_received_ms),
         prefill_wait_time_ms: timing
             .as_ref()
@@ -542,7 +543,7 @@ mod tests {
     use super::{
         AgentContextTraceState, SharedFinishReasonMetadata, record_backend_finish_reason_metadata,
         record_chat_finish_reason_metadata, record_completion_finish_reason_metadata,
-        request_metrics, request_metrics_from_agent_state,
+        record_llm_metric_tokens, request_metrics, request_metrics_from_agent_state,
     };
     use crate::protocols::common::extensions::AgentContext;
 
@@ -550,6 +551,7 @@ mod tests {
     fn test_request_metrics_from_tracker() {
         let tracker = RequestTracker::new();
         tracker.record_isl(128, Some(32));
+        record_llm_metric_tokens(Some(&tracker), Some(128), 5, Some(16));
         tracker.record_kv_hit(4.0, 8);
         tracker.record_osl(5);
         tracker.record_router_queue_depth(3);
@@ -576,6 +578,7 @@ mod tests {
         assert_eq!(metrics.input_tokens, Some(128));
         assert_eq!(metrics.output_tokens, Some(5));
         assert_eq!(metrics.cached_tokens, Some(32));
+        assert_eq!(metrics.backend_actual_cached_tokens, Some(16));
         assert!(metrics.request_received_ms.is_some_and(|ms| ms > 0));
         assert!(metrics.prefill_wait_time_ms.is_some());
         assert!(metrics.prefill_time_ms.is_some());
@@ -608,6 +611,7 @@ mod tests {
         assert_eq!(metrics.input_tokens, None);
         assert_eq!(metrics.output_tokens, None);
         assert_eq!(metrics.cached_tokens, None);
+        assert_eq!(metrics.backend_actual_cached_tokens, None);
         assert_eq!(metrics.request_received_ms, None);
         assert_eq!(metrics.prefill_wait_time_ms, None);
         assert_eq!(metrics.prefill_time_ms, None);
@@ -619,6 +623,24 @@ mod tests {
         assert_eq!(metrics.queue_depth, None);
         assert!(metrics.finish_reason_metadata.is_none());
         assert!(metrics.worker.is_none());
+    }
+
+    #[test]
+    fn test_request_metrics_preserve_fine_grained_backend_actual_cache_count() {
+        let tracker = RequestTracker::new();
+        tracker.record_isl(26_112, Some(24_576));
+        record_llm_metric_tokens(Some(&tracker), Some(26_112), 1, Some(24_704));
+
+        let metrics = request_metrics(
+            "req-fine-cache".to_string(),
+            None,
+            "test-model".to_string(),
+            Some(&tracker),
+        );
+
+        assert_eq!(metrics.cached_tokens, Some(24_576));
+        assert_eq!(metrics.backend_actual_cached_tokens, Some(24_704));
+        assert_eq!(tracker.cached_tokens(), Some(24_576));
     }
 
     #[tokio::test]

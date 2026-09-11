@@ -77,6 +77,7 @@ pub(crate) fn emit_request_end(
         input_tokens: tracker.isl_tokens().map(|v| v as u64),
         output_tokens: Some(tracker.osl_tokens()),
         cached_tokens: tracker.cached_tokens().map(|v| v as u64),
+        backend_actual_cached_tokens: tracker.backend_cached_tokens().map(|v| v as u64),
         request_received_ms: Some(timing.request_received_ms),
         prefill_wait_time_ms: timing.prefill_wait_time_ms,
         prefill_time_ms: timing.prefill_time_ms,
@@ -195,6 +196,7 @@ mod tests {
         let mut rx = BUS.subscribe();
         let tracker = RequestTracker::new();
         tracker.record_isl(8, Some(4));
+        tracker.record_backend_cached_tokens(Some(4));
         tracker.record_kv_hit(2.0, 4);
         tracker.record_osl(7);
         tracker.record_finish();
@@ -224,6 +226,7 @@ mod tests {
         assert_eq!(request.input_tokens, Some(8));
         assert_eq!(request.output_tokens, Some(7));
         assert_eq!(request.cached_tokens, Some(4));
+        assert_eq!(request.backend_actual_cached_tokens, Some(4));
         assert_eq!(request.kv_hit_rate, Some(0.5));
         assert_eq!(
             request.request_received_ms,
@@ -242,6 +245,66 @@ mod tests {
                 .expect("replay metrics")
                 .input_length,
             3
+        );
+    }
+
+    async fn emitted_cached_tokens(
+        request_id: &str,
+        predicted_cached_tokens: usize,
+        backend_cached_tokens: Option<usize>,
+    ) -> Option<u64> {
+        BUS.init(16);
+        let mut rx = BUS.subscribe();
+        let tracker = RequestTracker::new();
+        tracker.record_isl(24_576, Some(predicted_cached_tokens));
+        tracker.record_backend_cached_tokens(backend_cached_tokens);
+
+        emit_request_end(
+            request_id.to_string(),
+            &tracker,
+            RequestReplayMetrics {
+                trace_block_size: 12_288,
+                input_length: 24_576,
+                input_sequence_hashes: vec![11, 22],
+            },
+        );
+
+        let request = loop {
+            let record = rx.recv().await.unwrap();
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|request| request.request_id == request_id)
+            {
+                break record.request.unwrap();
+            }
+        };
+        assert_eq!(tracker.cached_tokens(), Some(predicted_cached_tokens));
+        assert_eq!(request.cached_tokens, Some(predicted_cached_tokens as u64));
+        request.backend_actual_cached_tokens
+    }
+
+    #[tokio::test]
+    async fn request_end_uses_backend_actual_instead_of_router_prediction() {
+        assert_eq!(
+            emitted_cached_tokens("actual-partial", 24_576, Some(12_288)).await,
+            Some(12_288)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_end_preserves_backend_actual_zero() {
+        assert_eq!(
+            emitted_cached_tokens("actual-zero", 24_576, Some(0)).await,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_end_keeps_missing_backend_actual_unknown() {
+        assert_eq!(
+            emitted_cached_tokens("actual-missing", 24_576, None).await,
+            None
         );
     }
 
