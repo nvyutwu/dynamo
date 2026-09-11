@@ -2095,14 +2095,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dynamo-custom-policy-builtin"
-version = "1.5.0"
-dependencies = [
- "dynamo-kv-router",
- "serde",
-]
-
-[[package]]
 name = "dynamo-data-gen"
 version = "1.5.0"
 dependencies = [
@@ -2388,7 +2380,6 @@ dependencies = [
  "clap",
  "dashmap",
  "dynamo-backend-common",
- "dynamo-custom-policy-builtin",
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-mocker",

@@ -26,12 +26,6 @@ flowchart LR
 
 For multiple compile-checked policies, see the [custom policy examples](https://github.com/ai-dynamo/dynamo/tree/main/examples/router/custom-policy-example). Repository contributors who use a coding agent must also provide the [worker-selection API rules](https://github.com/ai-dynamo/dynamo/blob/main/lib/kv-router/src/scheduling/CLAUDE.md).
 
-## Use a Built-In Policy First
-
-The Dynamo frontend ships built-in worker-selection policies, in [`lib/router-plugins`](https://github.com/ai-dynamo/dynamo/tree/main/lib/router-plugins). Selecting one needs router-policy YAML only — no policy crate, no rebuild, no private image. See [Worker-Selection Policies](configuration-and-tuning.md#worker-selection-policies) for the available types and how to select one.
-
-Write your own policy when no shipped policy expresses the rule you need. The rest of this page covers that case; a custom policy is added alongside the shipped ones, so you keep both.
-
 ## Choose the Policy Stage
 
 | Stage | Input | Output | Use this stage for |
@@ -397,10 +391,6 @@ Both paths use the same policy crate, catalog, and YAML file. Choose the process
 
 Add the catalog to the Python binding manifest. Keep the dependency alias `dynamo-worker-selection-policy-catalog`:
 
-<Note>
-Your catalog is registered alongside the [policies Dynamo ships](#use-a-built-in-policy-first), not instead of them, so both remain selectable. Your catalog cannot reuse a shipped policy's type name; the registry rejects the duplicate at startup rather than overriding it.
-</Note>
-
 ```bash
 # Link the policy catalog into the Python extension.
 cargo add \
@@ -503,6 +493,5 @@ With `DYN_ROUTER_DECISION_TRACE_ENABLED=1`, the host calls `WorkerPicker::pick_w
 
 The optional `decision_explanation` envelope uses `dynamo.router.explanation.v1`. Registered policies include their type, instance, and a hash of the configured parameter representation. The picker records resolved parameters separately. An unregistered policy has no instance or configuration identity. Unsupported explanations carry an explicit reason and no additive score.
 
-The shipped `dynamo-two-tier-cost-fn` policy records its resolved thresholds, exact request block denominator, effective active-load extrema, maximum device overlap, strict gate results, selected rule and row, and first-row tie count. Missing host load defaults to zero in the existing picker input; observation counts distinguish it from measured zero. Tracing does not sort candidate rows. The policy emits no `score_decision`, because its ordered rules do not compute additive costs.
 
 The default selector retains optional `score_decision` evidence in scheduler model units. Its formula discriminator distinguishes prefill/decode addition from the decode-only overlap clamp; active-request penalties and preference multipliers are explicit. These quantities are not milliseconds. Legacy v1 tier fields retain their existing cumulative/weighted meanings.
