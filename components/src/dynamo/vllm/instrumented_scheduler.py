@@ -111,6 +111,7 @@ from dynamo.common.forward_pass_metrics import (
     WelfordAccumulator,
     encode,
 )
+from dynamo.common.fpm_log_export import encode_record
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.vllm.benchmark_points import (
     BENCHMARK_MODES,
@@ -1115,6 +1116,13 @@ class _FpmPublisherThread:
             maxsize=max_queue_size
         )
         self._seq = count()
+        self._log_records = os.environ.get("DYN_FPM_LOG_RECORDS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._queue_dropped = 0
         self._worker_id = worker_id
         self._dp_rank = dp_rank
         self._publishing = threading.Event()
@@ -1137,7 +1145,7 @@ class _FpmPublisherThread:
         try:
             self._queue.put_nowait(metrics)
         except queue.Full:
-            pass
+            self._queue_dropped += 1
 
     def resume(self) -> None:
         """Enable live publishing after startup self-benchmarking finishes."""
@@ -1179,6 +1187,18 @@ class _FpmPublisherThread:
             try:
                 seq = next(self._seq)
                 metrics = msgspec.structs.replace(metrics, counter_id=seq)
+                if self._log_records:
+                    try:
+                        logger.info(
+                            "FPM_TRACE %s",
+                            encode_record(
+                                msgspec.to_builtins(metrics),
+                                dropped=self._queue_dropped,
+                                observed_ns=time.time_ns(),
+                            ),
+                        )
+                    except Exception:
+                        logger.warning("FPM log export failed", exc_info=True)
                 payload = encode(metrics)
                 seq_bytes = seq.to_bytes(8, "big")
                 self._pub.send_multipart((topic, seq_bytes, payload), flags=zmq.NOBLOCK)
