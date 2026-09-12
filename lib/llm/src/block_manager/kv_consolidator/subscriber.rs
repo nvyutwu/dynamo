@@ -267,9 +267,19 @@ fn process_event(
             }
         }
 
-        RawKvEvent::AllBlocksCleared { .. } => {
-            tracing::debug!("Processing AllBlocksCleared");
-            tracker.handle_clear_all();
+        RawKvEvent::AllBlocksCleared { medium, .. } => {
+            if medium.is_none() {
+                tracing::debug!("Processing legacy all-tier AllBlocksCleared");
+                tracker.handle_clear_all();
+            } else {
+                tracing::warn!(
+                    ?medium,
+                    "Ignoring tier-scoped clear in all-tier consolidator"
+                );
+            }
+        }
+        RawKvEvent::TierBlocksCleared { medium, .. } => {
+            tracing::warn!(?medium, "Ignoring tier-scoped clear in all-tier consolidator");
         }
 
         RawKvEvent::Ignored => {}
@@ -352,6 +362,35 @@ mod tests {
                 tier: Some(StorageTier::Device),
                 ..
             }]
+        ));
+    }
+
+    #[test]
+    fn tier_scoped_clear_is_not_widened_to_all_tiers() {
+        let mut tracker = PassthroughCacheStatusTracker::new();
+        process_event(
+            &mut tracker,
+            RawKvEvent::TierBlocksCleared {
+                medium: "GPU".to_string(),
+                ownership: None,
+            },
+            None,
+            EventSource::Vllm,
+        );
+        assert!(tracker.drain_events().is_empty());
+
+        process_event(
+            &mut tracker,
+            RawKvEvent::AllBlocksCleared {
+                medium: None,
+                ownership: None,
+            },
+            None,
+            EventSource::Vllm,
+        );
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::ClearAll]
         ));
     }
 }

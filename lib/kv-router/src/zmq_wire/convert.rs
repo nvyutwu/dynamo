@@ -23,6 +23,19 @@ pub fn convert_event(
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,
 ) -> Option<PlacementEvent> {
+    if matches!(
+        &raw,
+        RawKvEvent::AllBlocksCleared {
+            medium: Some(_),
+            ..
+        }
+    ) {
+        tracing::warn!(
+            event_id,
+            "Rejecting ambiguous additive scoped-clear encoding"
+        );
+        return None;
+    }
     // Read the wire tier/locality facts up front, before any indexing work.
     let (medium, locality) = match &raw {
         RawKvEvent::BlockStored {
@@ -31,7 +44,8 @@ pub fn convert_event(
         | RawKvEvent::BlockRemoved {
             medium, locality, ..
         } => (medium.as_deref(), *locality),
-        RawKvEvent::AllBlocksCleared { .. } => (None, None),
+        RawKvEvent::AllBlocksCleared { medium, .. } => (medium.as_deref(), None),
+        RawKvEvent::TierBlocksCleared { medium, .. } => (Some(medium.as_str()), None),
         RawKvEvent::Ignored => return None,
     };
 
@@ -157,6 +171,11 @@ pub fn convert_event(
         RawKvEvent::AllBlocksCleared { .. } => KvCacheEvent {
             event_id,
             data: KvCacheEventData::Cleared,
+            dp_rank,
+        },
+        RawKvEvent::TierBlocksCleared { .. } => KvCacheEvent {
+            event_id,
+            data: KvCacheEventData::TierCleared(storage_tier),
             dp_rank,
         },
         RawKvEvent::Ignored => unreachable!("ignored events return before conversion"),

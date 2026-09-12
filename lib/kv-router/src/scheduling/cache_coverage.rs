@@ -160,17 +160,14 @@ pub fn compute_raw_cache_coverage<C: WorkerConfigLike>(
         return RawCacheCoverage::incomplete(RawCacheObservation::StaleIndex, request.isl_tokens);
     }
     if request.overlap.raw_index_state != RawIndexState::Observed || request.isl_tokens == 0 {
-        return RawCacheCoverage::incomplete(
-            RawCacheObservation::MissingIndex,
-            request.isl_tokens,
-        );
+        return RawCacheCoverage::incomplete(RawCacheObservation::MissingIndex, request.isl_tokens);
     }
     if eligible_eligibility
         .pinned_worker()
         .is_some_and(|pinned| pinned != selected_worker)
         || eligible_eligibility
-        .validate_worker_rank(workers, selected_worker)
-        .is_err()
+            .validate_worker_rank(workers, selected_worker)
+            .is_err()
     {
         return RawCacheCoverage::incomplete(
             RawCacheObservation::InvalidCandidate,
@@ -283,7 +280,11 @@ mod tests {
     }
 
     fn workers() -> HashMap<WorkerId, SimpleWorkerConfig> {
-        HashMap::from([(1, SimpleWorkerConfig::default()), (2, SimpleWorkerConfig::default()), (3, SimpleWorkerConfig::default())])
+        HashMap::from([
+            (1, SimpleWorkerConfig::default()),
+            (2, SimpleWorkerConfig::default()),
+            (3, SimpleWorkerConfig::default()),
+        ])
     }
 
     #[test]
@@ -293,13 +294,31 @@ mod tests {
         let b = WorkerWithDpRank::new(2, 0);
         let c = WorkerWithDpRank::new(3, 0);
         let mut request = request(24_576, true);
-        request.overlap.tier_overlap_blocks.device.extend([(a, 2), (b, 1), (c, 1)]);
-        request.overlap.tier_overlap_blocks.host_pinned.extend([(a, 0), (b, 1), (c, 0)]);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .extend([(a, 2), (b, 1), (c, 1)]);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned
+            .extend([(a, 0), (b, 1), (c, 0)]);
         // Deliberately contradictory effective scores prove the raw helper ignores weights.
-        request.overlap.effective_cached_tokens.extend([(a, 1), (b, 99), (c, 100)]);
+        request
+            .overlap
+            .effective_cached_tokens
+            .extend([(a, 1), (b, 99), (c, 100)]);
         let overloaded = HashSet::from([1]);
         let eligible = request.eligibility_with_overloaded(Some(&overloaded));
-        let coverage = compute_raw_cache_coverage(&workers, &request, request.eligibility(), eligible, c, 12_288);
+        let coverage = compute_raw_cache_coverage(
+            &workers,
+            &request,
+            request.eligibility(),
+            eligible,
+            c,
+            12_288,
+        );
 
         assert_eq!(coverage.observation, RawCacheObservation::Complete);
         assert_eq!(coverage.resident.unwrap().worker_id, 2); // stable tie chooses larger identity
@@ -358,23 +377,41 @@ mod tests {
         let selected = WorkerWithDpRank::new(1, 0);
         let missing = request(24_704, false);
         assert_eq!(
-            compute_raw_cache_coverage(&workers, &missing, missing.eligibility(), missing.eligibility(), selected, 12_288).observation,
+            compute_raw_cache_coverage(
+                &workers,
+                &missing,
+                missing.eligibility(),
+                missing.eligibility(),
+                selected,
+                12_288
+            )
+            .observation,
             RawCacheObservation::MissingIndex
         );
 
         let mut zero = request(24_704, true);
-        let coverage = compute_raw_cache_coverage(&workers, &zero, zero.eligibility(), zero.eligibility(), selected, 12_288);
+        let coverage = compute_raw_cache_coverage(
+            &workers,
+            &zero,
+            zero.eligibility(),
+            zero.eligibility(),
+            selected,
+            12_288,
+        );
         assert_eq!(coverage.observation, RawCacheObservation::Complete);
         assert_eq!(coverage.selected.unwrap().total_tokens, 0);
         zero.overlap.tier_overlap_blocks.device.insert(selected, 3);
-        let capped = compute_raw_cache_coverage(&workers, &zero, zero.eligibility(), zero.eligibility(), selected, 12_288);
+        let capped = compute_raw_cache_coverage(
+            &workers,
+            &zero,
+            zero.eligibility(),
+            zero.eligibility(),
+            selected,
+            12_288,
+        );
         assert_eq!(capped.selected.unwrap().total_tokens, 24_704);
 
-        zero
-            .overlap
-            .tier_overlap_blocks
-            .device
-            .insert(selected, 4);
+        zero.overlap.tier_overlap_blocks.device.insert(selected, 4);
         assert_eq!(
             compute_raw_cache_coverage(
                 &workers,
@@ -398,9 +435,24 @@ mod tests {
         let invalid = WorkerWithDpRank::new(1, 2);
         let mut request = request(16, true);
         request.pinned_worker = Some(rank0);
-        request.overlap.tier_overlap_blocks.device.extend([(rank0, 1), (rank1, 0)]);
-        request.overlap.tier_overlap_blocks.host_pinned.insert(rank1, 8);
-        let coverage = compute_raw_cache_coverage(&workers, &request, request.eligibility(), request.eligibility(), rank0, 4);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .extend([(rank0, 1), (rank1, 0)]);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned
+            .insert(rank1, 8);
+        let coverage = compute_raw_cache_coverage(
+            &workers,
+            &request,
+            request.eligibility(),
+            request.eligibility(),
+            rank0,
+            4,
+        );
         assert_eq!(coverage.selected.unwrap().total_tokens, 4);
         assert_eq!(coverage.resident.unwrap().dp_rank, 0);
         assert_eq!(coverage.eligible.unwrap().dp_rank, 0);
@@ -419,7 +471,15 @@ mod tests {
         );
 
         assert_eq!(
-            compute_raw_cache_coverage(&workers, &request, request.eligibility(), request.eligibility(), invalid, 4).observation,
+            compute_raw_cache_coverage(
+                &workers,
+                &request,
+                request.eligibility(),
+                request.eligibility(),
+                invalid,
+                4
+            )
+            .observation,
             RawCacheObservation::InvalidCandidate
         );
     }
@@ -450,14 +510,7 @@ mod tests {
         let eligibility = request
             .eligibility()
             .with_available_workers(Some(&available));
-        let stale = compute_raw_cache_coverage(
-            &workers,
-            &request,
-            eligibility,
-            eligibility,
-            b,
-            8,
-        );
+        let stale = compute_raw_cache_coverage(&workers, &request, eligibility, eligibility, b, 8);
         assert_eq!(stale.observation, RawCacheObservation::StaleIndex);
         assert!(stale.resident.is_none());
     }

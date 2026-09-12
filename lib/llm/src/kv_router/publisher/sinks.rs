@@ -126,14 +126,26 @@ pub(super) fn event_plane_event_batches(
             return None;
         }
 
+        if matches!(
+            events[batch_start].event.data,
+            KvCacheEventData::TierCleared(_)
+        ) {
+            let singleton = &events[batch_start..batch_start + 1];
+            batch_start += 1;
+            return Some(singleton);
+        }
+
         let mut batch_end = batch_start;
         let mut batch_blocks = 0usize;
         while let Some(event) = events.get(batch_end) {
             let batch_events = batch_end - batch_start;
+            if matches!(event.event.data, KvCacheEventData::TierCleared(_)) {
+                break;
+            }
             let event_blocks = match &event.event.data {
                 KvCacheEventData::Stored(data) => data.blocks.len(),
                 KvCacheEventData::Removed(data) => data.block_hashes.len(),
-                KvCacheEventData::Cleared => 0,
+                KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => 0,
             };
             if batch_events > 0
                 && (batch_events >= max_events

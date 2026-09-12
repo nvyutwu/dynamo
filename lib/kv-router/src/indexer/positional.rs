@@ -355,7 +355,7 @@ impl PositionalIndexer {
                 self.remove_blocks_impl(worker_blocks, worker, &remove_data.block_hashes, id)?;
                 Ok(())
             }
-            KvCacheEventData::Cleared => {
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
                 self.remove_worker_dp_rank_impl(worker_blocks, worker_id, worker.dp_rank);
                 Ok(())
             }

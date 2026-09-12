@@ -39,7 +39,7 @@ impl EventKind {
         match data {
             KvCacheEventData::Stored(_) => Self::Stored,
             KvCacheEventData::Removed(_) => Self::Removed,
-            KvCacheEventData::Cleared => Self::Cleared,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => Self::Cleared,
         }
     }
 

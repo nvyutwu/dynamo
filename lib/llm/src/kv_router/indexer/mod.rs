@@ -366,7 +366,10 @@ impl Indexer {
                 return Ok(());
             }
         };
-        let is_clear = matches!(&event.event.data, KvCacheEventData::Cleared);
+        let is_clear = matches!(
+            &event.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        );
         match self {
             Self::KvIndexer {
                 primary,
@@ -380,8 +383,10 @@ impl Indexer {
                             .await?;
                     }
 
-                    for indexer in lower_tier.all() {
-                        indexer.apply_event_and_wait(event.clone()).await?;
+                    for (tier, indexer) in lower_tier.entries() {
+                        if event.targets_lower_tier(tier).unwrap_or(false) {
+                            indexer.apply_event_and_wait(event.clone()).await?;
+                        }
                     }
                 } else if targets_primary {
                     primary
@@ -405,8 +410,10 @@ impl Indexer {
                         primary.apply_event_and_wait(event.clone()).await?;
                     }
 
-                    for indexer in lower_tier.all() {
-                        indexer.apply_event_and_wait(event.clone()).await?;
+                    for (tier, indexer) in lower_tier.entries() {
+                        if event.targets_lower_tier(tier).unwrap_or(false) {
+                            indexer.apply_event_and_wait(event.clone()).await?;
+                        }
                     }
                 } else if targets_primary {
                     primary.enqueue_event(event)?;

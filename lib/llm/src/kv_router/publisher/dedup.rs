@@ -106,14 +106,17 @@ impl EventDedupFilter {
         &mut self,
         dp_rank: u32,
         domain: ResidencyDomain,
+        storage_tier: Option<StorageTier>,
         policy: EventDedupPolicy,
     ) {
         if policy == EventDedupPolicy::SetLike {
             return;
         }
         self.per_rank_tier
-            .retain(|(tracked_dp_rank, _, tracked_domain), _| {
-                *tracked_dp_rank != dp_rank || *tracked_domain != domain
+            .retain(|(tracked_dp_rank, tracked_tier, tracked_domain), _| {
+                *tracked_dp_rank != dp_rank
+                    || *tracked_domain != domain
+                    || storage_tier.is_some_and(|tier| tier != *tracked_tier)
             });
     }
 

@@ -160,12 +160,24 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared {
+                medium: normalize_medium(medium.unwrap_or(None)),
+                ownership: ownership.unwrap_or(None),
+            }),
+            Some("TierBlocksCleared") => Ok(RawKvEvent::TierBlocksCleared {
+                medium: normalize_medium(medium.unwrap_or(None))
+                    .ok_or_else(|| de::Error::missing_field("medium"))?,
                 ownership: ownership.unwrap_or(None),
             }),
             Some("Ignored") => Ok(RawKvEvent::Ignored),
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -268,9 +280,29 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             "AllBlocksCleared" => {
+                let first: Option<String> = seq.next_element()?.unwrap_or(None);
+                let second: Option<String> = seq.next_element()?.unwrap_or(None);
+                let (medium, ownership) = if first
+                    .as_deref()
+                    .and_then(crate::protocols::StorageTier::from_kv_medium)
+                    .is_some()
+                {
+                    (normalize_medium(first), second)
+                } else {
+                    (normalize_medium(second), first)
+                };
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::AllBlocksCleared { medium, ownership })
+            }
+            "TierBlocksCleared" => {
+                let medium: Option<String> = seq.next_element()?.unwrap_or(None);
                 let ownership: Option<String> = seq.next_element()?.unwrap_or(None);
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(RawKvEvent::AllBlocksCleared { ownership })
+                Ok(RawKvEvent::TierBlocksCleared {
+                    medium: normalize_medium(medium)
+                        .ok_or_else(|| de::Error::missing_field("medium"))?,
+                    ownership,
+                })
             }
             "Ignored" => {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -278,7 +310,13 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
             }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
         }
     }

@@ -311,7 +311,7 @@ fn convert_to_zmq_events(
                 group_idx: 0,
             }]
         }
-        KvCacheEventData::Cleared => vec![],
+        KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => vec![],
     }
 }
 

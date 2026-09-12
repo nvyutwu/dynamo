@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicU32;
 
 use rmp_serde as rmps;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 
 use crate::protocols::{DpRank, PlacementEvent, StorageTier, WorkerWithDpRank};
 
@@ -55,6 +56,7 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    cache_namespace_tiers: FxHashMap<(WorkerWithDpRank, u64), FxHashSet<StorageTier>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,7 @@ pub enum ZmqEventFilterReason {
     IgnoredEvent,
     NonLocalLocality,
     UnknownMedium,
+    AmbiguousScopedClear,
     UnsupportedOwnership,
     UnknownOwnership,
     AmbiguousCacheNamespace,
@@ -89,6 +92,7 @@ impl ZmqEventFilterReason {
             Self::IgnoredEvent => "ignored_event",
             Self::NonLocalLocality => "non_local_locality",
             Self::UnknownMedium => "unknown_medium",
+            Self::AmbiguousScopedClear => "ambiguous_scoped_clear",
             Self::UnsupportedOwnership => "unsupported_ownership",
             Self::UnknownOwnership => "unknown_ownership",
             Self::AmbiguousCacheNamespace => "ambiguous_cache_namespace",
@@ -109,6 +113,7 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            cache_namespace_tiers: FxHashMap::default(),
         }
     }
 
@@ -120,6 +125,7 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            cache_namespace_tiers: FxHashMap::default(),
         }
     }
 
@@ -167,6 +173,15 @@ impl ZmqEventNormalizer {
         }
         if raw.is_ignored() {
             return Err(ZmqEventFilterReason::IgnoredEvent);
+        }
+        if matches!(
+            &raw,
+            RawKvEvent::AllBlocksCleared {
+                medium: Some(_),
+                ..
+            }
+        ) {
+            return Err(ZmqEventFilterReason::AmbiguousScopedClear);
         }
 
         // Non-local events are dropped by policy (no shared-index consumer yet).
@@ -263,8 +278,13 @@ impl ZmqEventNormalizer {
                 block_hashes,
                 parent_block_hash,
                 cache_namespace,
+                medium,
                 ..
             } => {
+                let tier = medium
+                    .as_deref()
+                    .and_then(StorageTier::from_kv_medium)
+                    .unwrap_or(StorageTier::Device);
                 if cache_namespace.as_deref() == Some("") {
                     *cache_namespace = None;
                 }
@@ -332,10 +352,35 @@ impl ZmqEventNormalizer {
                         }
                     }
                 }
-            }
-            RawKvEvent::BlockRemoved { block_hashes, .. } => {
                 for block_hash in block_hashes.iter() {
                     let key = (worker, (*block_hash).into_u64());
+                    if self.cache_namespaces.contains_key(&key) {
+                        self.cache_namespace_tiers
+                            .entry(key)
+                            .or_default()
+                            .insert(tier);
+                    }
+                }
+            }
+            RawKvEvent::BlockRemoved {
+                block_hashes,
+                medium,
+                ..
+            } => {
+                let tier = medium
+                    .as_deref()
+                    .and_then(StorageTier::from_kv_medium)
+                    .unwrap_or(StorageTier::Device);
+                for block_hash in block_hashes.iter() {
+                    let key = (worker, (*block_hash).into_u64());
+                    if let Some(tiers) = self.cache_namespace_tiers.get_mut(&key) {
+                        tiers.remove(&tier);
+                        if tiers.is_empty() {
+                            self.cache_namespace_tiers.remove(&key);
+                        } else {
+                            continue;
+                        }
+                    }
                     if !matches!(
                         self.cache_namespaces.get(&key),
                         Some(CacheNamespaceState::Ambiguous)
@@ -344,13 +389,43 @@ impl ZmqEventNormalizer {
                     }
                 }
             }
-            RawKvEvent::AllBlocksCleared { .. } => {
-                self.cache_namespaces
-                    .retain(|(known_worker, _), _| *known_worker != worker);
+            RawKvEvent::AllBlocksCleared { medium, .. } => {
+                let reset_tier = medium.as_deref().and_then(StorageTier::from_kv_medium);
+                if medium.is_none() {
+                    self.cache_namespaces
+                        .retain(|(known_worker, _), _| *known_worker != worker);
+                    self.cache_namespace_tiers
+                        .retain(|(known_worker, _), _| *known_worker != worker);
+                } else if let Some(reset_tier) = reset_tier {
+                    self.clear_namespace_tier(worker, reset_tier);
+                }
+            }
+            RawKvEvent::TierBlocksCleared { medium, .. } => {
+                if let Some(reset_tier) = StorageTier::from_kv_medium(medium) {
+                    self.clear_namespace_tier(worker, reset_tier);
+                }
             }
             RawKvEvent::Ignored => {}
         }
         Ok(())
+    }
+
+    fn clear_namespace_tier(&mut self, worker: WorkerWithDpRank, reset_tier: StorageTier) {
+        let keys: Vec<_> = self
+            .cache_namespace_tiers
+            .keys()
+            .filter(|(known_worker, _)| *known_worker == worker)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(tiers) = self.cache_namespace_tiers.get_mut(&key) {
+                tiers.remove(&reset_tier);
+                if tiers.is_empty() {
+                    self.cache_namespace_tiers.remove(&key);
+                    self.cache_namespaces.remove(&key);
+                }
+            }
+        }
     }
 
     fn filter_reason(

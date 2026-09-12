@@ -12,8 +12,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use dynamo_kv_router::protocols::{
     RoutingConstraints, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
-use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
 use dynamo_kv_router::scheduling::cache_coverage::compute_raw_cache_coverage;
+use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
 use dynamo_kv_router::{
     DefaultWorkerSelector, KvRouterConfig, SchedulingRequest, WorkerCandidate, WorkerFilter,
     WorkerInputView, WorkerInputs, WorkerLoadProjection, WorkerPicker, WorkerScorer,
@@ -200,7 +200,7 @@ fn fixture_with_preferred_taints(
         policy_class: None,
         session_context: None,
         overlap: OverlapSignals {
-                raw_index_state: dynamo_kv_router::scheduling::RawIndexState::Missing,
+            raw_index_state: dynamo_kv_router::scheduling::RawIndexState::Missing,
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks,
             effective_cached_tokens,

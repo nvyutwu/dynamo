@@ -209,7 +209,10 @@ pub async fn sync_pulse(
 ) -> bool {
     let sentinel = TestBatch(
         0.0,
-        vec![RawKvEvent::AllBlocksCleared { ownership: None }],
+        vec![RawKvEvent::AllBlocksCleared {
+            medium: None,
+            ownership: None,
+        }],
         None,
     );
     // Keep sending until we see the response.

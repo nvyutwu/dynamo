@@ -1360,6 +1360,10 @@ pub enum KvCacheEventData {
     /// This is ordered only within that rank publisher's event sequence. Worker-wide removal is
     /// a separate serving-membership lifecycle operation.
     Cleared,
+    /// Remove KV ownership only from one physical storage tier. Keeping this
+    /// as a distinct variant makes older consumers reject the unsupported
+    /// operation instead of silently widening it to [`Self::Cleared`].
+    TierCleared(StorageTier),
 }
 
 /// Represents the data associated with a stored cache event.
@@ -1667,7 +1671,10 @@ impl RouterEvent {
         // stores or removes in Device.
         if domain == ResidencyDomain::CacheOwner
             && self.storage_tier.is_gpu()
-            && !matches!(self.event.data, KvCacheEventData::Cleared)
+            && !matches!(
+                self.event.data,
+                KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+            )
         {
             return Err(UnsupportedResidencyDomain);
         }
@@ -1688,7 +1695,10 @@ impl RouterEvent {
 
     /// Resolve `Cleared` semantics while preserving legacy all-domain clears.
     pub fn reset_scope(&self) -> Result<Option<ResetScope>, UnsupportedResidencyDomain> {
-        if !matches!(self.event.data, KvCacheEventData::Cleared) {
+        if !matches!(
+            self.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        ) {
             return Ok(None);
         }
         Ok(Some(match self.residency_domain.parse()? {
@@ -1699,6 +1709,10 @@ impl RouterEvent {
 
     pub fn targets_primary(&self) -> Result<bool, UnsupportedResidencyDomain> {
         if let Some(scope) = self.reset_scope()? {
+            if let KvCacheEventData::TierCleared(tier) = &self.event.data {
+                return Ok(tier.is_gpu()
+                    && !matches!(scope, ResetScope::Domain(ResidencyDomain::CacheOwner)));
+            }
             return Ok(!matches!(
                 scope,
                 ResetScope::Domain(ResidencyDomain::CacheOwner)
@@ -1706,6 +1720,21 @@ impl RouterEvent {
         }
         self.resolved_residency_domain()?;
         Ok(self.storage_tier.is_gpu())
+    }
+
+    pub fn targets_lower_tier(
+        &self,
+        tier: StorageTier,
+    ) -> Result<bool, UnsupportedResidencyDomain> {
+        let Some(_scope) = self.reset_scope()? else {
+            self.resolved_residency_domain()?;
+            return Ok(self.storage_tier == tier);
+        };
+        Ok(match &self.event.data {
+            KvCacheEventData::TierCleared(reset_tier) => *reset_tier == tier,
+            KvCacheEventData::Cleared => true,
+            _ => false,
+        })
     }
 }
 
@@ -1979,6 +2008,33 @@ mod tests {
             event: KvCacheEvent,
         }
 
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKvCacheEventData {
+            Stored(KvCacheStoreData),
+            Removed(KvCacheRemoveData),
+            Cleared,
+        }
+
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        struct OldKvCacheEvent {
+            event_id: u64,
+            data: OldKvCacheEventData,
+            #[serde(default)]
+            dp_rank: DpRank,
+        }
+
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        struct OldRouterEvent {
+            worker_id: WorkerId,
+            #[serde(default)]
+            storage_tier: StorageTier,
+            event: OldKvCacheEvent,
+        }
+
         #[derive(Serialize)]
         struct ExplicitDomainEvent {
             worker_id: WorkerId,
@@ -2073,6 +2129,18 @@ mod tests {
                 .map(|event| event.event.event_id)
                 .collect();
             assert_eq!(applied_ids, vec![4, 7]);
+        }
+
+        #[test]
+        fn old_reader_rejects_scoped_clear_instead_of_widening_it() {
+            let scoped_clear = RouterEvent::with_residency_domain(
+                7,
+                event(8, KvCacheEventData::TierCleared(StorageTier::Device)),
+                StorageTier::Device,
+                ResidencyDomain::Worker,
+            );
+            let encoded = rmp_serde::to_vec_named(&scoped_clear).unwrap();
+            assert!(rmp_serde::from_slice::<OldRouterEvent>(&encoded).is_err());
         }
     }
 

@@ -81,7 +81,8 @@ impl KvEventSummary {
                 first: removed.block_hashes.first().copied(),
                 last: removed.block_hashes.last().copied(),
             },
-            dynamo_kv_router::protocols::KvCacheEventData::Cleared => Self::Cleared,
+            dynamo_kv_router::protocols::KvCacheEventData::Cleared
+            | dynamo_kv_router::protocols::KvCacheEventData::TierCleared(_) => Self::Cleared,
         }
     }
 }

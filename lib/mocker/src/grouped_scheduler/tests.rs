@@ -33,7 +33,9 @@ impl KvCacheEventSink for CapturedEffects {
         self.publication_log.lock().unwrap().push(match event.data {
             KvCacheEventData::Stored(_) => CapturedEffect::KvStored,
             KvCacheEventData::Removed(_) => CapturedEffect::KvRemoved,
-            KvCacheEventData::Cleared => CapturedEffect::KvRemoved,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
+                CapturedEffect::KvRemoved
+            }
         });
         self.kv.lock().unwrap().push(event);
         Ok(())

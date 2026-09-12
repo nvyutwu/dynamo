@@ -40,7 +40,10 @@ impl<K: Eq> PlacementEventCoalescer<K> {
     /// follows a pending mutation, or when `Cleared` flushes the pending value
     /// and then passes through as its own barrier.
     pub(super) fn push(&mut self, key: K, event: PlacementEvent) -> [Option<PlacementEvent>; 2] {
-        if matches!(&event.event.data, KvCacheEventData::Cleared) {
+        if matches!(
+            &event.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        ) {
             return [self.flush(), Some(event)];
         }
 
@@ -101,7 +104,7 @@ fn event_block_count(event: &PlacementEvent) -> usize {
     match &event.event.data {
         KvCacheEventData::Stored(data) => data.blocks.len(),
         KvCacheEventData::Removed(data) => data.block_hashes.len(),
-        KvCacheEventData::Cleared => 0,
+        KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => 0,
     }
 }
 
@@ -213,7 +216,7 @@ impl BatchingState {
                 );
                 KvCacheEventData::Stored(data)
             }
-            KvCacheEventData::Cleared => {
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
                 unreachable!("Cleared is handled by the publisher's barrier policy")
             }
         };

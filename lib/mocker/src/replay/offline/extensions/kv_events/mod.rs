@@ -80,7 +80,8 @@ impl ReplayEngineObservation for RouterEventObservation {
                     store.blocks.as_slice()
                 }
                 dynamo_kv_router::protocols::KvCacheEventData::Removed(_)
-                | dynamo_kv_router::protocols::KvCacheEventData::Cleared => &[],
+                | dynamo_kv_router::protocols::KvCacheEventData::Cleared
+                | dynamo_kv_router::protocols::KvCacheEventData::TierCleared(_) => &[],
             })
             .map(|block| block.tokens_hash.0)
             .collect()
@@ -148,7 +149,9 @@ fn encode_events(
                     encoder.put_u64(hash.0);
                 }
             }
-            KvCacheEventData::Cleared => encoder.begin_kind(2, "cleared"),
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
+                encoder.begin_kind(2, "cleared")
+            }
         }
     }
     Ok(())

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rmp_serde::{from_slice, to_vec, to_vec_named};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
@@ -76,6 +76,79 @@ fn decodes_ownership_on_positional_events() {
 
     let cleared: RawKvEvent = from_slice(&to_vec(&("AllBlocksCleared", "kvcr")).unwrap()).unwrap();
     assert_eq!(cleared.ownership(), Ok(KvEventOwnership::Kvcr));
+}
+
+#[derive(Serialize)]
+struct MapClearFixture {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    medium: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ownership: Option<&'static str>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum LegacyClearEvent {
+    AllBlocksCleared {
+        #[serde(default)]
+        ownership: Option<String>,
+    },
+}
+
+#[test]
+fn scoped_clear_uses_distinct_tag_rejected_by_legacy_reader() {
+    let legacy: RawKvEvent = from_slice(
+        &to_vec_named(&MapClearFixture {
+            event_type: "AllBlocksCleared",
+            medium: None,
+            ownership: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(legacy.medium(), None);
+
+    let gpu: RawKvEvent = from_slice(
+        &to_vec_named(&MapClearFixture {
+            event_type: "TierBlocksCleared",
+            medium: Some("GPU"),
+            ownership: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let encoded_gpu = to_vec_named(&MapClearFixture {
+        event_type: "TierBlocksCleared",
+        medium: Some("GPU"),
+        ownership: None,
+    })
+    .unwrap();
+    assert!(from_slice::<LegacyClearEvent>(&encoded_gpu).is_err());
+    let missing_medium = to_vec_named(&MapClearFixture {
+        event_type: "TierBlocksCleared",
+        medium: None,
+        ownership: None,
+    })
+    .unwrap();
+    assert!(from_slice::<RawKvEvent>(&missing_medium).is_err());
+
+    let additive = to_vec_named(&MapClearFixture {
+        event_type: "AllBlocksCleared",
+        medium: Some("GPU"),
+        ownership: None,
+    })
+    .unwrap();
+    assert!(from_slice::<LegacyClearEvent>(&additive).is_ok());
+    let additive: RawKvEvent = from_slice(&additive).unwrap();
+    assert!(convert_placement(additive, WorkerWithDpRank::new(7, 0)).is_none());
+    let placement = convert_placement(gpu, WorkerWithDpRank::new(7, 0)).unwrap();
+    assert!(matches!(
+        placement.event.data,
+        KvCacheEventData::TierCleared(StorageTier::Device)
+    ));
 }
 
 #[derive(Serialize)]
@@ -1523,4 +1596,78 @@ fn test_unrecognized_media_do_not_pollute_cache_namespace_state() {
         panic!("expected BlockStored");
     };
     assert_eq!(cache_namespace.as_deref(), Some("tenant-a"));
+}
+
+#[test]
+fn scoped_clear_preserves_other_tier_namespace_and_unknown_clear_is_noop() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(2);
+    for medium in ["GPU", "CPU"] {
+        assert!(
+            normalizer
+                .preprocess(
+                    namespaced_block_stored(1, None, Some("tenant-a"), medium),
+                    worker
+                )
+                .is_some()
+        );
+    }
+
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(
+                RawKvEvent::AllBlocksCleared {
+                    medium: Some("GPU".to_string()),
+                    ownership: None,
+                },
+                worker,
+            )
+            .unwrap_err(),
+        ZmqEventFilterReason::AmbiguousScopedClear
+    );
+    assert!(normalizer.cache_namespaces.contains_key(&(worker, 1)));
+
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(
+                RawKvEvent::TierBlocksCleared {
+                    medium: "FUTURE".to_string(),
+                    ownership: None,
+                },
+                worker,
+            )
+            .unwrap_err(),
+        ZmqEventFilterReason::UnknownMedium
+    );
+    assert!(normalizer.cache_namespaces.contains_key(&(worker, 1)));
+
+    assert!(
+        normalizer
+            .preprocess(
+                RawKvEvent::TierBlocksCleared {
+                    medium: "GPU".to_string(),
+                    ownership: None,
+                },
+                worker,
+            )
+            .is_some()
+    );
+    assert!(normalizer.cache_namespaces.contains_key(&(worker, 1)));
+    assert_eq!(
+        normalizer.cache_namespace_tiers[&(worker, 1)],
+        FxHashSet::from_iter([StorageTier::HostPinned])
+    );
+
+    assert!(
+        normalizer
+            .preprocess(
+                RawKvEvent::AllBlocksCleared {
+                    medium: None,
+                    ownership: None,
+                },
+                worker,
+            )
+            .is_some()
+    );
+    assert!(!normalizer.cache_namespaces.contains_key(&(worker, 1)));
 }

@@ -312,13 +312,15 @@ mod tests {
     fn routing_trace_with_raw(
         raw: dynamo_kv_router::scheduling::RawCacheCoverage,
     ) -> RoutingDecisionTrace {
-        let selected = raw.selected.unwrap_or(dynamo_kv_router::scheduling::RawCacheCandidate {
-            worker_id: 7,
-            dp_rank: 0,
-            hbm_prefix_tokens: 0,
-            cpu_extension_tokens: 0,
-            total_tokens: 0,
-        });
+        let selected = raw
+            .selected
+            .unwrap_or(dynamo_kv_router::scheduling::RawCacheCandidate {
+                worker_id: 7,
+                dp_rank: 0,
+                hbm_prefix_tokens: 0,
+                cpu_extension_tokens: 0,
+                total_tokens: 0,
+            });
         RoutingDecisionTrace {
             score_decision: None,
             decision_explanation: None,
@@ -388,7 +390,11 @@ mod tests {
         );
         let record = loop {
             let record = rx.recv().await.unwrap();
-            if record.request.as_ref().is_some_and(|r| r.request_id == "raw-complete") {
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|r| r.request_id == "raw-complete")
+            {
                 break record;
             }
         };
@@ -425,13 +431,16 @@ mod tests {
         );
         let missing_record = loop {
             let record = rx.recv().await.unwrap();
-            if record.request.as_ref().is_some_and(|r| r.request_id == "raw-missing") {
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|r| r.request_id == "raw-missing")
+            {
                 break record;
             }
         };
         let missing_value = serde_json::to_value(missing_record).unwrap();
-        let missing_raw =
-            &missing_value["request"]["routing_decision"]["raw_cache_coverage"];
+        let missing_raw = &missing_value["request"]["routing_decision"]["raw_cache_coverage"];
         assert_eq!(missing_raw["observation"], "missing_index");
         assert!(missing_raw["resident"].is_null());
         assert!(missing_raw["overload_gap_tokens"].is_null());

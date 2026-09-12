@@ -1731,7 +1731,10 @@ async fn apply_events_for_owner(
             state.recovery_required = true;
             break;
         }
-        let is_clear = matches!(event.event.data, KvCacheEventData::Cleared);
+        let is_clear = matches!(
+            event.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        );
         if let Err(error) = indexer.try_apply_event(event).await {
             tracing::warn!(publisher_id, event_id, %error, "Failed to apply advisory KV state event");
             if is_clear {

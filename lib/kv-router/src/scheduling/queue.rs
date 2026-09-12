@@ -12,10 +12,10 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use super::cache_coverage::compute_raw_cache_coverage;
 #[cfg(test)]
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
-use super::cache_coverage::compute_raw_cache_coverage;
 use super::overlap::SelectedWorkerTierSnapshot;
 use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
@@ -3679,7 +3679,7 @@ policy_classes:
                     routing_snapshot: None,
                 }),
                 overlap: OverlapSignals {
-                raw_index_state: crate::scheduling::RawIndexState::Observed,
+                    raw_index_state: crate::scheduling::RawIndexState::Observed,
                     tier_overlap_blocks: Default::default(),
                     effective_overlap_blocks: HashMap::from([
                         (WorkerWithDpRank::new(0, 0), 1.0),
@@ -3757,10 +3757,7 @@ policy_classes:
             resp3.raw_cache_coverage.observation,
             crate::scheduling::RawCacheObservation::Complete
         );
-        assert_eq!(
-            resp3.raw_cache_coverage.selected.unwrap().total_tokens,
-            0
-        );
+        assert_eq!(resp3.raw_cache_coverage.selected.unwrap().total_tokens, 0);
         assert_eq!(
             resp3
                 .kv_transfer_candidates
@@ -3786,7 +3783,7 @@ policy_classes:
                     routing_snapshot: None,
                 }),
                 overlap: OverlapSignals {
-                raw_index_state: crate::scheduling::RawIndexState::Missing,
+                    raw_index_state: crate::scheduling::RawIndexState::Missing,
                     tier_overlap_blocks: Default::default(),
                     effective_overlap_blocks: HashMap::from([(worker, 5.0)]),
                     effective_cached_tokens: HashMap::from([(worker, 80)]),

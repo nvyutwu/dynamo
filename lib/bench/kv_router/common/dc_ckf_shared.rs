@@ -418,7 +418,7 @@ impl PoolCapacityTracker {
                     self.remove(member, *hash)?;
                 }
             }
-            KvCacheEventData::Cleared => self.clear(member)?,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => self.clear(member)?,
         }
         self.event_count = self
             .event_count

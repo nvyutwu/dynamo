@@ -777,12 +777,8 @@ where
 
         let overlap_scores_refresh = indexer.supports_overlap_refresh().then(|| {
             Arc::new(
-                TieredOverlapRefresher::new(
-                    indexer.clone(),
-                    kv_router_config.clone(),
-                    block_size,
-                )
-                .with_raw_cache_coverage_supported(indexer.supports_raw_cache_coverage()),
+                TieredOverlapRefresher::new(indexer.clone(), kv_router_config.clone(), block_size)
+                    .with_raw_cache_coverage_supported(indexer.supports_raw_cache_coverage()),
             )
         });
         let client_for_overload = client.clone();
