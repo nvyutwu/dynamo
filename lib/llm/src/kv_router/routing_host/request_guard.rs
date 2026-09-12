@@ -1213,6 +1213,26 @@ mod prefill_start_tests {
                 "test",
             )
             .unwrap(),
+            raw_cache_prompt_tokens_total: prometheus::IntCounter::new(
+                "raw_cache_prompt_tokens_total",
+                "test",
+            )
+            .unwrap(),
+            raw_cache_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("raw_cache_tokens_total", "test"),
+                &["candidate", "cache_tier"],
+            )
+            .unwrap(),
+            raw_cache_gap_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("raw_cache_gap_tokens_total", "test"),
+                &["boundary"],
+            )
+            .unwrap(),
+            raw_cache_observations_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("raw_cache_observations_total", "test"),
+                &["result"],
+            )
+            .unwrap(),
             cache_loss_observation_input_tokens_total: prometheus::IntCounter::new(
                 "cache_loss_observation_input_tokens_total",
                 "test",
@@ -1334,5 +1354,69 @@ mod prefill_start_tests {
         let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
         RequestObservability::new(Some(tracker.clone()), metrics).record_prefill_start(&request);
         assert_eq!(tracker.prefill_wait_time_ms(), recorded_by_prefill);
+    }
+
+    #[test]
+    fn raw_cache_metrics_keep_unknown_out_of_token_denominators_and_preserve_zero() {
+        use dynamo_kv_router::scheduling::{
+            RawCacheCandidate, RawCacheCoverage, RawCacheObservation,
+        };
+
+        let metrics = test_metrics();
+        let missing = RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::MissingIndex,
+            input_tokens: 24_704,
+            resident: None,
+            eligible: None,
+            selected: None,
+            overload_gap_tokens: None,
+            selection_gap_tokens: None,
+        };
+        super::super::record_raw_cache_coverage_metrics(&metrics, &missing);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 0);
+        assert_eq!(
+            metrics
+                .raw_cache_observations_total
+                .with_label_values(&["missing_index"])
+                .get(),
+            1
+        );
+
+        let zero = RawCacheCandidate {
+            worker_id: 1,
+            dp_rank: 0,
+            hbm_prefix_tokens: 0,
+            cpu_extension_tokens: 0,
+            total_tokens: 0,
+        };
+        let complete = RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::Complete,
+            input_tokens: 24_704,
+            resident: Some(zero),
+            eligible: Some(zero),
+            selected: Some(zero),
+            overload_gap_tokens: Some(0),
+            selection_gap_tokens: Some(0),
+        };
+        super::super::record_raw_cache_coverage_metrics(&metrics, &complete);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 24_704);
+        assert_eq!(
+            metrics
+                .raw_cache_tokens_total
+                .with_label_values(&["selected", "total"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .raw_cache_observations_total
+                .with_label_values(&["complete"])
+                .get(),
+            1
+        );
     }
 }

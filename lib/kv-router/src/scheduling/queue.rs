@@ -15,9 +15,11 @@ use tokio::time::Instant;
 #[cfg(test)]
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
+use super::cache_coverage::compute_raw_cache_coverage;
 use super::overlap::SelectedWorkerTierSnapshot;
 use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
+    should_refresh_overlap,
 };
 use super::policy_config::{PolicyClassConfig, PolicyProfile};
 use super::policy_queue::{PolicyQueue, QueueSnapshot};
@@ -72,6 +74,7 @@ struct SelectedWorkerForRequest {
     resident_oracle_cached_tokens: usize,
     eligible_oracle_worker: Option<WorkerWithDpRank>,
     eligible_oracle_tiers: SelectedWorkerTierSnapshot,
+    raw_cache_coverage: super::RawCacheCoverage,
 
     selected_worker_load: AdvisoryWorkerLoad,
     non_max_overlap_selection: Option<NonMaxOverlapSelection>,
@@ -1276,6 +1279,13 @@ impl<
             // accept load crossing the class threshold during this await: busy
             // thresholds guide admission, not reservation. This differs from main
             // to avoid reversing counters, heap state, and charged DRR credit.
+            let refresh_was_due = should_refresh_overlap(
+                self.overlap_scores_refresh.is_some(),
+                self.overlap_refresh_after,
+                queued.block_hashes.as_deref(),
+                queued.enqueue_at,
+                decay_now,
+            );
             let refreshed = refresh_overlap(
                 self.overlap_scores_refresh.as_deref(),
                 self.overlap_refresh_after,
@@ -1298,6 +1308,8 @@ impl<
                 } else {
                     None
                 };
+            } else if refresh_was_due {
+                queued.request.overlap.raw_index_state = super::RawIndexState::Stale;
             }
             let admit_now = Instant::now();
             let class_index = popped.class_index();
@@ -1406,12 +1418,21 @@ impl<
                                 .map(|config| request.overlap.selected_worker_tiers(worker, config))
                         })
                         .unwrap_or_default();
+                    let raw_cache_coverage = compute_raw_cache_coverage(
+                        &workers,
+                        request,
+                        resident_eligibility,
+                        eligibility,
+                        selection.worker,
+                        self.block_size,
+                    );
                     SelectedWorkerForRequest {
                         eligible_oracle_cached_tokens: eligible_oracle
                             .map_or(0, |(_, tokens)| tokens),
                         resident_oracle_cached_tokens,
                         eligible_oracle_worker,
                         eligible_oracle_tiers,
+                        raw_cache_coverage,
                         selection,
                         selected_worker_tiers,
                         selected_worker_load,
@@ -1443,6 +1464,7 @@ impl<
                 resident_oracle_cached_tokens: selected.resident_oracle_cached_tokens,
                 eligible_oracle_worker: selected.eligible_oracle_worker,
                 eligible_oracle_tiers: selected.eligible_oracle_tiers,
+                raw_cache_coverage: selected.raw_cache_coverage,
 
                 target_cached_prefix_blocks,
                 kv_transfer_candidates: request.kv_transfer_candidates.take(),
@@ -1482,6 +1504,7 @@ impl<
             resident_oracle_cached_tokens: selected.resident_oracle_cached_tokens,
             eligible_oracle_worker: selected.eligible_oracle_worker,
             eligible_oracle_tiers: selected.eligible_oracle_tiers,
+            raw_cache_coverage: selected.raw_cache_coverage,
 
             target_cached_prefix_blocks,
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
@@ -2108,7 +2131,7 @@ mod tests {
     struct CountingRefresher {
         calls: AtomicUsize,
         last_retain_kv_transfer_chain: AtomicBool,
-        response: RefreshedOverlap,
+        response: Option<RefreshedOverlap>,
     }
 
     #[async_trait]
@@ -2121,7 +2144,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.last_retain_kv_transfer_chain
                 .store(retain_kv_transfer_chain, Ordering::Relaxed);
-            Some(self.response.clone())
+            self.response.clone()
         }
     }
 
@@ -3646,7 +3669,7 @@ policy_classes:
         let refresher = Arc::new(CountingRefresher {
             calls: AtomicUsize::new(0),
             last_retain_kv_transfer_chain: AtomicBool::new(false),
-            response: RefreshedOverlap {
+            response: Some(RefreshedOverlap {
                 kv_transfer_candidates: Some(KvTransferCandidates {
                     block_hashes: vec![
                         ExternalSequenceBlockHash(101),
@@ -3656,6 +3679,7 @@ policy_classes:
                     routing_snapshot: None,
                 }),
                 overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Observed,
                     tier_overlap_blocks: Default::default(),
                     effective_overlap_blocks: HashMap::from([
                         (WorkerWithDpRank::new(0, 0), 1.0),
@@ -3666,7 +3690,7 @@ policy_classes:
                         (WorkerWithDpRank::new(1, 0), 144),
                     ]),
                 },
-            },
+            }),
         });
         let (queue, slots) =
             make_queue_with_refresher(2, block_size, isl, Some(0.0), refresher.clone());
@@ -3730,6 +3754,14 @@ policy_classes:
         assert_eq!(resp3.effective_overlap_blocks, 9.0);
         assert_eq!(resp3.cached_tokens, 144);
         assert_eq!(
+            resp3.raw_cache_coverage.observation,
+            crate::scheduling::RawCacheObservation::Complete
+        );
+        assert_eq!(
+            resp3.raw_cache_coverage.selected.unwrap().total_tokens,
+            0
+        );
+        assert_eq!(
             resp3
                 .kv_transfer_candidates
                 .as_ref()
@@ -3747,18 +3779,19 @@ policy_classes:
         let refresher = Arc::new(CountingRefresher {
             calls: AtomicUsize::new(0),
             last_retain_kv_transfer_chain: AtomicBool::new(true),
-            response: RefreshedOverlap {
+            response: Some(RefreshedOverlap {
                 kv_transfer_candidates: Some(KvTransferCandidates {
                     block_hashes: vec![ExternalSequenceBlockHash(101)],
                     owner_prefix_blocks: vec![(worker.into(), 1)],
                     routing_snapshot: None,
                 }),
                 overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                     tier_overlap_blocks: Default::default(),
                     effective_overlap_blocks: HashMap::from([(worker, 5.0)]),
                     effective_cached_tokens: HashMap::from([(worker, 80)]),
                 },
-            },
+            }),
         });
         let (queue, slots) =
             make_queue_with_refresher(1, block_size, isl, Some(0.0), refresher.clone());
@@ -3792,12 +3825,52 @@ policy_classes:
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_due_refresh_marks_raw_cache_coverage_stale() {
+        let block_size = 16u32;
+        let isl = 64usize;
+        let worker = WorkerWithDpRank::new(0, 0);
+        let refresher = Arc::new(CountingRefresher {
+            calls: AtomicUsize::new(0),
+            last_retain_kv_transfer_chain: AtomicBool::new(false),
+            response: None,
+        });
+        let (queue, slots) =
+            make_queue_with_refresher(1, block_size, isl, Some(0.0), refresher.clone());
+
+        let (first, first_rx) = make_request("raw-refresh-first", isl);
+        queue.enqueue(first).await;
+        first_rx.await.unwrap().unwrap();
+
+        let (mut queued, queued_rx) = make_request("raw-refresh-queued", isl);
+        queued.overlap.raw_index_state = crate::scheduling::RawIndexState::Observed;
+        queue
+            .enqueue_with_block_hashes(queued, Some(vec![LocalBlockHash(42)]))
+            .await;
+        assert_eq!(queue.pending_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        slots
+            .free(&"raw-refresh-first".to_string(), decay_now())
+            .unwrap();
+        queue.update().await;
+
+        let response = queued_rx.await.unwrap().unwrap();
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            response.raw_cache_coverage.observation,
+            crate::scheduling::RawCacheObservation::StaleIndex
+        );
+        assert_eq!(response.best_worker, worker);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn selected_request_dispatches_after_refresh_if_worker_becomes_busy() {
         let block_size = 16u32;
         let isl = 64usize;
         let worker = WorkerWithDpRank::new(0, 0);
         let refresher = Arc::new(BlockingRefresher::new(RefreshedOverlap::from_overlap(
             OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::from([(worker, 7.0)]),
                 effective_cached_tokens: HashMap::from([(worker, 56)]),

@@ -1184,8 +1184,11 @@ impl SelectionCore {
                 .await
                 .map_err(|error| SelectionError::Internal(error.to_string()))?
         };
-        let overlap =
+        let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, entry.block_size, &tiered).signals();
+        if normalized.block_hashes.is_empty() {
+            overlap.raw_index_state = crate::scheduling::RawIndexState::Missing;
+        }
         drop(tiered);
         Ok(PreparedSelectionInputs {
             block_hashes: normalized.block_hashes,

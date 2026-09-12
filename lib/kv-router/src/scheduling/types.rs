@@ -12,6 +12,7 @@ use super::config::RouterConfigOverride;
 use super::filter::RoutingEligibility;
 use super::overlap::{OverlapSignals, SelectedWorkerTierSnapshot};
 use super::prefill_load::effective_prefill_tokens;
+use super::RawCacheCoverage;
 use crate::kv_hints::KvTransferCandidates;
 pub use crate::protocols::PotentialLoad;
 use crate::protocols::{
@@ -142,6 +143,7 @@ pub struct SchedulingResponse {
     pub resident_oracle_cached_tokens: usize,
     pub eligible_oracle_worker: Option<WorkerWithDpRank>,
     pub eligible_oracle_tiers: SelectedWorkerTierSnapshot,
+    pub raw_cache_coverage: RawCacheCoverage,
 
     pub target_cached_prefix_blocks: u32,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
@@ -581,6 +583,7 @@ mod tests {
             policy_class: None,
             session_context: None,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),

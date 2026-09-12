@@ -856,6 +856,10 @@ pub struct RouterRequestMetrics {
     pub eligible_oracle_cache_residency_tokens_total: prometheus::IntCounterVec,
     pub eligible_oracle_cache_residency_missed_tokens_total: prometheus::IntCounterVec,
     pub resident_oracle_cached_tokens_total: prometheus::IntCounter,
+    pub raw_cache_prompt_tokens_total: prometheus::IntCounter,
+    pub raw_cache_tokens_total: prometheus::IntCounterVec,
+    pub raw_cache_gap_tokens_total: prometheus::IntCounterVec,
+    pub raw_cache_observations_total: prometheus::IntCounterVec,
     pub cache_loss_observation_input_tokens_total: prometheus::IntCounter,
     pub cache_loss_funnel_tokens_total: prometheus::IntCounterVec,
     pub cache_loss_observations_total: prometheus::IntCounterVec,
@@ -1021,6 +1025,54 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_resident_oracle_cached_tokens_total");
+                let raw_cache_prompt_tokens_total = metrics
+                    .create_intcounter(
+                        &router_metric("raw_cache_prompt_tokens_total"),
+                        "Prompt tokens in complete raw router-index cache coverage observations",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_raw_cache_prompt_tokens_total");
+                let raw_cache_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("raw_cache_tokens_total"),
+                        "Unweighted router-index cache prefix tokens by candidate boundary and cache tier",
+                        &["candidate", "cache_tier"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_raw_cache_tokens_total");
+                for candidate in ["resident", "eligible", "selected"] {
+                    for tier in ["total", "hbm_prefix", "cpu_extension"] {
+                        raw_cache_tokens_total.with_label_values(&[candidate, tier]);
+                    }
+                }
+                let raw_cache_gap_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("raw_cache_gap_tokens_total"),
+                        "Unweighted router-index cache tokens lost at overload and selection boundaries",
+                        &["boundary"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_raw_cache_gap_tokens_total");
+                for boundary in ["overload", "selection"] {
+                    raw_cache_gap_tokens_total.with_label_values(&[boundary]);
+                }
+                let raw_cache_observations_total = metrics
+                    .create_intcountervec(
+                        &router_metric("raw_cache_observations_total"),
+                        "Raw router-index cache coverage observations by validation result",
+                        &["result"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_raw_cache_observations_total");
+                for result in [
+                    "complete",
+                    "missing_index",
+                    "stale_index",
+                    "invalid_candidate",
+                    "invariant_failure",
+                ] {
+                    raw_cache_observations_total.with_label_values(&[result]);
+                }
                 let cache_loss_observation_input_tokens_total = metrics
                     .create_intcounter(
                         &router_metric("cache_loss_observation_input_tokens_total"),
@@ -1149,6 +1201,10 @@ impl RouterRequestMetrics {
                     eligible_oracle_cache_residency_tokens_total,
                     eligible_oracle_cache_residency_missed_tokens_total,
                     resident_oracle_cached_tokens_total,
+                    raw_cache_prompt_tokens_total,
+                    raw_cache_tokens_total,
+                    raw_cache_gap_tokens_total,
+                    raw_cache_observations_total,
                     cache_loss_observation_input_tokens_total,
                     cache_loss_funnel_tokens_total,
                     cache_loss_observations_total,

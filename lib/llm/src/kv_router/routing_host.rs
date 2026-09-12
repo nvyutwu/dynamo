@@ -129,6 +129,11 @@ fn record_routing_decision_trace(
             &selection.selected_worker_tiers,
         ),
         eligible_oracle,
+        raw_cache_coverage: matches!(
+            selection.attempt,
+            dynamo_kv_router::scheduling::AdmissionAttempt::Tracked(_)
+        )
+        .then(|| selection.raw_cache_coverage.clone()),
     });
 }
 
@@ -179,6 +184,58 @@ fn record_cache_residency_metrics(
             .with_label_values(&[tier])
             .inc_by(eligible_oracle.saturating_sub(selected));
     }
+}
+
+fn record_raw_cache_coverage_metrics(
+    metrics: &RouterRequestMetrics,
+    coverage: &dynamo_kv_router::scheduling::RawCacheCoverage,
+) {
+    metrics
+        .raw_cache_observations_total
+        .with_label_values(&[coverage.observation.as_str()])
+        .inc();
+    if coverage.observation != dynamo_kv_router::scheduling::RawCacheObservation::Complete {
+        return;
+    }
+
+    let candidates = [
+        ("resident", coverage.resident),
+        ("eligible", coverage.eligible),
+        ("selected", coverage.selected),
+    ];
+    let (Some(overload_gap), Some(selection_gap)) =
+        (coverage.overload_gap_tokens, coverage.selection_gap_tokens)
+    else {
+        return;
+    };
+    if candidates.iter().any(|(_, candidate)| candidate.is_none()) {
+        return;
+    }
+
+    metrics
+        .raw_cache_prompt_tokens_total
+        .inc_by(coverage.input_tokens);
+    for (name, candidate) in candidates {
+        let candidate = candidate.expect("complete coverage validates all candidates");
+        for (tier, tokens) in [
+            ("total", candidate.total_tokens),
+            ("hbm_prefix", candidate.hbm_prefix_tokens),
+            ("cpu_extension", candidate.cpu_extension_tokens),
+        ] {
+            metrics
+                .raw_cache_tokens_total
+                .with_label_values(&[name, tier])
+                .inc_by(tokens);
+        }
+    }
+    metrics
+        .raw_cache_gap_tokens_total
+        .with_label_values(&["overload"])
+        .inc_by(overload_gap);
+    metrics
+        .raw_cache_gap_tokens_total
+        .with_label_values(&["selection"])
+        .inc_by(selection_gap);
 }
 
 /// Bounds the wait for a worker's trailing typed error after a terminal frame.

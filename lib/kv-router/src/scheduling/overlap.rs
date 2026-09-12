@@ -9,7 +9,7 @@ use crate::protocols::{
     DpRank, SharedCacheHits, StorageTier, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
 use rustc_hash::FxHashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::TierOverlapBlocks;
 
@@ -22,6 +22,9 @@ pub struct CacheHitEstimates {
 /// Compact overlap state retained while a request waits for scheduling.
 #[derive(Debug, Clone, Default)]
 pub struct OverlapSignals {
+    /// Whether the authoritative HBM and host-pinned index lookup completed.
+    /// Empty observed maps represent valid zero-hit observations.
+    pub raw_index_state: RawIndexState,
     pub tier_overlap_blocks: TierOverlapBlocks,
     pub effective_overlap_blocks: HashMap<WorkerWithDpRank, f64>,
     pub effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
@@ -140,6 +143,10 @@ impl<'a> OverlapAnalysis<'a> {
         let estimates =
             cache_hit_estimates_from_tiered_matches(self.config, self.block_size, self.tiered);
         OverlapSignals {
+            // Callers construct OverlapAnalysis only after a successful lookup.
+            // An empty lower-tier map is therefore an observed router view with
+            // zero CPU extension, not evidence of physical cache absence.
+            raw_index_state: RawIndexState::Observed,
             tier_overlap_blocks: tier_overlap_blocks_from_tiered_matches(self.tiered),
             effective_overlap_blocks: estimates.effective_overlap_blocks.into_iter().collect(),
             effective_cached_tokens: estimates.cached_tokens.into_iter().collect(),
@@ -167,6 +174,14 @@ impl<'a> OverlapAnalysis<'a> {
             shared_cache_error,
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawIndexState {
+    #[default]
+    Missing,
+    Observed,
+    Stale,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -508,5 +523,17 @@ mod tests {
         assert_eq!(snapshot.gpu_blocks, u32::MAX);
         assert_eq!(snapshot.host_pinned_blocks, u32::MAX);
         assert_eq!(snapshot.disk_blocks, u32::MAX);
+    }
+
+    #[test]
+    fn successful_empty_lookup_is_observed_router_zero() {
+        let config = KvRouterConfig::default();
+        let empty = TieredMatchDetails::default();
+        assert_eq!(
+            OverlapAnalysis::new(&config, 16, &empty)
+                .signals()
+                .raw_index_state,
+            RawIndexState::Observed
+        );
     }
 }

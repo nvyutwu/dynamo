@@ -354,6 +354,7 @@ pub enum FindBestMatchOutcome {
         resident_oracle_cached_tokens: usize,
         eligible_oracle_worker: Option<WorkerWithDpRank>,
         eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+        raw_cache_coverage: dynamo_kv_router::scheduling::RawCacheCoverage,
         score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
         decision_explanation: Option<Box<dynamo_kv_router::protocols::RoutingDecisionExplanation>>,
         selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
@@ -380,6 +381,7 @@ pub enum FindBestMatchAdvisoryOutcome {
         resident_oracle_cached_tokens: usize,
         eligible_oracle_worker: Option<WorkerWithDpRank>,
         eligible_oracle_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+        raw_cache_coverage: dynamo_kv_router::scheduling::RawCacheCoverage,
         score_decision: Option<Box<dynamo_kv_router::protocols::RoutingScoreDecision>>,
         decision_explanation: Option<Box<dynamo_kv_router::protocols::RoutingDecisionExplanation>>,
         selected_worker_tiers: dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
@@ -774,11 +776,14 @@ where
         }
 
         let overlap_scores_refresh = indexer.supports_overlap_refresh().then(|| {
-            Arc::new(TieredOverlapRefresher::new(
-                indexer.clone(),
-                kv_router_config.clone(),
-                block_size,
-            ))
+            Arc::new(
+                TieredOverlapRefresher::new(
+                    indexer.clone(),
+                    kv_router_config.clone(),
+                    block_size,
+                )
+                .with_raw_cache_coverage_supported(indexer.supports_raw_cache_coverage()),
+            )
         });
         let client_for_overload = client.clone();
         let overloaded_worker_provider: OverloadedWorkerProvider =
@@ -1660,9 +1665,12 @@ where
             })
             .unwrap_or((None, None));
 
-        let overlap =
+        let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
+        if !self.indexer.supports_raw_cache_coverage() {
+            overlap.raw_index_state = scheduling::RawIndexState::Missing;
+        }
         let kv_transfer_candidates = retain_kv_transfer_chain
             .then(|| tiered_matches.kv_transfer_candidates().cloned())
             .flatten();
@@ -1804,6 +1812,7 @@ where
                         resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                         eligible_oracle_worker: response.eligible_oracle_worker,
                         eligible_oracle_tiers: response.eligible_oracle_tiers,
+                        raw_cache_coverage: response.raw_cache_coverage,
                         score_decision: response.score_decision,
                         decision_explanation: response.decision_explanation,
                         selected_worker_tiers: response.selected_worker_tiers,
@@ -1825,6 +1834,7 @@ where
                     resident_oracle_cached_tokens: response.resident_oracle_cached_tokens,
                     eligible_oracle_worker: response.eligible_oracle_worker,
                     eligible_oracle_tiers: response.eligible_oracle_tiers,
+                    raw_cache_coverage: response.raw_cache_coverage,
                     score_decision: response.score_decision,
                     decision_explanation: response.decision_explanation,
                     selected_worker_tiers: response.selected_worker_tiers,

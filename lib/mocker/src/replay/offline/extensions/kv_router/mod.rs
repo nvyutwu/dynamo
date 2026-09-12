@@ -293,6 +293,7 @@ impl PendingRequest {
             token_seq: self.token_seq.clone(),
             isl_tokens: self.isl_tokens,
             overlap: OverlapSignals {
+                raw_index_state: dynamo_kv_router::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: TierOverlapBlocks::default(),
                 effective_overlap_blocks,
                 effective_cached_tokens,

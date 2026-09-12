@@ -1407,6 +1407,65 @@ async fn track_request(
 
 #[tokio::test]
 #[serial_test::serial]
+async fn raw_cache_metrics_exclude_query_only_and_count_tracked_selection_once() {
+    let (router, runtime) = router(None).await;
+    let observation_total = || {
+        [
+            "complete",
+            "missing_index",
+            "stale_index",
+            "invalid_candidate",
+            "invariant_failure",
+        ]
+        .into_iter()
+        .map(|result| {
+            router
+                .request_metrics
+                .raw_cache_observations_total
+                .with_label_values(&[result])
+                .get()
+        })
+        .sum::<u64>()
+    };
+    let complete = router
+        .request_metrics
+        .raw_cache_observations_total
+        .with_label_values(&["complete"]);
+    let prompt = &router.request_metrics.raw_cache_prompt_tokens_total;
+    let before_complete = complete.get();
+    let before_prompt = prompt.get();
+    let before_observations = observation_total();
+
+    let (_request, query_selection, query_guard) = track_request(&router, true).await;
+    assert_eq!(
+        query_selection.raw_cache_coverage.observation,
+        dynamo_kv_router::scheduling::RawCacheObservation::Complete,
+        "a successful empty lookup is an observed-zero router view"
+    );
+    assert_eq!(complete.get(), before_complete);
+    assert_eq!(prompt.get(), before_prompt);
+    assert_eq!(observation_total(), before_observations);
+    drop(query_guard);
+
+    let (_request, tracked_selection, tracked_guard) = track_request(&router, false).await;
+    assert_eq!(
+        tracked_selection.raw_cache_coverage.observation,
+        dynamo_kv_router::scheduling::RawCacheObservation::Complete
+    );
+    assert_eq!(complete.get(), before_complete + 1);
+    assert_eq!(observation_total(), before_observations + 1);
+    assert_eq!(
+        prompt.get(),
+        before_prompt + tracked_selection.raw_cache_coverage.input_tokens
+    );
+    drop(tracked_guard);
+
+    drop(router);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn route_plan_from_preview_holds_and_releases_the_decode_reservation() {
     let (router, runtime) = router(None).await;
     let request = Context::new(request());

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod config;
+pub mod cache_coverage;
 mod filter;
 mod local;
 pub mod overlap;
@@ -18,10 +19,11 @@ mod worker_selection_config;
 
 mod types;
 pub use filter::*;
+pub use cache_coverage::{RawCacheCandidate, RawCacheCoverage, RawCacheObservation};
 pub use local::LocalScheduler;
 pub use overlap::{
     CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals,
-    SelectedWorkerTierSnapshot, SharedCacheOverlapScore, WorkerOverlapScore,
+    RawIndexState, SelectedWorkerTierSnapshot, SharedCacheOverlapScore, WorkerOverlapScore,
 };
 pub use overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, RefreshedOverlap, TieredOverlapRefresher,

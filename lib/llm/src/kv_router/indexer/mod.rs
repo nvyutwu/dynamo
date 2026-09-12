@@ -130,6 +130,17 @@ async fn dump_local_events(
 }
 
 impl Indexer {
+    /// Raw HBM+CPU coverage is unavailable when a side index can raise device
+    /// depth independently of the primary depth used to seed lower-tier walks.
+    pub(crate) fn supports_raw_cache_coverage(&self) -> bool {
+        match self {
+            Self::KvIndexer { approx, .. }
+            | Self::Concurrent { approx, .. }
+            | Self::Remote { approx, .. } => approx.is_none(),
+            Self::None => false,
+        }
+    }
+
     /// Publish a control-plane projection snapshot for subsequent lookups.
     ///
     /// Discovery and attachment reconciliation stay in lib/llm; router-core
@@ -632,11 +643,41 @@ mod tests {
         }
     }
 
+    fn make_test_concurrent_side_indexer() -> Indexer {
+        let side = Arc::new(ThreadPoolIndexer::new_with_pruning(
+            ConcurrentRadixTreeCompressed::new(),
+            1,
+            4,
+            PruneConfig {
+                ttl: Duration::from_secs(60),
+            },
+        ));
+        Indexer::Concurrent {
+            primary: Arc::new(ThreadPoolIndexer::new(
+                ConcurrentRadixTreeCompressed::new(),
+                2,
+                4,
+            )),
+            lower_tier: LowerTierIndexers::new(2, 4),
+            approx: Some(super::SideIndexer::Concurrent(side)),
+            primary_records_routing_decisions: false,
+        }
+    }
+
     #[test]
     fn overlap_refresh_is_limited_to_local_indexers() {
         assert!(make_test_indexer().supports_overlap_refresh());
         assert!(make_test_concurrent_indexer().supports_overlap_refresh());
         assert!(!Indexer::None.supports_overlap_refresh());
+    }
+
+    #[test]
+    fn raw_cache_coverage_rejects_missing_and_side_merged_primary_views() {
+        assert!(make_test_indexer().supports_raw_cache_coverage());
+        assert!(make_test_concurrent_indexer().supports_raw_cache_coverage());
+        assert!(make_test_concurrent_approx_indexer().supports_raw_cache_coverage());
+        assert!(!make_test_concurrent_side_indexer().supports_raw_cache_coverage());
+        assert!(!Indexer::None.supports_raw_cache_coverage());
     }
 
     #[test]

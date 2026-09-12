@@ -464,6 +464,7 @@ where
             block_hashes,
             isl_tokens,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks,
                 effective_overlap_blocks,
                 effective_cached_tokens,

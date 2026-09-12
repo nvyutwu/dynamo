@@ -956,6 +956,7 @@ mod tests {
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
@@ -1359,6 +1360,7 @@ mod tests {
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
@@ -1418,6 +1420,7 @@ mod tests {
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
@@ -1495,6 +1498,7 @@ mod tests {
                 token_seq: None,
                 isl_tokens: 16,
                 overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                     tier_overlap_blocks: Default::default(),
                     effective_overlap_blocks: HashMap::default(),
                     effective_cached_tokens: HashMap::default(),
@@ -1570,6 +1574,7 @@ mod tests {
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
@@ -1641,6 +1646,7 @@ mod tests {
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
@@ -1728,6 +1734,7 @@ mod tests {
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks,
                 effective_overlap_blocks,
                 effective_cached_tokens,
@@ -1806,6 +1813,7 @@ mod tests {
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks,
                 effective_overlap_blocks: HashMap::new(),
                 effective_cached_tokens,
@@ -2108,6 +2116,7 @@ mod tests {
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks,
                 effective_cached_tokens: HashMap::new(),
@@ -2198,6 +2207,7 @@ mod tests {
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks,
                 effective_cached_tokens: HashMap::new(),

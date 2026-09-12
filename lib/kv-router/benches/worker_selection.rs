@@ -13,6 +13,7 @@ use dynamo_kv_router::protocols::{
     RoutingConstraints, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
 use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
+use dynamo_kv_router::scheduling::cache_coverage::compute_raw_cache_coverage;
 use dynamo_kv_router::{
     DefaultWorkerSelector, KvRouterConfig, SchedulingRequest, WorkerCandidate, WorkerFilter,
     WorkerInputView, WorkerInputs, WorkerLoadProjection, WorkerPicker, WorkerScorer,
@@ -199,6 +200,7 @@ fn fixture_with_preferred_taints(
         policy_class: None,
         session_context: None,
         overlap: OverlapSignals {
+                raw_index_state: dynamo_kv_router::scheduling::RawIndexState::Missing,
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks,
             effective_cached_tokens,
@@ -258,6 +260,87 @@ fn worker_selection(c: &mut Criterion) {
             group.finish();
         }
     }
+}
+
+fn raw_cache_coverage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("raw_cache_selection_overhead");
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(50);
+    for worker_count in [2, 32, 1_024, 10_000] {
+        let (workers, mut request) = fixture(worker_count);
+        request.overlap.raw_index_state = dynamo_kv_router::scheduling::RawIndexState::Observed;
+        for worker_id in 0..worker_count as u64 {
+            let worker = WorkerWithDpRank::new(worker_id, 0);
+            request
+                .overlap
+                .tier_overlap_blocks
+                .device
+                .insert(worker, worker_id as usize % 8);
+            request
+                .overlap
+                .tier_overlap_blocks
+                .host_pinned
+                .insert(worker, worker_id as usize % 4);
+        }
+        let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "prefill");
+        assert_eq!(
+            compute_raw_cache_coverage(
+                &workers,
+                &request,
+                request.eligibility(),
+                request.eligibility(),
+                WorkerWithDpRank::new(0, 0),
+                16,
+            )
+            .observation,
+            dynamo_kv_router::scheduling::RawCacheObservation::Complete,
+        );
+        group.throughput(Throughput::Elements(worker_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("selector_only", worker_count),
+            &worker_count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        selector
+                            .select_worker(WorkerSelectionInput::configured(
+                                black_box(&workers),
+                                black_box(&request),
+                                request.eligibility(),
+                                black_box(16),
+                            ))
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("selector_plus_raw", worker_count),
+            &worker_count,
+            |b, _| {
+                b.iter(|| {
+                    let selection = selector
+                        .select_worker(WorkerSelectionInput::configured(
+                            black_box(&workers),
+                            black_box(&request),
+                            request.eligibility(),
+                            black_box(16),
+                        ))
+                        .unwrap();
+                    black_box(compute_raw_cache_coverage(
+                        black_box(&workers),
+                        black_box(&request),
+                        request.eligibility(),
+                        request.eligibility(),
+                        selection.worker,
+                        16,
+                    ))
+                })
+            },
+        );
+    }
+    group.finish();
 }
 
 fn custom_worker_selection(c: &mut Criterion) {
@@ -419,6 +502,7 @@ fn default_policy_wrapper(c: &mut Criterion) {
 criterion_group!(
     benches,
     worker_selection,
+    raw_cache_coverage,
     custom_worker_selection,
     unused_preferred_taint_metadata,
     default_policy_wrapper
