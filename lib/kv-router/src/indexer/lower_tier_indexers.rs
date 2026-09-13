@@ -126,6 +126,10 @@ impl LowerTierIndexers {
     }
 
     /// Lookup without allocation; returns `None` if the tier is unseen.
+    ///
+    /// A tier-scoped clear uses this instead of [`get_or_create`](Self::get_or_create):
+    /// a tier that never received an event has nothing to remove, and
+    /// materializing it would add an empty per-tier thread pool.
     pub fn get(
         &self,
         storage_tier: StorageTier,

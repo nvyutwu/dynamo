@@ -539,6 +539,30 @@ impl LowerTierIndexer {
                         .ok_or(KvCacheEventError::UnsupportedResidencyDomain)?;
                     self.remove_owner_impl(worker_blocks, ResidencyOwner::cache_owner(cache_owner));
                 }
+                // One `LowerTierIndexer` instance *is* one physical tier, so the
+                // caller has already selected the tier by routing the event
+                // here. Only the ownership half of the scope remains. The tier
+                // is re-checked so a misrouted scoped clear is a no-op instead
+                // of wiping a tier it never named.
+                ResetScope::Tier { tier, domain } => {
+                    if tier.is_gpu() {
+                        return Ok(());
+                    }
+                    match domain {
+                        ResidencyDomain::Worker => {
+                            self.remove_owner_impl(worker_blocks, ResidencyOwner::worker(worker));
+                        }
+                        ResidencyDomain::CacheOwner => {
+                            let cache_owner = event
+                                .state_source
+                                .ok_or(KvCacheEventError::UnsupportedResidencyDomain)?;
+                            self.remove_owner_impl(
+                                worker_blocks,
+                                ResidencyOwner::cache_owner(cache_owner),
+                            );
+                        }
+                    }
+                }
             }
             return Ok(());
         }
@@ -1661,6 +1685,7 @@ mod tests {
                 state_source: None,
                 storage_tier: StorageTier::Device,
                 residency_domain: WireResidencyDomain::default(),
+                reset_tier: crate::protocols::WireStorageTier::default(),
                 event: crate::protocols::KvCacheEvent {
                     event_id: 7,
                     data: KvCacheEventData::Cleared,
@@ -2834,5 +2859,180 @@ mod tests {
             .query_contiguous_hits(&local_hashes(&[11, 12, 13]), &continuations);
         assert_eq!(original, replayed);
         assert_eq!(replayed.get(&worker), Some(&3));
+    }
+
+    fn scoped_clear(
+        worker_id: u64,
+        event_id: u64,
+        tier: StorageTier,
+        domain: ResidencyDomain,
+    ) -> RouterEvent {
+        let event = crate::protocols::KvCacheEvent {
+            event_id,
+            dp_rank: 0,
+            data: KvCacheEventData::Cleared,
+        };
+        let router_event = RouterEvent::with_tier_reset(worker_id, event, tier, domain);
+        match domain {
+            ResidencyDomain::Worker => router_event,
+            ResidencyDomain::CacheOwner => router_event.with_state_source(cache_owner_id()),
+        }
+    }
+
+    #[test]
+    fn host_scoped_clear_removes_only_the_named_ownership_domain() {
+        // This index instance is the host tier, so the tier half of the scope is
+        // already satisfied by dispatch; only the ownership half may act.
+        let mut index = TestLowerTierIndex::new();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let continuations = FxHashMap::from_iter([(worker, LowerTierContinuation::from_root(0))]);
+
+        for domain in [ResidencyDomain::Worker, ResidencyDomain::CacheOwner] {
+            index
+                .apply_event(store_event_in_domain(
+                    7,
+                    1,
+                    None,
+                    &[11, 12],
+                    &[101, 102],
+                    domain,
+                ))
+                .unwrap();
+        }
+
+        index
+            .apply_event(scoped_clear(
+                7,
+                2,
+                StorageTier::HostPinned,
+                ResidencyDomain::Worker,
+            ))
+            .unwrap();
+        assert_eq!(
+            index
+                .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
+                .get(&worker),
+            Some(&2),
+            "a Worker-domain tier reset must retain duplicate CacheOwner ownership"
+        );
+
+        index
+            .apply_event(scoped_clear(
+                7,
+                3,
+                StorageTier::HostPinned,
+                ResidencyDomain::CacheOwner,
+            ))
+            .unwrap();
+        assert_eq!(
+            index
+                .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
+                .get(&worker),
+            Some(&0),
+            "clearing the remaining domain empties this tier"
+        );
+    }
+
+    #[test]
+    fn a_device_scoped_clear_is_inert_in_a_lower_tier_index() {
+        // The primary radix tree owns the device tier. A device-scoped clear that
+        // reaches a lower-tier index (misrouted, or replayed from a buffer) must
+        // be a no-op rather than wipe the tier it never named.
+        let mut index = TestLowerTierIndex::new();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let continuations = FxHashMap::from_iter([(worker, LowerTierContinuation::from_root(0))]);
+        index
+            .apply_event(store_event(7, 0, 1, None, &[11, 12], &[101, 102]))
+            .unwrap();
+
+        index
+            .apply_event(scoped_clear(
+                7,
+                2,
+                StorageTier::Device,
+                ResidencyDomain::Worker,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            index
+                .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
+                .get(&worker),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn a_scoped_clear_leaves_other_workers_and_ranks_alone() {
+        let mut index = TestLowerTierIndex::new();
+        let cleared = WorkerWithDpRank::new(7, 0);
+        let other_rank = WorkerWithDpRank::new(7, 1);
+        let other_worker = WorkerWithDpRank::new(8, 0);
+        let continuations = FxHashMap::from_iter([
+            (cleared, LowerTierContinuation::from_root(0)),
+            (other_rank, LowerTierContinuation::from_root(0)),
+            (other_worker, LowerTierContinuation::from_root(0)),
+        ]);
+
+        index
+            .apply_event(store_event(7, 0, 1, None, &[11], &[101]))
+            .unwrap();
+        index
+            .apply_event(store_event(7, 1, 2, None, &[11], &[101]))
+            .unwrap();
+        index
+            .apply_event(store_event(8, 0, 3, None, &[11], &[101]))
+            .unwrap();
+
+        index
+            .apply_event(scoped_clear(
+                7,
+                4,
+                StorageTier::HostPinned,
+                ResidencyDomain::Worker,
+            ))
+            .unwrap();
+
+        let hits = index.query_contiguous_hits(&local_hashes(&[11]), &continuations);
+        assert_eq!(hits.get(&cleared), Some(&0));
+        assert_eq!(hits.get(&other_rank), Some(&1));
+        assert_eq!(hits.get(&other_worker), Some(&1));
+    }
+
+    #[test]
+    fn a_replayed_scoped_clear_is_idempotent_and_a_later_store_restores_the_tier() {
+        let mut index = TestLowerTierIndex::new();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let continuations = FxHashMap::from_iter([(worker, LowerTierContinuation::from_root(0))]);
+
+        index
+            .apply_event(store_event(7, 0, 1, None, &[11, 12], &[101, 102]))
+            .unwrap();
+        for event_id in [2, 2, 3] {
+            index
+                .apply_event(scoped_clear(
+                    7,
+                    event_id,
+                    StorageTier::HostPinned,
+                    ResidencyDomain::Worker,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            index
+                .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
+                .get(&worker),
+            Some(&0)
+        );
+
+        index
+            .apply_event(store_event(7, 0, 4, None, &[11, 12], &[101, 102]))
+            .unwrap();
+        assert_eq!(
+            index
+                .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
+                .get(&worker),
+            Some(&2)
+        );
     }
 }

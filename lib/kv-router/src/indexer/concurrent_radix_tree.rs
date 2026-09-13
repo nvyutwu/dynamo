@@ -507,6 +507,7 @@ impl ConcurrentRadixTree {
                     residency_domain: crate::protocols::WireResidencyDomain::explicit(
                         crate::protocols::ResidencyDomain::Worker,
                     ),
+                    reset_tier: crate::protocols::WireStorageTier::default(),
                     event: KvCacheEvent {
                         event_id,
                         data: KvCacheEventData::Stored(KvCacheStoreData {

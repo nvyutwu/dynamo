@@ -28,13 +28,19 @@ Events are published over the **Dynamo event plane**, a transport-agnostic pub/s
 
 ## Event Types
 
-The KV cache supports three event types:
+The KV cache supports four event types:
 
 | Event Type | Description | When to Publish |
 |------------|-------------|-----------------|
 | `BlockStored` | New blocks added to cache | After KV cache allocation succeeds |
 | `BlockRemoved` | Blocks evicted from cache | When blocks are evicted or freed |
-| `AllBlocksCleared` | All blocks removed | On cache reset or worker restart |
+| `AllBlocksCleared` | All blocks removed, every tier | On cache reset or worker restart |
+| `TierBlocksCleared` | All blocks removed from **one** storage tier | On a reset that clears only that tier, e.g. a GPU prefix-cache reset that leaves the CPU offload pool intact |
+
+Publish `TierBlocksCleared` only when the reset really is tier-scoped. A backend
+that clears everything must keep publishing `AllBlocksCleared`: the router reads
+an absent tier selector as "every tier this rank owns", which over-invalidates
+but never leaves a stale residency behind.
 
 ### Event Structure
 
@@ -207,7 +213,7 @@ The ZMQ message format (compatible with SGLang / vLLM):
 | 2 | Sequence number (8 bytes, big-endian) |
 | 3 | Msgpack payload: `[timestamp, [events], dp_rank]` |
 
-Each event in the payload is a dictionary with a `type` field (`BlockStored`, `BlockRemoved`, or `AllBlocksCleared`).
+Each event in the payload is a dictionary with a `type` field (`BlockStored`, `BlockRemoved`, `AllBlocksCleared`, or `TierBlocksCleared`).
 
 For `BlockStored`:
 ```python
@@ -233,6 +239,20 @@ For `AllBlocksCleared`:
 ```python
 {"type": "AllBlocksCleared"}
 ```
+
+For `TierBlocksCleared`:
+```python
+{
+    "type": "TierBlocksCleared",
+    "medium": str,             # required: "GPU", "CPU", "CPU_PINNED", "DISK", ...
+    "ownership": str | None,   # omit for the framework's own cache
+}
+```
+
+`medium` is required and is rejected if missing, empty, or unrecognized. The
+router drops an event it cannot map to a known tier rather than falling back to
+an all-tier clear, so a backend must not invent new medium strings without a
+matching router release.
 
 ## API Reference
 

@@ -15,7 +15,7 @@ use crate::kv_router::metrics::kv_publisher_metrics;
 use super::DEFAULT_MAX_BATCH_BLOCKS;
 use super::batching::BatchingState;
 use super::dedup::{EventDedupFilter, EventDedupPolicy};
-use super::sinks::{RouterEventBatchSink, emit};
+use super::sinks::{RouterEventBatchSink, emit_with_reset_tier};
 
 pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
     publisher: P,
@@ -78,6 +78,12 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
 
                     let storage_tier = placement_event.placement.tier;
                     let residency_domain = placement_event.placement.residency_domain;
+                    // Only meaningful for `Cleared`; `storage_tier` is the
+                    // selector when set, and the legacy all-tier placeholder
+                    // otherwise.
+                    let reset_tier = placement_event
+                        .is_tier_scoped_reset()
+                        .then_some(storage_tier);
                     tracing::trace!(
                         "Event processor for worker_id {} processing event: {:?}",
                         worker_id,
@@ -99,16 +105,29 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                         KvCacheEventData::Cleared => {
                             batching_state.flush(&local_indexer, worker_id, &mut dedup, &mut output).await;
                             let event = placement_event.event;
-                            dedup.clear_rank_domain(
-                                event.dp_rank,
-                                residency_domain,
-                                EventDedupPolicy::RefCounted,
-                            );
-                            let applied = emit(
+                            match reset_tier {
+                                // Dedup refcounts are per `(rank, tier, domain)`.
+                                // Dropping the whole rank/domain on a one-tier
+                                // reset would make the next store on a surviving
+                                // tier look new and republish indexed blocks.
+                                Some(tier) => dedup.clear_rank_tier_domain(
+                                    event.dp_rank,
+                                    tier,
+                                    residency_domain,
+                                    EventDedupPolicy::RefCounted,
+                                ),
+                                None => dedup.clear_rank_domain(
+                                    event.dp_rank,
+                                    residency_domain,
+                                    EventDedupPolicy::RefCounted,
+                                ),
+                            }
+                            let applied = emit_with_reset_tier(
                                 &local_indexer,
                                 worker_id,
                                 storage_tier,
                                 residency_domain,
+                                reset_tier,
                                 KvCacheEvent {
                                     event_id: batching_state.next_publish_id,
                                     data: KvCacheEventData::Cleared,

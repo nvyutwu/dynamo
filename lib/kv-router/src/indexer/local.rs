@@ -748,11 +748,29 @@ impl LocalKvIndexer {
             }
         };
         if matches!(&event.event.data, KvCacheEventData::Cleared) {
+            // `targets_primary` already resolved the scope; an unreadable tier
+            // took the Err branch above and never reaches a tier index.
+            let clear_tier = event.clear_tier().unwrap_or(None);
             if targets_primary {
                 self.indexer.apply_event_and_wait(event.clone()).await?;
             }
-            for indexer in self.all_lower_tier_indexers() {
-                indexer.apply_event_and_wait(event.clone()).await?;
+            match clear_tier {
+                // Legacy all-tier clear: every tier this rank owns.
+                None => {
+                    for indexer in self.all_lower_tier_indexers() {
+                        indexer.apply_event_and_wait(event.clone()).await?;
+                    }
+                }
+                // Device was handled by the primary above; a device-scoped clear
+                // must leave every lower tier intact.
+                Some(tier) if tier.is_gpu() => {}
+                // Exactly one lower tier. A tier with no index has nothing to
+                // clear, so it is not created here.
+                Some(tier) => {
+                    if let Some(indexer) = self.existing_lower_tier_indexer(tier) {
+                        indexer.apply_event_and_wait(event.clone()).await?;
+                    }
+                }
             }
             Ok(())
         } else if targets_primary {
@@ -784,6 +802,17 @@ impl LocalKvIndexer {
     fn all_lower_tier_indexers(&self) -> Vec<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
         let indexers = self.lower_tier_indexers.lock().unwrap();
         indexers.values().cloned().collect()
+    }
+
+    /// Lookup without allocation. A scoped clear for a tier that never received
+    /// an event has nothing to remove, and creating the index would add an empty
+    /// per-tier thread pool for a tier this worker may never use.
+    fn existing_lower_tier_indexer(
+        &self,
+        storage_tier: StorageTier,
+    ) -> Option<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
+        let indexers = self.lower_tier_indexers.lock().unwrap();
+        indexers.get(&storage_tier).cloned()
     }
 }
 

@@ -162,10 +162,27 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared {
                 ownership: ownership.unwrap_or(None),
             }),
+            Some("TierBlocksCleared") => {
+                // A scoped clear with no readable tier is malformed. Defaulting
+                // it to the device tier, or to an all-tier clear, would silently
+                // change which residency the reset removes.
+                let medium = normalize_medium(medium.unwrap_or(None))
+                    .ok_or_else(|| de::Error::missing_field("medium"))?;
+                Ok(RawKvEvent::TierBlocksCleared {
+                    medium,
+                    ownership: ownership.unwrap_or(None),
+                })
+            }
             Some("Ignored") => Ok(RawKvEvent::Ignored),
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -272,13 +289,28 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::AllBlocksCleared { ownership })
             }
+            "TierBlocksCleared" => {
+                let medium: Option<String> = normalize_medium(seq.next_element()?.unwrap_or(None));
+                let ownership: Option<String> = seq.next_element()?.unwrap_or(None);
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                let medium = medium.ok_or_else(|| {
+                    de::Error::invalid_length(1, &"missing medium on a tier-scoped clear")
+                })?;
+                Ok(RawKvEvent::TierBlocksCleared { medium, ownership })
+            }
             "Ignored" => {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::Ignored)
             }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
         }
     }

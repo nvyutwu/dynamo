@@ -267,8 +267,13 @@ fn process_event(
             }
         }
 
-        RawKvEvent::AllBlocksCleared { .. } => {
-            tracing::debug!("Processing AllBlocksCleared");
+        // This ingress is G1-only: the medium gate above already dropped every
+        // non-Device event, so the tracker's entire scope is the device tier and
+        // clearing all of it *is* the scoped clear. This is a narrowing of the
+        // producer's event to this consumer's scope, not a widening of it -- a
+        // CPU- or disk-scoped clear returned before reaching this match.
+        RawKvEvent::AllBlocksCleared { .. } | RawKvEvent::TierBlocksCleared { .. } => {
+            tracing::debug!("Processing cache clear for the device tier");
             tracker.handle_clear_all();
         }
 
@@ -353,5 +358,61 @@ mod tests {
                 ..
             }]
         ));
+    }
+    /// The consolidator tracks the device tier and nothing else, so a
+    /// device-scoped clear is a full clear *of its scope*. A clear naming any
+    /// other tier must never reach the tracker: turning it into `ClearAll` would
+    /// be exactly the widening the scoped-clear contract forbids.
+    #[test]
+    fn device_scoped_clear_clears_g1_and_other_tier_clears_are_ignored() {
+        let mut tracker = PassthroughCacheStatusTracker::new();
+
+        for medium in ["CPU", "CPU_PINNED", "STORAGE", "DISK", "EXTERNAL"] {
+            process_event(
+                &mut tracker,
+                RawKvEvent::TierBlocksCleared {
+                    medium: medium.to_string(),
+                    ownership: None,
+                },
+                None,
+                EventSource::Vllm,
+            );
+            assert!(
+                tracker.drain_events().is_empty(),
+                "a {medium}-scoped clear must not reach a device-only tracker"
+            );
+        }
+
+        for medium in ["GPU", "DEVICE"] {
+            process_event(
+                &mut tracker,
+                RawKvEvent::TierBlocksCleared {
+                    medium: medium.to_string(),
+                    ownership: None,
+                },
+                None,
+                EventSource::Vllm,
+            );
+            assert!(
+                matches!(
+                    tracker.drain_events().as_slice(),
+                    [ConsolidatedEvent::ClearAll]
+                ),
+                "a {medium}-scoped clear covers this tracker's whole scope"
+            );
+        }
+
+        // A scoped clear owned by another domain is still gated out with the
+        // rest of the non-framework stream.
+        process_event(
+            &mut tracker,
+            RawKvEvent::TierBlocksCleared {
+                medium: "GPU".to_string(),
+                ownership: Some("kvcr".to_string()),
+            },
+            None,
+            EventSource::Vllm,
+        );
+        assert!(tracker.drain_events().is_empty());
     }
 }

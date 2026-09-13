@@ -348,6 +348,14 @@ impl ZmqEventNormalizer {
                 self.cache_namespaces
                     .retain(|(known_worker, _), _| *known_worker != worker);
             }
+            // Salted-namespace state is keyed by external block hash, not by
+            // tier: the same hash can be resident in several tiers at once, so
+            // a single-tier clear must not drop the worker's namespace chain.
+            // The per-tier index still forgets the blocks; only the namespace
+            // memo survives, and a stale memo can at worst mis-score overlap,
+            // whereas dropping it would break salted continuation for tiers the
+            // reset never touched.
+            RawKvEvent::TierBlocksCleared { .. } => {}
             RawKvEvent::Ignored => {}
         }
         Ok(())

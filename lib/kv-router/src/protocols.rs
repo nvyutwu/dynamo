@@ -726,12 +726,47 @@ pub enum ResidencyProjectionError {
 }
 
 /// Scope of a cache-residency reset.
+///
+/// `All` and `Domain` are purely logical (ownership) scopes. `Tier` additionally
+/// restricts the reset to one physical storage tier. Physical-tier selection is
+/// deliberately independent of Worker/CacheOwner ownership: a GPU-only reset
+/// must keep valid host-tier records for the same owner, and a host-tier reset
+/// must keep the device tree intact.
+///
+/// `Tier` is never produced by a recovery snapshot (`WorkerKvQueryResponse::
+/// TreeDump`); snapshots stay rank-wide so legacy readers keep decoding them.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetScope {
     #[default]
     All,
     Domain(ResidencyDomain),
+    Tier {
+        tier: StorageTier,
+        domain: ResidencyDomain,
+    },
+}
+
+impl ResetScope {
+    /// Ownership domain this reset removes.
+    ///
+    /// `All` has no single domain; it supersedes every residency owned by the
+    /// emitting rank.
+    pub const fn domain(self) -> Option<ResidencyDomain> {
+        match self {
+            Self::All => None,
+            Self::Domain(domain) | Self::Tier { domain, .. } => Some(domain),
+        }
+    }
+
+    /// Physical tier this reset is restricted to. `None` means every tier owned
+    /// by the emitting rank.
+    pub const fn tier(self) -> Option<StorageTier> {
+        match self {
+            Self::All | Self::Domain(_) => None,
+            Self::Tier { tier, .. } => Some(tier),
+        }
+    }
 }
 
 /// Tolerant wire representation for the additive `residency_domain` field.
@@ -874,6 +909,174 @@ impl<'de> Deserialize<'de> for WireResidencyDomain {
 #[error("unsupported residency domain")]
 pub struct UnsupportedResidencyDomain;
 
+/// Why a `Cleared` event could not be resolved to a [`ResetScope`].
+///
+/// Kept separate from [`UnsupportedResidencyDomain`] so a consumer can tell an
+/// unreadable ownership domain from an unreadable physical tier. Both fail
+/// closed: neither ever degrades into an all-tier clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UnsupportedResetScope {
+    #[error("unsupported residency domain")]
+    Domain,
+    #[error("unsupported reset tier")]
+    Tier,
+}
+
+impl From<UnsupportedResidencyDomain> for UnsupportedResetScope {
+    fn from(_: UnsupportedResidencyDomain) -> Self {
+        Self::Domain
+    }
+}
+
+/// Tolerant wire representation for the additive `reset_tier` selector.
+///
+/// `Missing` is the legacy compatibility signal: a clear without a physical
+/// selector removes every tier owned by the emitting rank, which is exactly what
+/// every pre-selector publisher meant. An unrecognized or malformed value stays
+/// at the wire boundary as `Unknown`/`Invalid` and is rejected by
+/// [`WireStorageTier::parse`]; it must never be read as "no selector" because
+/// that would silently widen a scoped clear into an all-tier clear.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WireStorageTier {
+    #[default]
+    Missing,
+    Known(StorageTier),
+    Unknown(Box<str>),
+    Invalid,
+}
+
+impl WireStorageTier {
+    pub fn explicit(tier: StorageTier) -> Self {
+        Self::Known(tier)
+    }
+
+    pub(crate) fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn parse(&self) -> Result<Option<StorageTier>, UnsupportedResetScope> {
+        match self {
+            Self::Missing => Ok(None),
+            Self::Known(tier) => Ok(Some(*tier)),
+            Self::Unknown(_) | Self::Invalid => Err(UnsupportedResetScope::Tier),
+        }
+    }
+
+    fn as_wire_str(tier: StorageTier) -> &'static str {
+        match tier {
+            StorageTier::Device => "device",
+            StorageTier::HostPinned => "host_pinned",
+            StorageTier::Disk => "disk",
+            StorageTier::External => "external",
+        }
+    }
+
+    fn from_wire_str(value: &str) -> Self {
+        match value {
+            "device" => Self::Known(StorageTier::Device),
+            "host_pinned" => Self::Known(StorageTier::HostPinned),
+            "disk" => Self::Known(StorageTier::Disk),
+            "external" => Self::Known(StorageTier::External),
+            other => Self::Unknown(other.into()),
+        }
+    }
+}
+
+impl Serialize for WireStorageTier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Missing | Self::Invalid => serializer.serialize_none(),
+            Self::Known(tier) => serializer.serialize_str(Self::as_wire_str(*tier)),
+            Self::Unknown(value) => serializer.serialize_str(value),
+        }
+    }
+}
+
+struct WireStorageTierVisitor;
+
+impl<'de> Visitor<'de> for WireStorageTierVisitor {
+    type Value = WireStorageTier;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a storage-tier string")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::from_wire_str(value))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::from_wire_str(&value))
+    }
+
+    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        // Explicit null is malformed, matching `WireResidencyDomain`. Only an
+        // omitted field selects the legacy all-tier clear; reading null as
+        // omission would turn a malformed scoped clear into an all-tier one.
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(WireStorageTier::Invalid)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(WireStorageTier::Invalid)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireStorageTier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(WireStorageTierVisitor)
+    }
+}
+
 impl StorageTier {
     pub fn from_kv_medium(medium: &str) -> Option<Self> {
         match medium {
@@ -907,12 +1110,21 @@ pub enum PlacementOwner {
     Shared,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Placement {
     pub owner: PlacementOwner,
     pub tier: StorageTier,
     #[serde(default)]
     pub residency_domain: ResidencyDomain,
+    /// `Cleared` events only: `tier` selects the one physical tier to reset
+    /// instead of every tier owned by the rank. Ignored for stores and removes,
+    /// whose `tier` is always the placement tier.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tier_scoped_reset: bool,
 }
 
 impl Placement {
@@ -921,11 +1133,20 @@ impl Placement {
             owner: PlacementOwner::LocalWorker(WorkerWithDpRank::new(worker_id, dp_rank)),
             tier,
             residency_domain: ResidencyDomain::Worker,
+            tier_scoped_reset: false,
         }
     }
 
     pub fn local_gpu(worker_id: WorkerId, dp_rank: DpRank) -> Self {
         Self::local_worker(worker_id, dp_rank, StorageTier::Device)
+    }
+
+    /// Placement for a clear restricted to one physical tier of one worker.
+    pub fn local_tier_reset(worker_id: WorkerId, dp_rank: DpRank, tier: StorageTier) -> Self {
+        Self {
+            tier_scoped_reset: true,
+            ..Self::local_worker(worker_id, dp_rank, tier)
+        }
     }
 
     pub fn is_local_gpu(&self) -> bool {
@@ -944,6 +1165,11 @@ impl PlacementEvent {
         Self { placement, event }
     }
 
+    /// True when this event is a clear restricted to `placement.tier`.
+    pub fn is_tier_scoped_reset(&self) -> bool {
+        self.placement.tier_scoped_reset && matches!(self.event.data, KvCacheEventData::Cleared)
+    }
+
     pub fn local_gpu(worker_id: WorkerId, event: KvCacheEvent) -> Self {
         Self::new(Placement::local_gpu(worker_id, event.dp_rank), event)
     }
@@ -952,12 +1178,17 @@ impl PlacementEvent {
         let PlacementOwner::LocalWorker(worker) = self.placement.owner else {
             return None;
         };
-        Some(RouterEvent::with_residency_domain(
-            worker.worker_id,
-            self.event,
-            self.placement.tier,
-            self.placement.residency_domain,
-        ))
+        let tier_scoped_reset = self.is_tier_scoped_reset();
+        let placement_tier = self.placement.tier;
+        Some(
+            RouterEvent::with_residency_domain(
+                worker.worker_id,
+                self.event,
+                self.placement.tier,
+                self.placement.residency_domain,
+            )
+            .with_optional_reset_tier(tier_scoped_reset.then_some(placement_tier)),
+        )
     }
 }
 
@@ -1600,6 +1831,19 @@ pub struct RouterEvent {
     /// last so legacy positional MessagePack remains prefix-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_source: Option<CacheOwnerId>,
+    /// Physical tier a `Cleared` event is restricted to. Meaningless on stores
+    /// and removes, which carry their tier in `storage_tier`.
+    ///
+    /// Absent is the legacy all-tier clear. A consumer that does not know this
+    /// field keeps clearing every tier owned by the rank, which over-invalidates
+    /// but never leaves a stale residency behind; that is why the selector is an
+    /// additive trailing field rather than a new `KvCacheEventData` variant,
+    /// which older readers would fail to decode at all.
+    ///
+    /// Keep this field last, after `state_source`, so legacy positional
+    /// MessagePack stays prefix-compatible.
+    #[serde(default, skip_serializing_if = "WireStorageTier::is_missing")]
+    pub reset_tier: WireStorageTier,
 }
 
 impl RouterEvent {
@@ -1639,7 +1883,38 @@ impl RouterEvent {
             storage_tier,
             residency_domain: WireResidencyDomain::explicit(residency_domain),
             event,
+            reset_tier: WireStorageTier::Missing,
         }
+    }
+
+    /// Create a `Cleared` event restricted to one physical tier.
+    ///
+    /// `storage_tier` is set to the same tier so diagnostics and lower-tier
+    /// dispatch agree; `reset_tier` is what resolves the scope.
+    pub fn with_tier_reset(
+        worker_id: WorkerId,
+        event: KvCacheEvent,
+        tier: StorageTier,
+        residency_domain: ResidencyDomain,
+    ) -> Self {
+        debug_assert!(
+            matches!(event.data, KvCacheEventData::Cleared),
+            "a tier-scoped reset must carry Cleared data"
+        );
+        let mut router_event =
+            Self::with_residency_domain(worker_id, event, tier, residency_domain);
+        router_event.reset_tier = WireStorageTier::explicit(tier);
+        router_event
+    }
+
+    /// Restrict an existing `Cleared` event to one physical tier, or leave it
+    /// all-tier when `tier` is `None`.
+    pub fn with_optional_reset_tier(mut self, tier: Option<StorageTier>) -> Self {
+        self.reset_tier = match tier {
+            Some(tier) => WireStorageTier::explicit(tier),
+            None => WireStorageTier::Missing,
+        };
+        self
     }
 
     /// Create a CacheOwner event with its required stable state source.
@@ -1687,22 +1962,49 @@ impl RouterEvent {
     }
 
     /// Resolve `Cleared` semantics while preserving legacy all-domain clears.
-    pub fn reset_scope(&self) -> Result<Option<ResetScope>, UnsupportedResidencyDomain> {
+    ///
+    /// A physical selector narrows, never widens: a publisher that sets
+    /// `reset_tier` always sets `residency_domain` too, and a selector arriving
+    /// without a readable domain is treated as `Worker` because physical
+    /// residency is worker-owned unless a `CacheOwner` explicitly claims it.
+    pub fn reset_scope(&self) -> Result<Option<ResetScope>, UnsupportedResetScope> {
         if !matches!(self.event.data, KvCacheEventData::Cleared) {
             return Ok(None);
         }
-        Ok(Some(match self.residency_domain.parse()? {
-            Some(domain) => ResetScope::Domain(domain),
-            None => ResetScope::All,
+        let domain = self.residency_domain.parse()?;
+        Ok(Some(match self.reset_tier.parse()? {
+            Some(tier) => ResetScope::Tier {
+                tier,
+                domain: domain.unwrap_or(ResidencyDomain::Worker),
+            },
+            None => match domain {
+                Some(domain) => ResetScope::Domain(domain),
+                None => ResetScope::All,
+            },
         }))
     }
 
-    pub fn targets_primary(&self) -> Result<bool, UnsupportedResidencyDomain> {
+    /// Physical tier a `Cleared` event is restricted to.
+    ///
+    /// `Ok(None)` means either "not a clear" or "clear every tier owned by the
+    /// rank"; callers that need to distinguish those should match
+    /// [`RouterEvent::reset_scope`] instead.
+    pub fn clear_tier(&self) -> Result<Option<StorageTier>, UnsupportedResetScope> {
+        Ok(self.reset_scope()?.and_then(ResetScope::tier))
+    }
+
+    pub fn targets_primary(&self) -> Result<bool, UnsupportedResetScope> {
         if let Some(scope) = self.reset_scope()? {
-            return Ok(!matches!(
-                scope,
-                ResetScope::Domain(ResidencyDomain::CacheOwner)
-            ));
+            return Ok(match scope {
+                ResetScope::All => true,
+                ResetScope::Domain(domain) => domain != ResidencyDomain::CacheOwner,
+                // The device tree indexes worker-owned residency only, so a
+                // CacheOwner-domain clear never reaches it even when the
+                // selector names the device tier.
+                ResetScope::Tier { tier, domain } => {
+                    tier.is_gpu() && domain != ResidencyDomain::CacheOwner
+                }
+            });
         }
         self.resolved_residency_domain()?;
         Ok(self.storage_tier.is_gpu())
@@ -2936,6 +3238,323 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&load).unwrap(),
             r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4,"active_requests":2}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod tier_scoped_reset_tests {
+    use super::*;
+
+    fn clear_event(event_id: u64, dp_rank: DpRank) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id,
+            data: KvCacheEventData::Cleared,
+            dp_rank,
+        }
+    }
+
+    fn stored_event(event_id: u64) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id,
+            data: KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: None,
+                start_position: None,
+                blocks: Vec::new(),
+            }),
+            dp_rank: 0,
+        }
+    }
+
+    #[test]
+    fn device_scoped_reset_reaches_the_primary_tree_only() {
+        let event = RouterEvent::with_tier_reset(
+            7,
+            clear_event(1, 0),
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+        );
+        assert_eq!(
+            event.reset_scope(),
+            Ok(Some(ResetScope::Tier {
+                tier: StorageTier::Device,
+                domain: ResidencyDomain::Worker,
+            }))
+        );
+        assert_eq!(event.clear_tier(), Ok(Some(StorageTier::Device)));
+        assert_eq!(event.targets_primary(), Ok(true));
+    }
+
+    #[test]
+    fn host_scoped_reset_never_reaches_the_primary_tree() {
+        let event = RouterEvent::with_tier_reset(
+            7,
+            clear_event(1, 0),
+            StorageTier::HostPinned,
+            ResidencyDomain::Worker,
+        );
+        assert_eq!(event.clear_tier(), Ok(Some(StorageTier::HostPinned)));
+        assert_eq!(event.targets_primary(), Ok(false));
+    }
+
+    #[test]
+    fn cache_owner_device_scoped_reset_stays_out_of_the_worker_only_device_tree() {
+        let event = RouterEvent::with_tier_reset(
+            7,
+            clear_event(1, 0),
+            StorageTier::Device,
+            ResidencyDomain::CacheOwner,
+        );
+        assert_eq!(
+            event.reset_scope(),
+            Ok(Some(ResetScope::Tier {
+                tier: StorageTier::Device,
+                domain: ResidencyDomain::CacheOwner,
+            }))
+        );
+        assert_eq!(event.targets_primary(), Ok(false));
+    }
+
+    #[test]
+    fn a_reset_selector_is_ignored_on_non_clear_events() {
+        let mut event = RouterEvent::with_storage_tier(7, stored_event(1), StorageTier::HostPinned);
+        event.reset_tier = WireStorageTier::explicit(StorageTier::Device);
+        assert_eq!(event.reset_scope(), Ok(None));
+        assert_eq!(event.clear_tier(), Ok(None));
+        assert_eq!(
+            event.targets_primary(),
+            Ok(false),
+            "a store is still routed by storage_tier, not by the reset selector"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_selector_fails_closed_instead_of_widening() {
+        for wire in [
+            WireStorageTier::Unknown("future_tier".into()),
+            WireStorageTier::Invalid,
+        ] {
+            let mut event = RouterEvent::with_residency_domain(
+                7,
+                clear_event(1, 0),
+                StorageTier::Device,
+                ResidencyDomain::Worker,
+            );
+            event.reset_tier = wire;
+            assert_eq!(event.reset_scope(), Err(UnsupportedResetScope::Tier));
+            assert_eq!(event.clear_tier(), Err(UnsupportedResetScope::Tier));
+            assert_eq!(event.targets_primary(), Err(UnsupportedResetScope::Tier));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_domain_is_still_reported_as_a_domain_fault() {
+        let mut event = RouterEvent::with_residency_domain(
+            7,
+            clear_event(1, 0),
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+        );
+        event.residency_domain = WireResidencyDomain::Unknown("future_domain".into());
+        assert_eq!(event.reset_scope(), Err(UnsupportedResetScope::Domain));
+    }
+
+    #[test]
+    fn a_selector_without_a_domain_is_worker_owned_not_all_domain() {
+        let mut event = RouterEvent::with_tier_reset(
+            7,
+            clear_event(1, 0),
+            StorageTier::HostPinned,
+            ResidencyDomain::Worker,
+        );
+        event.residency_domain = WireResidencyDomain::Missing;
+        assert_eq!(
+            event.reset_scope(),
+            Ok(Some(ResetScope::Tier {
+                tier: StorageTier::HostPinned,
+                domain: ResidencyDomain::Worker,
+            })),
+            "physical residency is worker-owned unless a CacheOwner claims it"
+        );
+    }
+
+    #[test]
+    fn an_absent_selector_keeps_the_legacy_all_tier_clear() {
+        let legacy = RouterEvent::new(7, clear_event(1, 0));
+        assert_eq!(legacy.clear_tier(), Ok(None));
+        assert_eq!(legacy.targets_primary(), Ok(true));
+
+        let mut domainless = legacy.clone();
+        domainless.residency_domain = WireResidencyDomain::Missing;
+        assert_eq!(domainless.reset_scope(), Ok(Some(ResetScope::All)));
+        assert_eq!(domainless.clear_tier(), Ok(None));
+    }
+
+    #[test]
+    fn with_optional_reset_tier_round_trips_both_ways() {
+        let event = RouterEvent::new(7, clear_event(1, 0))
+            .with_optional_reset_tier(Some(StorageTier::Disk));
+        assert_eq!(event.clear_tier(), Ok(Some(StorageTier::Disk)));
+        let cleared_selector = event.with_optional_reset_tier(None);
+        assert_eq!(cleared_selector.clear_tier(), Ok(None));
+    }
+
+    #[test]
+    fn reset_scope_accessors_agree_with_the_variant() {
+        assert_eq!(ResetScope::All.tier(), None);
+        assert_eq!(ResetScope::All.domain(), None);
+        assert_eq!(
+            ResetScope::Domain(ResidencyDomain::CacheOwner).domain(),
+            Some(ResidencyDomain::CacheOwner)
+        );
+        assert_eq!(ResetScope::Domain(ResidencyDomain::Worker).tier(), None);
+        let scoped = ResetScope::Tier {
+            tier: StorageTier::HostPinned,
+            domain: ResidencyDomain::Worker,
+        };
+        assert_eq!(scoped.tier(), Some(StorageTier::HostPinned));
+        assert_eq!(scoped.domain(), Some(ResidencyDomain::Worker));
+    }
+
+    // ---- wire compatibility -------------------------------------------------
+
+    /// Shape of a consumer that predates the selector. It must keep decoding the
+    /// new event, and it must interpret it as today's all-tier clear -- the
+    /// over-invalidating but never-stale fallback.
+    #[derive(Serialize, Deserialize)]
+    struct PreSelectorRouterEvent {
+        worker_id: WorkerId,
+        #[serde(default)]
+        storage_tier: StorageTier,
+        #[serde(default)]
+        residency_domain: WireResidencyDomain,
+        event: KvCacheEvent,
+    }
+
+    #[test]
+    fn a_pre_selector_consumer_still_decodes_a_scoped_clear_as_an_all_tier_clear() {
+        let scoped = RouterEvent::with_tier_reset(
+            7,
+            clear_event(4, 2),
+            StorageTier::HostPinned,
+            ResidencyDomain::Worker,
+        );
+        let encoded = rmp_serde::to_vec_named(&vec![scoped]).unwrap();
+
+        let decoded: Vec<PreSelectorRouterEvent> = rmp_serde::from_slice(&encoded)
+            .expect("an additive trailing field must not break an older reader");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].worker_id, 7);
+        assert_eq!(decoded[0].storage_tier, StorageTier::HostPinned);
+        assert_eq!(
+            decoded[0].residency_domain.parse(),
+            Ok(Some(ResidencyDomain::Worker))
+        );
+        assert!(matches!(decoded[0].event.data, KvCacheEventData::Cleared));
+    }
+
+    #[test]
+    fn a_pre_selector_publisher_still_decodes_into_the_new_reader() {
+        let legacy = vec![PreSelectorRouterEvent {
+            worker_id: 7,
+            storage_tier: StorageTier::Device,
+            residency_domain: WireResidencyDomain::explicit(ResidencyDomain::Worker),
+            event: clear_event(9, 1),
+        }];
+        let decoded: Vec<RouterEvent> =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&legacy).unwrap()).unwrap();
+        assert_eq!(decoded[0].reset_tier, WireStorageTier::Missing);
+        assert_eq!(decoded[0].clear_tier(), Ok(None));
+    }
+
+    #[test]
+    fn the_selector_round_trips_through_named_messagepack_and_json() {
+        for tier in [
+            StorageTier::Device,
+            StorageTier::HostPinned,
+            StorageTier::Disk,
+            StorageTier::External,
+        ] {
+            let event =
+                RouterEvent::with_tier_reset(7, clear_event(1, 0), tier, ResidencyDomain::Worker);
+
+            let msgpack: RouterEvent =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&event).unwrap()).unwrap();
+            assert_eq!(msgpack.clear_tier(), Ok(Some(tier)));
+
+            let json: RouterEvent =
+                serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+            assert_eq!(json.clear_tier(), Ok(Some(tier)));
+        }
+    }
+
+    #[test]
+    fn an_absent_selector_is_omitted_from_the_wire_entirely() {
+        let legacy = RouterEvent::new(7, clear_event(1, 0));
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !json.contains("reset_tier"),
+            "the selector must stay invisible to pre-selector consumers: {json}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_selector_string_survives_decoding_and_fails_closed() {
+        let scoped = RouterEvent::with_tier_reset(
+            7,
+            clear_event(1, 0),
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        value["reset_tier"] = serde_json::Value::String("nvme_tier3".to_string());
+        let decoded: RouterEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.reset_tier,
+            WireStorageTier::Unknown("nvme_tier3".into())
+        );
+        assert_eq!(decoded.clear_tier(), Err(UnsupportedResetScope::Tier));
+    }
+
+    #[test]
+    fn an_explicit_null_selector_is_invalid_not_absent() {
+        // Treating null as omission would turn a malformed scoped clear into an
+        // all-tier clear, which is the widening this contract forbids.
+        let scoped = RouterEvent::with_tier_reset(
+            7,
+            clear_event(1, 0),
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        value["reset_tier"] = serde_json::Value::Null;
+        let decoded: RouterEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.reset_tier, WireStorageTier::Invalid);
+        assert_eq!(decoded.clear_tier(), Err(UnsupportedResetScope::Tier));
+    }
+
+    #[test]
+    fn a_scoped_placement_event_carries_its_selector_into_the_router_event() {
+        let placement = PlacementEvent::new(
+            Placement::local_tier_reset(7, 2, StorageTier::HostPinned),
+            clear_event(3, 2),
+        );
+        assert!(placement.is_tier_scoped_reset());
+        let router_event = placement.into_router_event().unwrap();
+        assert_eq!(router_event.storage_tier, StorageTier::HostPinned);
+        assert_eq!(router_event.clear_tier(), Ok(Some(StorageTier::HostPinned)));
+
+        // The same placement flag on a store is inert.
+        let store = PlacementEvent::new(
+            Placement::local_tier_reset(7, 2, StorageTier::HostPinned),
+            stored_event(4),
+        );
+        assert!(!store.is_tier_scoped_reset());
+        assert_eq!(
+            store.into_router_event().unwrap().reset_tier,
+            WireStorageTier::Missing
         );
     }
 }

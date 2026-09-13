@@ -597,6 +597,9 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                 // This state agent creates CacheOwner events only from KVCR ownership.
                 ResidencyDomain::CacheOwner => EventDedupPolicy::SetLike,
             };
+            let reset_tier = placement_event
+                .is_tier_scoped_reset()
+                .then_some(placement_event.placement.tier);
             let mut event = placement_event.event;
             if event.dp_rank != self.slot_dp_rank {
                 self.fail_source(
@@ -637,8 +640,17 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                     KvCacheEventData::Stored(data)
                 }
                 KvCacheEventData::Cleared => {
-                    self.dedup
-                        .clear_rank_domain(event.dp_rank, domain, dedup_policy);
+                    match reset_tier {
+                        Some(reset_tier) => self.dedup.clear_rank_tier_domain(
+                            event.dp_rank,
+                            reset_tier,
+                            domain,
+                            dedup_policy,
+                        ),
+                        None => self
+                            .dedup
+                            .clear_rank_domain(event.dp_rank, domain, dedup_policy),
+                    }
                     KvCacheEventData::Cleared
                 }
             };
@@ -669,7 +681,8 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                     tier,
                     self.identity.cache_owner_id,
                 ),
-            };
+            }
+            .with_optional_reset_tier(reset_tier);
             // NOTE: Stored/Removed intentionally use the legacy lossy contract: queue
             // admission and one best-effort publish, with no completion acknowledgement.
             // Cleared is stronger and completes every affected tier before publication.
@@ -741,6 +754,9 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
             owner: dynamo_kv_router::protocols::PlacementOwner::LocalWorker(worker),
             tier: StorageTier::Device,
             residency_domain: domain,
+            // A control-plane domain reset covers every tier the domain owns;
+            // Device here is the legacy placeholder, not a selector.
+            tier_scoped_reset: false,
         };
         self.apply_and_publish_chunk(vec![PlacementEvent::new(
             placement,
@@ -1898,6 +1914,7 @@ mod tests {
                 owner: PlacementOwner::LocalWorker(worker),
                 tier: StorageTier::HostPinned,
                 residency_domain: domain,
+                tier_scoped_reset: false,
             },
             KvCacheEvent {
                 event_id: 0,

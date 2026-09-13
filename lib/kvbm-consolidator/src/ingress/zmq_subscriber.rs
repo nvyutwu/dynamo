@@ -11,7 +11,7 @@
 //!   - malformed frame counts / bad msgpack → `WARN`, loop survives
 //!   - `BlockStored` → chunks `token_ids` by `block_size`, chains parents left-to-right
 //!   - `BlockRemoved` → per-hash remove
-//!   - `AllBlocksCleared` → clear_all
+//!   - `AllBlocksCleared` / device-scoped `TierBlocksCleared` → clear_all
 //!
 //! Wave1-C implements this body.
 
@@ -197,7 +197,11 @@ fn process_event(tracker: &mut Tracker, event: RawKvEvent, engine_source: EventS
             }
         }
 
-        RawKvEvent::AllBlocksCleared { .. } => {
+        // G1-only ingress: the medium gate above already returned for every
+        // non-Device event, so this tracker's whole scope is the device tier.
+        // Clearing all of it narrows the producer's scoped clear to this
+        // consumer's scope; it never widens one.
+        RawKvEvent::AllBlocksCleared { .. } | RawKvEvent::TierBlocksCleared { .. } => {
             tracker.handle_clear_all();
         }
 
@@ -269,6 +273,48 @@ mod tests {
         assert!(matches!(
             tracker.drain_events().as_slice(),
             [ConsolidatedEvent::Store { .. }]
+        ));
+    }
+    /// This ingress tracks the device tier and nothing else, so a device-scoped
+    /// clear is a full clear *of its scope*. A clear naming any other tier must
+    /// never reach the tracker: turning it into `ClearAll` would be exactly the
+    /// widening the scoped-clear contract forbids.
+    #[test]
+    fn device_scoped_clear_clears_g1_and_other_tier_clears_are_ignored() {
+        let mut tracker = Tracker::new(None);
+        process_event(&mut tracker, stored_event(None, None), EventSource::Vllm);
+        let _ = tracker.drain_events();
+        assert_eq!(tracker.num_blocks(), 1);
+
+        for medium in ["CPU", "CPU_PINNED", "STORAGE", "DISK", "EXTERNAL"] {
+            process_event(
+                &mut tracker,
+                RawKvEvent::TierBlocksCleared {
+                    medium: medium.to_string(),
+                    ownership: None,
+                },
+                EventSource::Vllm,
+            );
+            assert_eq!(
+                tracker.num_blocks(),
+                1,
+                "a {medium}-scoped clear must not reach a device-only tracker"
+            );
+            assert!(tracker.drain_events().is_empty());
+        }
+
+        process_event(
+            &mut tracker,
+            RawKvEvent::TierBlocksCleared {
+                medium: "GPU".to_string(),
+                ownership: None,
+            },
+            EventSource::Vllm,
+        );
+        assert_eq!(tracker.num_blocks(), 0);
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::ClearAll]
         ));
     }
 }

@@ -31,6 +31,10 @@ pub fn convert_event(
         | RawKvEvent::BlockRemoved {
             medium, locality, ..
         } => (medium.as_deref(), *locality),
+        // The scoped clear's medium is its selector, so it resolves through the
+        // same `StorageTier::from_kv_medium` gate as a placement event and an
+        // unrecognized tier is dropped rather than widened.
+        RawKvEvent::TierBlocksCleared { medium, .. } => (Some(medium.as_str()), None),
         RawKvEvent::AllBlocksCleared { .. } => (None, None),
         RawKvEvent::Ignored => return None,
     };
@@ -66,6 +70,9 @@ pub fn convert_event(
     };
 
     let dp_rank = worker.dp_rank;
+    // A scoped clear keeps `storage_tier` as a real selector rather than the
+    // all-tier placeholder the legacy clear uses.
+    let tier_scoped_reset = matches!(raw, RawKvEvent::TierBlocksCleared { .. });
     let event = match raw {
         RawKvEvent::BlockStored {
             block_hashes,
@@ -154,18 +161,22 @@ pub fn convert_event(
                 dp_rank,
             }
         }
-        RawKvEvent::AllBlocksCleared { .. } => KvCacheEvent {
-            event_id,
-            data: KvCacheEventData::Cleared,
-            dp_rank,
-        },
+        RawKvEvent::AllBlocksCleared { .. } | RawKvEvent::TierBlocksCleared { .. } => {
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Cleared,
+                dp_rank,
+            }
+        }
         RawKvEvent::Ignored => unreachable!("ignored events return before conversion"),
     };
 
-    Some(PlacementEvent::new(
-        Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
-        event,
-    ))
+    let placement = if tier_scoped_reset {
+        Placement::local_tier_reset(worker.worker_id, worker.dp_rank, storage_tier)
+    } else {
+        Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier)
+    };
+    Some(PlacementEvent::new(placement, event))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2491,12 +2491,252 @@ mod local_indexer_tests {
         )
     }
 
+    fn make_local_tier_store_event(
+        event_id: u64,
+        block_hash: u64,
+        storage_tier: StorageTier,
+    ) -> RouterEvent {
+        RouterEvent::with_storage_tier(
+            0,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(block_hash),
+                        tokens_hash: LocalBlockHash(block_hash),
+                        mm_extra_info: None,
+                    }],
+                }),
+                dp_rank: 0,
+            },
+            storage_tier,
+        )
+    }
+
+    fn make_local_scoped_clear_event(event_id: u64, tier: StorageTier) -> RouterEvent {
+        RouterEvent::with_tier_reset(
+            0,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Cleared,
+                dp_rank: 0,
+            },
+            tier,
+            ResidencyDomain::Worker,
+        )
+    }
+
+    /// Blocks still indexed per tier, read back through the recovery dump the
+    /// frontend would replay.
+    async fn tier_block_counts(
+        indexer: &LocalKvIndexer,
+    ) -> std::collections::HashMap<StorageTier, usize> {
+        let WorkerKvQueryResponse::TreeDump { events, .. } =
+            indexer.get_events_in_id_range(None, None).await
+        else {
+            panic!("expected a full tree dump");
+        };
+        let mut counts: std::collections::HashMap<StorageTier, usize> =
+            std::collections::HashMap::new();
+        for event in events {
+            if let KvCacheEventData::Stored(store) = &event.event.data {
+                *counts.entry(event.storage_tier).or_default() += store.blocks.len();
+            }
+        }
+        counts
+    }
+
+    #[tokio::test]
+    async fn local_indexer_device_scoped_clear_retains_host_tier_blocks() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            64,
+        );
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(1, 11, StorageTier::Device))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(2, 21, StorageTier::HostPinned))
+            .await
+            .unwrap();
+        let seeded = tier_block_counts(&indexer).await;
+        assert_eq!(seeded.get(&StorageTier::Device), Some(&1));
+        assert_eq!(seeded.get(&StorageTier::HostPinned), Some(&1));
+
+        indexer
+            .apply_event_with_buffer(make_local_scoped_clear_event(3, StorageTier::Device))
+            .await
+            .unwrap();
+
+        let after = tier_block_counts(&indexer).await;
+        assert_eq!(
+            after.get(&StorageTier::Device).copied().unwrap_or(0),
+            0,
+            "the worker-local device index must be empty after a GPU reset"
+        );
+        assert_eq!(
+            after.get(&StorageTier::HostPinned),
+            Some(&1),
+            "the worker-local host index must keep records the reset never named"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_indexer_host_scoped_clear_retains_device_blocks() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            64,
+        );
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(1, 11, StorageTier::Device))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(2, 21, StorageTier::HostPinned))
+            .await
+            .unwrap();
+
+        indexer
+            .apply_event_with_buffer(make_local_scoped_clear_event(3, StorageTier::HostPinned))
+            .await
+            .unwrap();
+
+        let after = tier_block_counts(&indexer).await;
+        assert_eq!(after.get(&StorageTier::Device), Some(&1));
+        assert_eq!(after.get(&StorageTier::HostPinned).copied().unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn local_indexer_legacy_clear_still_empties_every_tier() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            64,
+        );
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(1, 11, StorageTier::Device))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(2, 21, StorageTier::HostPinned))
+            .await
+            .unwrap();
+
+        indexer
+            .apply_event_with_buffer(make_local_clear_event(3))
+            .await
+            .unwrap();
+
+        assert!(tier_block_counts(&indexer).await.values().all(|&n| n == 0));
+    }
+
+    #[tokio::test]
+    async fn scoped_clear_is_replayed_as_an_ordinary_ordered_event() {
+        // Only an all-domain clear supersedes earlier buffered events. A scoped
+        // clear must stay in the replayed suffix so a recovering frontend applies
+        // it in order instead of inferring a rank-wide reset.
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            64,
+        );
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(1, 11, StorageTier::Device))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(make_local_scoped_clear_event(2, StorageTier::Device))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(3, 12, StorageTier::Device))
+            .await
+            .unwrap();
+
+        let WorkerKvQueryResponse::Events { events, .. } =
+            indexer.get_events_in_id_range(Some(1), Some(3)).await
+        else {
+            panic!("expected a buffered replay");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.event_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "a scoped clear must not truncate the replay window"
+        );
+        assert_eq!(
+            events[1].clear_tier(),
+            Ok(Some(StorageTier::Device)),
+            "the selector must survive replay"
+        );
+
+        // An all-domain clear still truncates.
+        indexer
+            .apply_event_with_buffer({
+                let mut event = make_local_clear_event(4);
+                event.residency_domain = WireResidencyDomain::Missing;
+                event
+            })
+            .await
+            .unwrap();
+        let WorkerKvQueryResponse::Events { events, .. } =
+            indexer.get_events_in_id_range(Some(1), Some(4)).await
+        else {
+            panic!("expected a buffered replay");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.event_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_indexer_drops_an_unreadable_selector_without_widening() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            64,
+        );
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(1, 11, StorageTier::Device))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(make_local_tier_store_event(2, 21, StorageTier::HostPinned))
+            .await
+            .unwrap();
+
+        let mut event = make_local_scoped_clear_event(3, StorageTier::Device);
+        event.reset_tier = crate::protocols::WireStorageTier::Unknown("future_tier".into());
+        indexer.apply_event_with_buffer(event).await.unwrap();
+
+        let after = tier_block_counts(&indexer).await;
+        assert_eq!(after.get(&StorageTier::Device), Some(&1));
+        assert_eq!(after.get(&StorageTier::HostPinned), Some(&1));
+    }
+
     fn make_local_clear_event(event_id: u64) -> RouterEvent {
         RouterEvent {
             worker_id: 0,
             state_source: None,
             storage_tier: StorageTier::Device,
             residency_domain: WireResidencyDomain::default(),
+            reset_tier: crate::protocols::WireStorageTier::default(),
             event: KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Cleared,

@@ -117,6 +117,25 @@ impl EventDedupFilter {
             });
     }
 
+    /// Forget refcounts for one physical tier only.
+    ///
+    /// Dedup state is keyed by `(dp_rank, tier, domain)`, so a tier-scoped clear
+    /// must drop exactly one key. Dropping the whole rank/domain would make the
+    /// next store on a surviving tier look new and republish blocks the frontend
+    /// already indexes.
+    pub(super) fn clear_rank_tier_domain(
+        &mut self,
+        dp_rank: u32,
+        storage_tier: StorageTier,
+        domain: ResidencyDomain,
+        policy: EventDedupPolicy,
+    ) {
+        if policy == EventDedupPolicy::SetLike {
+            return;
+        }
+        self.per_rank_tier.remove(&(dp_rank, storage_tier, domain));
+    }
+
     #[cfg(test)]
     pub(super) fn track_store(
         &mut self,
@@ -153,5 +172,159 @@ impl EventDedupFilter {
     pub(super) fn clear_rank(&mut self, dp_rank: u32) {
         self.per_rank_tier
             .retain(|(tracked_dp_rank, _, _), _| *tracked_dp_rank != dp_rank);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_kv_router::protocols::{KvCacheStoredBlockData, LocalBlockHash};
+
+    fn store(hashes: &[u64]) -> KvCacheStoreData {
+        KvCacheStoreData {
+            parent_hash: None,
+            start_position: None,
+            blocks: hashes
+                .iter()
+                .map(|&hash| KvCacheStoredBlockData {
+                    block_hash: ExternalSequenceBlockHash(hash),
+                    tokens_hash: LocalBlockHash(hash),
+                    mm_extra_info: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn remove(hashes: &[u64]) -> KvCacheRemoveData {
+        KvCacheRemoveData {
+            block_hashes: hashes
+                .iter()
+                .map(|&hash| ExternalSequenceBlockHash(hash))
+                .collect(),
+        }
+    }
+
+    /// A refcount of 2 swallows the first remove; a forgotten key passes it
+    /// through defensively. That asymmetry is what makes a surviving refcount
+    /// observable, so each tier is stored twice and probed with one remove.
+    fn seeded_filter() -> EventDedupFilter {
+        let mut dedup = EventDedupFilter::new();
+        for tier in [StorageTier::Device, StorageTier::HostPinned] {
+            for _ in 0..2 {
+                dedup.track_store_in_domain(
+                    0,
+                    tier,
+                    ResidencyDomain::Worker,
+                    EventDedupPolicy::RefCounted,
+                    &store(&[1]),
+                );
+            }
+        }
+        dedup
+    }
+
+    fn remove_is_swallowed(
+        dedup: &mut EventDedupFilter,
+        tier: StorageTier,
+        domain: ResidencyDomain,
+    ) -> bool {
+        dedup
+            .filter_remove_in_domain(0, tier, domain, EventDedupPolicy::RefCounted, remove(&[1]))
+            .is_none()
+    }
+
+    #[test]
+    fn a_tier_scoped_clear_forgets_only_the_named_tier() {
+        let mut dedup = seeded_filter();
+        dedup.clear_rank_tier_domain(
+            0,
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+            EventDedupPolicy::RefCounted,
+        );
+
+        assert!(
+            !remove_is_swallowed(&mut dedup, StorageTier::Device, ResidencyDomain::Worker),
+            "the cleared tier must have forgotten its refcounts"
+        );
+        assert!(
+            remove_is_swallowed(&mut dedup, StorageTier::HostPinned, ResidencyDomain::Worker),
+            "the untouched tier must keep its refcounts; dropping them would make \
+             the next store on that tier look new and republish indexed blocks"
+        );
+    }
+
+    #[test]
+    fn an_all_tier_clear_still_forgets_every_tier_of_the_rank() {
+        let mut dedup = seeded_filter();
+        dedup.clear_rank_domain(0, ResidencyDomain::Worker, EventDedupPolicy::RefCounted);
+
+        for tier in [StorageTier::Device, StorageTier::HostPinned] {
+            assert!(!remove_is_swallowed(
+                &mut dedup,
+                tier,
+                ResidencyDomain::Worker
+            ));
+        }
+    }
+
+    #[test]
+    fn a_tier_scoped_clear_spares_other_ranks_and_other_domains() {
+        let mut dedup = seeded_filter();
+        for _ in 0..2 {
+            dedup.track_store_in_domain(
+                1,
+                StorageTier::Device,
+                ResidencyDomain::Worker,
+                EventDedupPolicy::RefCounted,
+                &store(&[1]),
+            );
+            dedup.track_store_in_domain(
+                0,
+                StorageTier::Device,
+                ResidencyDomain::CacheOwner,
+                EventDedupPolicy::RefCounted,
+                &store(&[1]),
+            );
+        }
+
+        dedup.clear_rank_tier_domain(
+            0,
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+            EventDedupPolicy::RefCounted,
+        );
+
+        assert!(
+            dedup
+                .filter_remove_in_domain(
+                    1,
+                    StorageTier::Device,
+                    ResidencyDomain::Worker,
+                    EventDedupPolicy::RefCounted,
+                    remove(&[1]),
+                )
+                .is_none(),
+            "another rank keeps its refcounts"
+        );
+        assert!(
+            remove_is_swallowed(&mut dedup, StorageTier::Device, ResidencyDomain::CacheOwner),
+            "another ownership domain on the same tier keeps its refcounts"
+        );
+    }
+
+    #[test]
+    fn a_set_like_producer_keeps_bypassing_the_bookkeeping() {
+        let mut dedup = seeded_filter();
+        dedup.clear_rank_tier_domain(
+            0,
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+            EventDedupPolicy::SetLike,
+        );
+        assert!(
+            remove_is_swallowed(&mut dedup, StorageTier::Device, ResidencyDomain::Worker),
+            "a SetLike clear must not touch RefCounted state"
+        );
     }
 }

@@ -1611,6 +1611,15 @@ async fn apply_recovery_response(
                         clear_worker(indexer, worker, owner).await?;
                     }
                 }
+                // Snapshots are rank-wide by construction, so a tier-scoped
+                // snapshot means the peer represents state this consumer cannot
+                // reconstruct. Fail before any clear so the recovery cursor does
+                // not advance over state that was never replaced.
+                ResetScope::Tier { tier, domain } => {
+                    anyhow::bail!(
+                        "state-agent recovery returned a tier-scoped snapshot                          (tier {tier:?}, domain {domain:?}); snapshots must be rank-wide"
+                    )
+                }
             }
             for event in events {
                 indexer.try_apply_event(event).await?;

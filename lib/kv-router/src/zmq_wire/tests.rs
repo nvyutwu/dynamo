@@ -9,8 +9,8 @@ use serde::Serialize;
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, PlacementEvent, PlacementOwner, StorageTier, WorkerWithDpRank,
-    compute_block_hash_for_seq,
+    KvCacheEventData, PlacementEvent, PlacementOwner, ResetScope, ResidencyDomain, StorageTier,
+    WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -1523,4 +1523,303 @@ fn test_unrecognized_media_do_not_pollute_cache_namespace_state() {
         panic!("expected BlockStored");
     };
     assert_eq!(cache_namespace.as_deref(), Some("tenant-a"));
+}
+
+// ============================================================================
+// Tier-scoped cache reset (`TierBlocksCleared`)
+// ============================================================================
+
+#[derive(Serialize)]
+struct MapTierClearFixture {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    medium: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ownership: Option<&'static str>,
+}
+
+impl Default for MapTierClearFixture {
+    fn default() -> Self {
+        Self {
+            event_type: "TierBlocksCleared",
+            medium: Some("GPU"),
+            ownership: None,
+        }
+    }
+}
+
+fn convert_tier_clear(event: RawKvEvent, worker: WorkerWithDpRank) -> Option<PlacementEvent> {
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    let raw = normalizer.preprocess(event, worker)?;
+    normalizer.normalize_preprocessed(raw, 1, worker)
+}
+
+#[test]
+fn tier_clear_decodes_from_both_map_and_sequence_encodings() {
+    // vLLM's msgspec structs are tagged maps; other producers use tagged tuples.
+    let from_map: RawKvEvent =
+        from_slice(&to_vec_named(&MapTierClearFixture::default()).unwrap()).unwrap();
+    let from_seq: RawKvEvent = from_slice(&to_vec(&("TierBlocksCleared", "GPU")).unwrap()).unwrap();
+
+    for event in [from_map, from_seq] {
+        match event {
+            RawKvEvent::TierBlocksCleared { medium, ownership } => {
+                assert_eq!(medium, "GPU");
+                assert_eq!(ownership, None);
+            }
+            other => panic!("expected TierBlocksCleared, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn tier_clear_is_a_distinct_variant_from_the_legacy_clear() {
+    let legacy: RawKvEvent = from_slice(&to_vec(&("AllBlocksCleared",)).unwrap()).unwrap();
+    assert!(matches!(legacy, RawKvEvent::AllBlocksCleared { .. }));
+    assert_eq!(legacy.event_type_label(), "cleared");
+    assert_eq!(legacy.medium(), None);
+
+    let scoped: RawKvEvent =
+        from_slice(&to_vec(&("TierBlocksCleared", "CPU", "kvcr")).unwrap()).unwrap();
+    assert!(matches!(scoped, RawKvEvent::TierBlocksCleared { .. }));
+    assert_eq!(scoped.event_type_label(), "tier_cleared");
+    assert_eq!(scoped.medium(), Some("CPU"));
+    assert_eq!(scoped.ownership(), Ok(KvEventOwnership::Kvcr));
+}
+
+#[test]
+fn tier_clear_without_a_readable_medium_is_rejected_not_defaulted() {
+    // A scoped clear with no tier has no meaning. Decoding it as device-scoped,
+    // or as the legacy all-tier clear, would silently change which residency the
+    // reset removes.
+    let missing_map = to_vec_named(&MapTierClearFixture {
+        medium: None,
+        ..Default::default()
+    })
+    .unwrap();
+    let empty_map = to_vec_named(&MapTierClearFixture {
+        medium: Some(""),
+        ..Default::default()
+    })
+    .unwrap();
+    let missing_seq = to_vec(&("TierBlocksCleared",)).unwrap();
+    let empty_seq = to_vec(&("TierBlocksCleared", "")).unwrap();
+
+    for encoded in [missing_map, empty_map, missing_seq, empty_seq] {
+        assert!(
+            from_slice::<RawKvEvent>(&encoded).is_err(),
+            "a tier-scoped clear without a medium must fail to decode"
+        );
+    }
+}
+
+#[test]
+fn unknown_tier_clear_is_filtered_and_never_widened() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    let raw = RawKvEvent::TierBlocksCleared {
+        medium: "FUTURE_TIER".to_string(),
+        ownership: None,
+    };
+
+    assert_eq!(
+        normalizer.preprocess_with_reason(raw.clone(), worker).err(),
+        Some(ZmqEventFilterReason::UnknownMedium),
+        "an unrecognized tier must fail closed at the normalizer"
+    );
+    // The defensive backstop for callers that bypass preprocess must also drop
+    // it rather than emit an all-tier clear.
+    assert!(convert_event(raw, 1, 4, worker, &Arc::new(AtomicU32::new(0)), None, None).is_none());
+}
+
+#[test]
+fn gpu_tier_clear_becomes_a_device_scoped_reset() {
+    let worker = WorkerWithDpRank::new(7, 3);
+    let placement = convert_tier_clear(
+        RawKvEvent::TierBlocksCleared {
+            medium: "GPU".to_string(),
+            ownership: None,
+        },
+        worker,
+    )
+    .expect("a device-scoped clear must be indexed");
+
+    assert_eq!(placement.placement.tier, StorageTier::Device);
+    assert!(placement.is_tier_scoped_reset());
+    assert!(matches!(
+        placement.placement.owner,
+        PlacementOwner::LocalWorker(_)
+    ));
+
+    let router_event = placement.into_router_event().unwrap();
+    assert_eq!(
+        router_event.reset_scope(),
+        Ok(Some(ResetScope::Tier {
+            tier: StorageTier::Device,
+            domain: ResidencyDomain::Worker,
+        }))
+    );
+    assert_eq!(router_event.clear_tier(), Ok(Some(StorageTier::Device)));
+    assert_eq!(router_event.targets_primary(), Ok(true));
+}
+
+#[test]
+fn cpu_tier_clear_becomes_a_host_scoped_reset_that_spares_the_device_tree() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let placement = convert_tier_clear(
+        RawKvEvent::TierBlocksCleared {
+            medium: "CPU".to_string(),
+            ownership: None,
+        },
+        worker,
+    )
+    .expect("a host-scoped clear must be indexed");
+    assert_eq!(placement.placement.tier, StorageTier::HostPinned);
+
+    let router_event = placement.into_router_event().unwrap();
+    assert_eq!(router_event.clear_tier(), Ok(Some(StorageTier::HostPinned)));
+    assert_eq!(
+        router_event.targets_primary(),
+        Ok(false),
+        "a host-tier reset must not reach the device radix tree"
+    );
+}
+
+#[test]
+fn lower_tier_scoped_clear_bypasses_the_group_filter_and_keeps_its_tier() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    for (medium, tier) in [
+        ("STORAGE", StorageTier::Disk),
+        ("DISK", StorageTier::Disk),
+        ("EXTERNAL", StorageTier::External),
+    ] {
+        let placement = convert_tier_clear(
+            RawKvEvent::TierBlocksCleared {
+                medium: medium.to_string(),
+                ownership: None,
+            },
+            worker,
+        )
+        .unwrap_or_else(|| panic!("{medium} scoped clear must be indexed"));
+        assert_eq!(placement.placement.tier, tier);
+        assert_eq!(
+            placement.into_router_event().unwrap().clear_tier(),
+            Ok(Some(tier))
+        );
+    }
+}
+
+#[test]
+fn legacy_clear_still_resolves_to_an_all_tier_reset() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let placement = convert_tier_clear(RawKvEvent::AllBlocksCleared { ownership: None }, worker)
+        .expect("the legacy clear must keep working");
+    assert!(!placement.is_tier_scoped_reset());
+
+    let router_event = placement.into_router_event().unwrap();
+    assert_eq!(
+        router_event.clear_tier(),
+        Ok(None),
+        "a clear with no selector still covers every tier owned by the rank"
+    );
+    assert_eq!(router_event.targets_primary(), Ok(true));
+}
+
+#[test]
+fn tier_scoped_clear_keeps_the_salted_namespace_chain_alive() {
+    // Namespace state is keyed by external block hash, not by tier, and the same
+    // hash can be resident in several tiers at once. Dropping it on a one-tier
+    // reset would break salted continuation for tiers the reset never touched.
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    let salted_store = RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(11)],
+        parent_block_hash: None,
+        token_ids: vec![1, 2, 3, 4],
+        block_size: 4,
+        medium: None,
+        lora_name: None,
+        cache_namespace: Some("tenant-a".to_string()),
+        block_mm_infos: None,
+        is_eagle: Some(false),
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+    };
+    normalizer
+        .preprocess_with_reason(salted_store, worker)
+        .expect("salted store must be accepted");
+
+    normalizer
+        .preprocess_with_reason(
+            RawKvEvent::TierBlocksCleared {
+                medium: "CPU".to_string(),
+                ownership: None,
+            },
+            worker,
+        )
+        .expect("a host-scoped clear must be accepted");
+
+    let child = normalizer
+        .preprocess_with_reason(
+            RawKvEvent::BlockStored {
+                block_hashes: vec![BlockHashValue::Unsigned(12)],
+                parent_block_hash: Some(BlockHashValue::Unsigned(11)),
+                token_ids: vec![5, 6, 7, 8],
+                block_size: 4,
+                medium: None,
+                lora_name: None,
+                cache_namespace: None,
+                block_mm_infos: None,
+                is_eagle: Some(false),
+                group_idx: None,
+                kv_cache_spec_kind: None,
+                kv_cache_spec_sliding_window: None,
+                locality: None,
+                ownership: None,
+            },
+            worker,
+        )
+        .expect("child store must be accepted");
+    match child {
+        RawKvEvent::BlockStored {
+            cache_namespace, ..
+        } => assert_eq!(cache_namespace.as_deref(), Some("tenant-a")),
+        other => panic!("expected BlockStored, got {other:?}"),
+    }
+
+    // The legacy all-tier clear still drops the whole worker's namespace memo.
+    normalizer
+        .preprocess_with_reason(RawKvEvent::AllBlocksCleared { ownership: None }, worker)
+        .expect("legacy clear must be accepted");
+    let orphan = normalizer
+        .preprocess_with_reason(
+            RawKvEvent::BlockStored {
+                block_hashes: vec![BlockHashValue::Unsigned(13)],
+                parent_block_hash: Some(BlockHashValue::Unsigned(11)),
+                token_ids: vec![9, 10, 11, 12],
+                block_size: 4,
+                medium: None,
+                lora_name: None,
+                cache_namespace: None,
+                block_mm_infos: None,
+                is_eagle: Some(false),
+                group_idx: None,
+                kv_cache_spec_kind: None,
+                kv_cache_spec_sliding_window: None,
+                locality: None,
+                ownership: None,
+            },
+            worker,
+        )
+        .expect("store after a full clear must be accepted");
+    match orphan {
+        RawKvEvent::BlockStored {
+            cache_namespace, ..
+        } => assert_eq!(cache_namespace, None),
+        other => panic!("expected BlockStored, got {other:?}"),
+    }
 }

@@ -356,6 +356,9 @@ impl Indexer {
             }
         };
         let is_clear = matches!(&event.event.data, KvCacheEventData::Cleared);
+        // `targets_primary` already resolved the reset scope, so an unreadable
+        // tier took the Err branch above and never reaches a tier index here.
+        let clear_tier = event.clear_tier().unwrap_or(None);
         match self {
             Self::KvIndexer {
                 primary,
@@ -369,7 +372,7 @@ impl Indexer {
                             .await?;
                     }
 
-                    for indexer in lower_tier.all() {
+                    for indexer in clear_target_indexers(lower_tier, clear_tier) {
                         indexer.apply_event_and_wait(event.clone()).await?;
                     }
                 } else if targets_primary {
@@ -394,7 +397,7 @@ impl Indexer {
                         primary.apply_event_and_wait(event.clone()).await?;
                     }
 
-                    for indexer in lower_tier.all() {
+                    for indexer in clear_target_indexers(lower_tier, clear_tier) {
                         indexer.apply_event_and_wait(event.clone()).await?;
                     }
                 } else if targets_primary {
@@ -1492,5 +1495,346 @@ mod tests {
             host_hits, 1,
             "lower-tier should extend the device prefix without double-counting it"
         );
+    }
+
+    // ========================================================================
+    // Tier-scoped cache reset at the frontend indexer
+    // ========================================================================
+
+    fn clear_event(
+        worker_id: u64,
+        dp_rank: u32,
+        event_id: u64,
+        reset_tier: Option<StorageTier>,
+    ) -> RouterEvent {
+        use dynamo_kv_router::protocols::ResidencyDomain;
+        let event = KvCacheEvent {
+            event_id,
+            data: KvCacheEventData::Cleared,
+            dp_rank,
+        };
+        match reset_tier {
+            Some(tier) => {
+                RouterEvent::with_tier_reset(worker_id, event, tier, ResidencyDomain::Worker)
+            }
+            None => RouterEvent::with_storage_tier(worker_id, event, StorageTier::Device),
+        }
+    }
+
+    /// Seed one worker with DUAL residency: the same two-block prefix resident on
+    /// the device and in the host (CPU-offload) pool.
+    ///
+    /// This is the production shape the scoped clear exists for, and it is the
+    /// only shape that can prove retention. The lower tier is a *continuation*
+    /// index, so a host-only tail hanging off a device prefix becomes unreachable
+    /// the moment that device prefix is gone, whatever the reset did to the host
+    /// records. Dual residency gives the host tier its own root edge, so the host
+    /// hit count after a device reset is a direct read of what survived.
+    async fn seed_two_tiers(indexer: &Indexer, worker_id: u64, dp_rank: u32) {
+        for (event_id, tier) in [(1, StorageTier::Device), (2, StorageTier::HostPinned)] {
+            indexer
+                .apply_event(store_event(
+                    worker_id,
+                    dp_rank,
+                    event_id,
+                    &[],
+                    &[11, 12],
+                    tier,
+                ))
+                .await;
+        }
+        flush_indexer(indexer).await;
+    }
+
+    /// `(device overlap, host hits)`. While both tiers hold the prefix the host
+    /// count is 0 -- dual residency must not double count -- so the host copy
+    /// becomes visible only once the device copy is gone.
+    async fn tier_hits(indexer: &Indexer, worker: WorkerWithDpRank) -> (u32, usize) {
+        let matches = indexer
+            .find_matches_by_tier(vec![LocalBlockHash(11), LocalBlockHash(12)])
+            .await
+            .unwrap();
+        let device = matches
+            .device
+            .overlap_scores
+            .scores
+            .get(&worker)
+            .copied()
+            .unwrap_or(0);
+        let host = matches
+            .lower_tier
+            .get(&StorageTier::HostPinned)
+            .and_then(|tier| tier.hits.get(&worker).copied())
+            .unwrap_or(0);
+        (device, host)
+    }
+
+    async fn assert_device_scoped_clear_retains_host_records(indexer: Indexer) {
+        let worker = WorkerWithDpRank::new(7, 0);
+        seed_two_tiers(&indexer, 7, 0).await;
+        assert_eq!(
+            tier_hits(&indexer, worker).await,
+            (2, 0),
+            "seed precondition: device serves the prefix, host is a silent duplicate"
+        );
+
+        indexer
+            .try_apply_event(clear_event(7, 0, 3, Some(StorageTier::Device)))
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        let (device, host) = tier_hits(&indexer, worker).await;
+        assert_eq!(device, 0, "the device tree must be empty after a GPU reset");
+        assert_eq!(
+            host, 2,
+            "host residency the reset never named must survive and become the \
+             reusable source; this is the whole point of the scoped clear. Before \
+             this change the GPU reset dropped these records too."
+        );
+    }
+
+    async fn assert_host_scoped_clear_retains_device_records(indexer: Indexer) {
+        let worker = WorkerWithDpRank::new(7, 0);
+        seed_two_tiers(&indexer, 7, 0).await;
+
+        indexer
+            .try_apply_event(clear_event(7, 0, 3, Some(StorageTier::HostPinned)))
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        let (device, host) = tier_hits(&indexer, worker).await;
+        assert_eq!(device, 2, "a host reset must not touch the device tree");
+        assert_eq!(host, 0, "the host tier must be empty after a host reset");
+
+        // With the host copy gone, a later device reset leaves nothing: the host
+        // reset really removed the record instead of hiding it behind the device
+        // duplicate.
+        indexer
+            .try_apply_event(clear_event(7, 0, 4, Some(StorageTier::Device)))
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+        assert_eq!(tier_hits(&indexer, worker).await, (0, 0));
+    }
+
+    async fn assert_legacy_clear_still_clears_every_tier(indexer: Indexer) {
+        let worker = WorkerWithDpRank::new(7, 0);
+        seed_two_tiers(&indexer, 7, 0).await;
+
+        indexer
+            .try_apply_event(clear_event(7, 0, 3, None))
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        assert_eq!(
+            tier_hits(&indexer, worker).await,
+            (0, 0),
+            "a clear with no selector keeps its all-tier meaning"
+        );
+    }
+
+    async fn assert_scoped_clear_spares_other_ranks(indexer: Indexer) {
+        let cleared = WorkerWithDpRank::new(7, 0);
+        let retained = WorkerWithDpRank::new(7, 1);
+        seed_two_tiers(&indexer, 7, 0).await;
+        seed_two_tiers(&indexer, 7, 1).await;
+
+        indexer
+            .try_apply_event(clear_event(7, 0, 3, Some(StorageTier::Device)))
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        assert_eq!(tier_hits(&indexer, cleared).await, (0, 2));
+        assert_eq!(tier_hits(&indexer, retained).await, (2, 0));
+    }
+
+    async fn assert_unreadable_selector_is_dropped_not_widened(indexer: Indexer) {
+        use dynamo_kv_router::protocols::WireStorageTier;
+        let worker = WorkerWithDpRank::new(7, 0);
+        seed_two_tiers(&indexer, 7, 0).await;
+
+        let mut event = clear_event(7, 0, 3, Some(StorageTier::Device));
+        event.reset_tier = WireStorageTier::Unknown("future_tier".into());
+        indexer.try_apply_event(event).await.unwrap();
+        flush_indexer(&indexer).await;
+
+        assert_eq!(
+            tier_hits(&indexer, worker).await,
+            (2, 0),
+            "an unreadable selector must be recorded and dropped, never widened \
+             into an all-tier clear"
+        );
+    }
+
+    /// Three tiers, one named. The inner per-tier re-check only rejects a
+    /// device-scoped clear that reaches a lower tier, so a host-scoped clear
+    /// landing on the disk index would be applied there. Only the dispatch
+    /// narrowing keeps disk intact, which makes this the test that fails if the
+    /// fan-out regresses to "every allocated lower tier".
+    async fn assert_host_scoped_clear_spares_the_disk_tier(indexer: Indexer) {
+        let worker = WorkerWithDpRank::new(7, 0);
+        for (event_id, tier) in [
+            (1, StorageTier::Device),
+            (2, StorageTier::HostPinned),
+            (3, StorageTier::Disk),
+        ] {
+            indexer
+                .apply_event(store_event(7, 0, event_id, &[], &[11, 12], tier))
+                .await;
+        }
+        flush_indexer(&indexer).await;
+
+        indexer
+            .try_apply_event(clear_event(7, 0, 4, Some(StorageTier::HostPinned)))
+            .await
+            .unwrap();
+        // Remove the device copy so the surviving lower tiers become visible.
+        indexer
+            .try_apply_event(clear_event(7, 0, 5, Some(StorageTier::Device)))
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        let matches = indexer
+            .find_matches_by_tier(vec![LocalBlockHash(11), LocalBlockHash(12)])
+            .await
+            .unwrap();
+        let hits = |tier| {
+            matches
+                .lower_tier
+                .get(&tier)
+                .and_then(|tier| tier.hits.get(&worker).copied())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            hits(StorageTier::HostPinned),
+            0,
+            "the named tier is cleared"
+        );
+        assert_eq!(
+            hits(StorageTier::Disk),
+            2,
+            "a host-scoped clear must not reach the disk index"
+        );
+    }
+
+    async fn assert_scoped_clear_is_idempotent_under_replay(indexer: Indexer) {
+        let worker = WorkerWithDpRank::new(7, 0);
+        seed_two_tiers(&indexer, 7, 0).await;
+
+        for event_id in [3, 3, 4] {
+            indexer
+                .try_apply_event(clear_event(7, 0, event_id, Some(StorageTier::Device)))
+                .await
+                .unwrap();
+        }
+        flush_indexer(&indexer).await;
+        assert_eq!(tier_hits(&indexer, worker).await, (0, 2));
+
+        // A later store on the cleared tier restores it without disturbing host,
+        // which returns to being a silent duplicate.
+        indexer
+            .apply_event(store_event(7, 0, 5, &[], &[11, 12], StorageTier::Device))
+            .await;
+        flush_indexer(&indexer).await;
+        assert_eq!(tier_hits(&indexer, worker).await, (2, 0));
+    }
+
+    #[tokio::test]
+    async fn single_thread_device_scoped_clear_retains_host_records() {
+        assert_device_scoped_clear_retains_host_records(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_device_scoped_clear_retains_host_records() {
+        assert_device_scoped_clear_retains_host_records(make_test_concurrent_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn single_thread_host_scoped_clear_retains_device_records() {
+        assert_host_scoped_clear_retains_device_records(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_host_scoped_clear_retains_device_records() {
+        assert_host_scoped_clear_retains_device_records(make_test_concurrent_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn single_thread_legacy_clear_still_clears_every_tier() {
+        assert_legacy_clear_still_clears_every_tier(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_legacy_clear_still_clears_every_tier() {
+        assert_legacy_clear_still_clears_every_tier(make_test_concurrent_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn single_thread_host_scoped_clear_spares_the_disk_tier() {
+        assert_host_scoped_clear_spares_the_disk_tier(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_host_scoped_clear_spares_the_disk_tier() {
+        assert_host_scoped_clear_spares_the_disk_tier(make_test_concurrent_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn single_thread_scoped_clear_spares_other_ranks() {
+        assert_scoped_clear_spares_other_ranks(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn single_thread_unreadable_selector_is_dropped_not_widened() {
+        assert_unreadable_selector_is_dropped_not_widened(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn single_thread_scoped_clear_is_idempotent_under_replay() {
+        assert_scoped_clear_is_idempotent_under_replay(make_test_indexer()).await;
+    }
+
+    #[test]
+    fn clear_fanout_selects_exactly_one_lower_tier() {
+        let lower_tier = LowerTierIndexers::new(1, 4);
+        let host = lower_tier.get_or_create(StorageTier::HostPinned);
+        let disk = lower_tier.get_or_create(StorageTier::Disk);
+
+        assert_eq!(super::clear_target_indexers(&lower_tier, None).len(), 2);
+        assert!(
+            super::clear_target_indexers(&lower_tier, Some(StorageTier::Device)).is_empty(),
+            "the primary tree owns the device tier"
+        );
+        let host_targets = super::clear_target_indexers(&lower_tier, Some(StorageTier::HostPinned));
+        assert_eq!(host_targets.len(), 1);
+        assert!(Arc::ptr_eq(&host_targets[0], &host));
+        let disk_targets = super::clear_target_indexers(&lower_tier, Some(StorageTier::Disk));
+        assert_eq!(disk_targets.len(), 1);
+        assert!(Arc::ptr_eq(&disk_targets[0], &disk));
+        assert!(
+            super::clear_target_indexers(&lower_tier, Some(StorageTier::External)).is_empty(),
+            "an unseen tier has nothing to clear and must not be materialized"
+        );
+    }
+}
+
+/// Lower-tier indexers a `Cleared` event must reach.
+///
+/// `None` is the legacy all-tier clear. `Some(Device)` is handled by the primary
+/// tree alone, so no lower tier is touched. `Some(other)` selects exactly that
+/// tier, and a tier with no allocated index has nothing to clear.
+fn clear_target_indexers(
+    lower_tier: &LowerTierIndexers,
+    clear_tier: Option<dynamo_kv_router::protocols::StorageTier>,
+) -> Vec<Arc<ThreadPoolIndexer<dynamo_kv_router::indexer::LowerTierIndexer>>> {
+    match clear_tier {
+        None => lower_tier.all(),
+        Some(tier) if tier.is_gpu() => Vec::new(),
+        Some(tier) => lower_tier.get(tier).into_iter().collect(),
     }
 }

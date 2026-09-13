@@ -173,8 +173,34 @@ pub(super) async fn emit(
     event: KvCacheEvent,
     output: &mut Vec<RouterEvent>,
 ) -> bool {
+    emit_with_reset_tier(
+        local_indexer,
+        worker_id,
+        storage_tier,
+        residency_domain,
+        None,
+        event,
+        output,
+    )
+    .await
+}
+
+/// `emit` with an explicit physical reset selector.
+///
+/// `reset_tier` is meaningful only for `Cleared`; `None` keeps the legacy
+/// all-tier clear that every pre-selector consumer already implements.
+pub(super) async fn emit_with_reset_tier(
+    local_indexer: &Option<Arc<LocalKvIndexer>>,
+    worker_id: u64,
+    storage_tier: StorageTier,
+    residency_domain: ResidencyDomain,
+    reset_tier: Option<StorageTier>,
+    event: KvCacheEvent,
+    output: &mut Vec<RouterEvent>,
+) -> bool {
     let router_event =
-        RouterEvent::with_residency_domain(worker_id, event, storage_tier, residency_domain);
+        RouterEvent::with_residency_domain(worker_id, event, storage_tier, residency_domain)
+            .with_optional_reset_tier(reset_tier);
     let applied = match admit_local_event(local_indexer.as_deref(), &router_event).await {
         Ok(()) => true,
         Err(error) => {
@@ -184,4 +210,57 @@ pub(super) async fn emit(
     };
     output.push(router_event);
     applied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clear_event() -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 7,
+            data: KvCacheEventData::Cleared,
+            dp_rank: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_carries_the_reset_selector_onto_the_published_event() {
+        let mut output = Vec::new();
+        assert!(
+            emit_with_reset_tier(
+                &None,
+                11,
+                StorageTier::HostPinned,
+                ResidencyDomain::Worker,
+                Some(StorageTier::HostPinned),
+                clear_event(),
+                &mut output,
+            )
+            .await
+        );
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            output[0].clear_tier(),
+            Ok(Some(StorageTier::HostPinned)),
+            "the frontend cannot narrow a reset it never receives a selector for"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_without_a_selector_publishes_the_legacy_all_tier_clear() {
+        let mut output = Vec::new();
+        assert!(
+            emit(
+                &None,
+                11,
+                StorageTier::Device,
+                ResidencyDomain::Worker,
+                clear_event(),
+                &mut output,
+            )
+            .await
+        );
+        assert_eq!(output[0].clear_tier(), Ok(None));
+    }
 }
