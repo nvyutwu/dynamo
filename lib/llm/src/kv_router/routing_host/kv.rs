@@ -501,6 +501,12 @@ where
                 routing_parts.token_ids.len(),
                 chooser.block_size(),
             );
+            if !is_query_only {
+                record_raw_cache_coverage_metrics(
+                    guard.request_metrics(),
+                    &selection.raw_cache_coverage,
+                );
+            }
             guard
                 .request_metrics()
                 .input_sequence_tokens

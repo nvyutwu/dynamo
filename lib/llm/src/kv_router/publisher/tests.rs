@@ -565,7 +565,10 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_all_blocks_cleared() {
         let kv_block_size = 4;
-        let raw_evt = RawKvEvent::AllBlocksCleared { ownership: None };
+        let raw_evt = RawKvEvent::AllBlocksCleared {
+            medium: None,
+            ownership: None,
+        };
         let out = convert_event(
             raw_evt,
             1,
@@ -578,6 +581,24 @@ mod test_event_processing {
         .unwrap();
         assert!(matches!(out.event.data, KvCacheEventData::Cleared));
         assert_eq!(out.placement.residency_domain, ResidencyDomain::Worker);
+
+        let scoped = convert_event(
+            RawKvEvent::TierBlocksCleared {
+                medium: "GPU".to_string(),
+                ownership: None,
+            },
+            2,
+            kv_block_size,
+            WorkerWithDpRank::from_worker_id(1),
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            scoped.event.data,
+            KvCacheEventData::TierCleared(StorageTier::Device)
+        ));
     }
 
     #[test]
@@ -2087,6 +2108,33 @@ mod test_event_dedup_filter {
     }
 
     #[test]
+    fn gpu_scoped_clear_keeps_cpu_refcounts() {
+        let mut filter = EventDedupFilter::new();
+        filter.track_store(0, StorageTier::Device, &store_data(&[1]));
+        filter.track_store(0, StorageTier::Device, &store_data(&[1]));
+        filter.track_store(0, StorageTier::HostPinned, &store_data(&[1]));
+        filter.track_store(0, StorageTier::HostPinned, &store_data(&[1]));
+
+        filter.clear_rank_domain(
+            0,
+            ResidencyDomain::Worker,
+            Some(StorageTier::Device),
+            EventDedupPolicy::RefCounted,
+        );
+
+        assert!(
+            filter
+                .filter_remove(0, StorageTier::Device, remove_data(&[1]))
+                .is_some()
+        );
+        assert!(
+            filter
+                .filter_remove(0, StorageTier::HostPinned, remove_data(&[1]))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn mixed_blocks_in_single_remove() {
         let mut filter = EventDedupFilter::new();
 
@@ -2447,7 +2495,7 @@ mod event_processor_tests {
         let host_removed = removed_event(5, 51, 1);
         let clear = KvCacheEvent {
             event_id: 7,
-            data: KvCacheEventData::Cleared,
+            data: KvCacheEventData::TierCleared(StorageTier::Device),
             dp_rank: 1,
         };
         tx.send(vec![
@@ -2489,7 +2537,10 @@ mod event_processor_tests {
         assert_eq!(events[3].storage_tier, StorageTier::Device);
         assert_eq!(events[4].storage_tier, StorageTier::HostPinned);
         assert_eq!(events[5].storage_tier, StorageTier::Disk);
-        assert!(matches!(events[6].event.data, KvCacheEventData::Cleared));
+        assert!(matches!(
+            events[6].event.data,
+            KvCacheEventData::TierCleared(StorageTier::Device)
+        ));
         assert!(
             events
                 .iter()
@@ -3920,6 +3971,17 @@ mod event_plane_batch_tests {
         )
     }
 
+    fn tier_cleared_router_event(event_id: u64) -> RouterEvent {
+        RouterEvent::new(
+            7,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::TierCleared(StorageTier::Device),
+                dp_rank: (event_id % 2) as u32,
+            },
+        )
+    }
+
     #[test]
     fn production_event_plane_batches_fit_default_nats_payload() {
         const NATS_DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -3976,6 +4038,20 @@ mod event_plane_batch_tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0], &events[..3]);
         assert_eq!(batches[1], &events[3..]);
+    }
+
+    #[test]
+    fn event_plane_batching_isolates_scoped_clear_from_legacy_readers() {
+        let events = vec![
+            stored_router_event(1, 1),
+            tier_cleared_router_event(2),
+            removed_router_event(3, 1),
+        ];
+
+        let batches =
+            event_plane_event_batches(&events, usize::MAX, usize::MAX).collect::<Vec<_>>();
+
+        assert_eq!(batches, vec![&events[..1], &events[1..2], &events[2..]]);
     }
 
     #[test]

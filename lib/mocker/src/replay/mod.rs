@@ -16,6 +16,33 @@ use dynamo_kv_router::PrefillLoadEstimator;
 
 /// Backward-compatible Dynamo Mocker name for [`aisimulate_core::ReplayReport`].
 pub use aisimulate_core::ReplayReport as TraceSimulationReport;
+
+/// Serialize the online replay report at the Python result boundary.
+/// Kept separate from the offline report, whose evidence has different semantics.
+pub fn online_replay_report(report: &TraceSimulationReport) -> impl serde::Serialize + '_ {
+    #[derive(serde::Serialize)]
+    struct OnlineReport<'a> {
+        #[serde(flatten)]
+        report: &'a TraceSimulationReport,
+        raw_cache_coverage_capability: RawCacheCoverageCapability,
+    }
+    #[derive(serde::Serialize)]
+    struct RawCacheCoverageCapability {
+        supported: bool,
+        reason: &'static str,
+    }
+    // Online replay indexes GPU events and feeds effective overlap to its
+    // legacy scheduler adapter. It has no coherent raw two-tier evidence;
+    // never turn those estimates into observed-zero R/E/S.
+    OnlineReport {
+        report,
+        raw_cache_coverage_capability: RawCacheCoverageCapability {
+            supported: false,
+            reason: "gpu_only_effective_replay",
+        },
+    }
+}
+
 pub(crate) use aisimulate_core::replay::TraceCollector;
 pub use aisimulate_core::replay::{
     CanonicalReplayCoverage, CanonicalReplayRecord, LifecycleOperation, OfflineRuntimeEvidence,

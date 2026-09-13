@@ -275,7 +275,9 @@ impl LocalKvIndexer {
     ///   plus the buffered `last_event_id`. If the buffered suffix contains an all-domain
     ///   `Cleared` event, events before the last such clear may be omitted because it supersedes
     ///   every residency owned by this rank publisher.
-    /// - `TreeDump`: Full tree dump with synthetic IDs and the worker's latest real event ID (when range is too old or unspecified)
+    /// - `TreeDump`: Full tree dump with synthetic IDs and the worker's latest real event ID when
+    ///   the range is too old or unspecified, or when the suffix contains `TierCleared` that an
+    ///   older recovery client cannot decode.
     /// - `TooNew`: Error when requested range is newer than available data
     /// - `InvalidRange`: Error when end_id < start_id
     pub async fn get_events_in_id_range(
@@ -296,6 +298,7 @@ impl LocalKvIndexer {
     /// - start_id is Some (not a full dump request)
     /// - buffer is not empty
     /// - start_id is within or after the buffer range
+    /// - the applicable suffix has no tier-scoped clear requiring a compatible dump
     ///
     /// Note: This is a heuristic - the buffer state may change between this check
     /// and the actual query, so a tree dump may still occur even if this returns true.
@@ -310,7 +313,19 @@ impl LocalKvIndexer {
         }
 
         let first_buffered = buffer.front().unwrap().event.event_id;
-        start_id.unwrap() >= first_buffered
+        let start_id = start_id.unwrap();
+        if start_id < first_buffered {
+            return false;
+        }
+        let start_idx = match buffer.binary_search_by_key(&start_id, |event| event.event.event_id) {
+            Ok(idx) => idx,
+            Err(insertion_point) => insertion_point,
+        };
+        let response_start_idx = Self::buffer_response_start_idx(&buffer, start_idx);
+        !buffer
+            .iter()
+            .skip(response_start_idx)
+            .any(|event| matches!(event.event.data, KvCacheEventData::TierCleared(_)))
     }
 
     /// Newest locally applied outbound event cursor.
@@ -369,7 +384,10 @@ impl LocalKvIndexer {
         result: Result<(), KvRouterError>,
     ) -> Result<(), KvRouterError> {
         if result.is_ok() {
-            let should_invalidate = matches!(event.event.data, KvCacheEventData::Cleared);
+            let should_invalidate = matches!(
+                event.event.data,
+                KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+            );
             let detected_gap = self.record_event(event);
             if should_invalidate || detected_gap {
                 self.recovery_cache.invalidate().await;
@@ -451,6 +469,20 @@ impl LocalKvIndexer {
             Err(insertion_point) => insertion_point,
         };
         let response_start_idx = Self::buffer_response_start_idx(&buffer, start_idx);
+        if buffer
+            .iter()
+            .skip(response_start_idx)
+            .any(|event| matches!(event.event.data, KvCacheEventData::TierCleared(_)))
+        {
+            tracing::debug!(
+                start_id,
+                end_id,
+                "Scoped clear in recovery suffix; using an old-compatible tree dump"
+            );
+            return DumpPlan::RequiresDump {
+                last_event_id: last_buffered,
+            };
+        }
         let events = buffer.iter().skip(response_start_idx).cloned().collect();
 
         DumpPlan::Immediate(WorkerKvQueryResponse::Events {
@@ -747,12 +779,17 @@ impl LocalKvIndexer {
                 return Ok(());
             }
         };
-        if matches!(&event.event.data, KvCacheEventData::Cleared) {
+        if matches!(
+            &event.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        ) {
             if targets_primary {
                 self.indexer.apply_event_and_wait(event.clone()).await?;
             }
-            for indexer in self.all_lower_tier_indexers() {
-                indexer.apply_event_and_wait(event.clone()).await?;
+            for (tier, indexer) in self.all_lower_tier_indexers() {
+                if event.targets_lower_tier(tier).unwrap_or(false) {
+                    indexer.apply_event_and_wait(event.clone()).await?;
+                }
             }
             Ok(())
         } else if targets_primary {
@@ -781,9 +818,14 @@ impl LocalKvIndexer {
             .clone()
     }
 
-    fn all_lower_tier_indexers(&self) -> Vec<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
+    fn all_lower_tier_indexers(
+        &self,
+    ) -> Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)> {
         let indexers = self.lower_tier_indexers.lock().unwrap();
-        indexers.values().cloned().collect()
+        indexers
+            .iter()
+            .map(|(tier, indexer)| (*tier, indexer.clone()))
+            .collect()
     }
 }
 
@@ -815,14 +857,14 @@ impl KvIndexerInterface for LocalKvIndexer {
     }
 
     async fn remove_worker(&self, worker: WorkerId) {
-        for indexer in self.all_lower_tier_indexers() {
+        for (_, indexer) in self.all_lower_tier_indexers() {
             indexer.remove_worker(worker).await;
         }
         let _ = self.indexer.remove_worker_sender().send(worker).await;
     }
 
     async fn remove_worker_dp_rank(&self, worker: WorkerId, dp_rank: DpRank) {
-        for indexer in self.all_lower_tier_indexers() {
+        for (_, indexer) in self.all_lower_tier_indexers() {
             KvIndexerInterface::remove_worker_dp_rank(&*indexer, worker, dp_rank).await;
         }
         KvIndexerInterface::remove_worker_dp_rank(&self.indexer, worker, dp_rank).await;
@@ -850,7 +892,7 @@ impl KvIndexerInterface for LocalKvIndexer {
 
     async fn flush(&self) -> usize {
         let queued = self.indexer.flush().await;
-        for indexer in self.all_lower_tier_indexers() {
+        for (_, indexer) in self.all_lower_tier_indexers() {
             let _ = indexer.flush_and_wait().await;
         }
         queued
@@ -1026,6 +1068,71 @@ mod tests {
             .await
             .unwrap();
         assert!(overlap.scores.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gpu_scoped_clear_preserves_cpu_but_legacy_clear_removes_it() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+        indexer
+            .apply_event_with_buffer(lower_tier_store_event(
+                7,
+                0,
+                1,
+                900,
+                11,
+                101,
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+
+        let clear = RouterEvent::with_residency_domain(
+            7,
+            KvCacheEvent {
+                event_id: 2,
+                data: KvCacheEventData::TierCleared(StorageTier::Device),
+                dp_rank: 0,
+            },
+            StorageTier::Device,
+            ResidencyDomain::Worker,
+        );
+        indexer
+            .apply_event_with_buffer(clear.clone())
+            .await
+            .unwrap();
+        assert!(!indexer.likely_served_from_buffer(Some(2)));
+        assert_eq!(
+            lower_tier_hits(&indexer, StorageTier::HostPinned, 7, 0, 900, 11),
+            1
+        );
+        let WorkerKvQueryResponse::TreeDump {
+            events,
+            last_event_id,
+            reset_scope,
+        } = indexer.get_events_in_id_range(Some(2), Some(2)).await
+        else {
+            panic!("scoped clear recovery must fall back to an old-compatible tree dump");
+        };
+        assert_eq!(last_event_id, 2);
+        assert_eq!(reset_scope, ResetScope::All);
+        assert!(events.iter().any(|event| {
+            event.storage_tier == StorageTier::HostPinned
+                && matches!(event.event.data, KvCacheEventData::Stored(_))
+        }));
+
+        let mut legacy_clear = clear;
+        legacy_clear.event.event_id = 3;
+        legacy_clear.event.data = KvCacheEventData::Cleared;
+        indexer.apply_event_with_buffer(legacy_clear).await.unwrap();
+        assert_eq!(
+            lower_tier_hits(&indexer, StorageTier::HostPinned, 7, 0, 900, 11),
+            0
+        );
     }
 
     #[tokio::test]

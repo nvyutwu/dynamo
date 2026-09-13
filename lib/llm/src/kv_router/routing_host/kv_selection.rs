@@ -43,6 +43,7 @@ pub(super) struct WorkerSelection {
     pub(super) eligible_oracle_worker: Option<WorkerWithDpRank>,
     pub(super) eligible_oracle_tiers:
         dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
+    pub(super) raw_cache_coverage: dynamo_kv_router::scheduling::RawCacheCoverage,
     pub(super) selected_worker_tiers:
         dynamo_kv_router::scheduling::overlap::SelectedWorkerTierSnapshot,
 
@@ -150,6 +151,7 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    raw_cache_coverage,
                     score_decision,
                     decision_explanation,
                     selected_worker_tiers,
@@ -167,6 +169,7 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    raw_cache_coverage,
                     score_decision,
                     decision_explanation,
                     selected_worker_tiers,
@@ -190,6 +193,7 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    raw_cache_coverage,
                     score_decision,
                     decision_explanation,
                     selected_worker_tiers,
@@ -207,6 +211,7 @@ where
                     resident_oracle_cached_tokens,
                     eligible_oracle_worker,
                     eligible_oracle_tiers,
+                    raw_cache_coverage,
                     score_decision,
                     decision_explanation,
                     selected_worker_tiers,

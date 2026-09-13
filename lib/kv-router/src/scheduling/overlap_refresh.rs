@@ -70,6 +70,7 @@ pub struct TieredOverlapRefresher<P> {
     provider: P,
     config: KvRouterConfig,
     block_size: u32,
+    raw_cache_coverage_supported: bool,
 }
 
 impl<P> TieredOverlapRefresher<P> {
@@ -78,7 +79,13 @@ impl<P> TieredOverlapRefresher<P> {
             provider,
             config,
             block_size,
+            raw_cache_coverage_supported: true,
         }
+    }
+
+    pub fn with_raw_cache_coverage_supported(mut self, supported: bool) -> Self {
+        self.raw_cache_coverage_supported = supported;
+        self
     }
 }
 
@@ -108,7 +115,10 @@ impl<P: TieredMatchProvider> OverlapScoresRefresh for TieredOverlapRefresher<P> 
                 return None;
             }
         };
-        let overlap = OverlapAnalysis::new(&self.config, self.block_size, &tiered).signals();
+        let mut overlap = OverlapAnalysis::new(&self.config, self.block_size, &tiered).signals();
+        if !self.raw_cache_coverage_supported {
+            overlap.raw_index_state = super::RawIndexState::Missing;
+        }
         let kv_transfer_candidates = retain_kv_transfer_chain
             .then(|| tiered.kv_transfer_candidates().cloned())
             .flatten();
@@ -276,6 +286,7 @@ mod tests {
         ) -> Option<RefreshedOverlap> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Some(RefreshedOverlap::from_overlap(OverlapSignals {
+                raw_index_state: crate::scheduling::RawIndexState::Missing,
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::new(),
                 effective_cached_tokens: HashMap::new(),
@@ -325,6 +336,38 @@ mod tests {
             .is_none()
         );
         assert_eq!(refresher.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raw_refresh_capability_never_promotes_unsupported_provider() {
+        for supported in [false, true] {
+            let refresher = TieredOverlapRefresher::new(
+                FakeProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail: false,
+                },
+                KvRouterConfig::default(),
+                16,
+            )
+            .with_raw_cache_coverage_supported(supported);
+            let refreshed = refresher
+                .refresh(&[LocalBlockHash(1)], false)
+                .await
+                .expect("query");
+            assert_eq!(
+                refreshed.overlap.raw_index_state,
+                if supported {
+                    super::super::RawIndexState::Observed
+                } else {
+                    super::super::RawIndexState::Missing
+                }
+            );
+            // The capability changes observation quality, never effective routing scores.
+            assert_eq!(
+                refreshed.overlap.effective_cached_tokens[&WorkerWithDpRank::new(4, 0)],
+                32
+            );
+        }
     }
 
     #[tokio::test]

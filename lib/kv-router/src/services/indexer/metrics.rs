@@ -30,6 +30,8 @@ const MODELS: &str = "models";
 const WORKERS: &str = "workers";
 #[cfg(feature = "metrics")]
 const LISTENERS: &str = "listeners";
+#[cfg(feature = "metrics")]
+const DROPPED_BATCHES_TOTAL: &str = "dropped_batches_total";
 
 #[cfg(feature = "metrics")]
 pub struct StandaloneIndexerMetrics {
@@ -39,6 +41,7 @@ pub struct StandaloneIndexerMetrics {
     pub models: IntGauge,
     pub workers: IntGauge,
     pub listeners: IntGaugeVec,
+    pub dropped_batches_total: IntCounterVec,
 }
 
 #[cfg(feature = "metrics")]
@@ -86,17 +89,29 @@ static METRICS: LazyLock<StandaloneIndexerMetrics> = LazyLock::new(|| Standalone
         &["status"],
     )
     .expect("valid gauge"),
+    dropped_batches_total: IntCounterVec::new(
+        Opts::new(
+            format!("{METRICS_PREFIX}_{DROPPED_BATCHES_TOTAL}"),
+            "ZMQ event batches dropped before indexing",
+        ),
+        &["reason"],
+    )
+    .expect("valid counter"),
 });
 
 #[cfg(feature = "metrics")]
 pub fn register(registry: &prometheus::Registry) -> Result<(), prometheus::Error> {
     let m = &*METRICS;
+    // Materialize the only bounded reason so a healthy zero is exported and
+    // dashboard/alert consumers never have to infer zero from an absent family.
+    m.dropped_batches_total.with_label_values(&["decode_error"]);
     registry.register(Box::new(m.request_duration.clone()))?;
     registry.register(Box::new(m.requests_total.clone()))?;
     registry.register(Box::new(m.errors_total.clone()))?;
     registry.register(Box::new(m.models.clone()))?;
     registry.register(Box::new(m.workers.clone()))?;
     registry.register(Box::new(m.listeners.clone()))?;
+    registry.register(Box::new(m.dropped_batches_total.clone()))?;
     Ok(())
 }
 
@@ -144,6 +159,25 @@ pub fn set_worker_state(models: usize, workers: usize, listener_counts: [i64; 4]
 #[cfg(not(feature = "metrics"))]
 pub fn set_worker_state(_models: usize, _workers: usize, _listener_counts: [i64; 4]) {}
 
+#[cfg(feature = "metrics")]
+pub fn increment_decode_failed_batch() {
+    METRICS
+        .dropped_batches_total
+        .with_label_values(&["decode_error"])
+        .inc();
+}
+
+#[cfg(not(feature = "metrics"))]
+pub fn increment_decode_failed_batch() {}
+
+#[cfg(all(test, feature = "metrics"))]
+pub fn decode_failed_batches_for_test() -> u64 {
+    METRICS
+        .dropped_batches_total
+        .with_label_values(&["decode_error"])
+        .get()
+}
+
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;
@@ -180,5 +214,6 @@ mod tests {
         assert!(output.contains("dynamo_kvindexer_workers 2"));
         assert!(output.contains("dynamo_kvindexer_listeners{status=\"pending\"} 1"));
         assert!(output.contains("dynamo_kvindexer_listeners{status=\"active\"} 1"));
+        assert!(output.contains("dynamo_kvindexer_dropped_batches_total"));
     }
 }

@@ -420,7 +420,9 @@ pub(crate) fn prepare_scaled_benchmark(
                     totals.removed_events += 1;
                     totals.removed_blocks += remove.block_hashes.len();
                 }
-                KvCacheEventData::Cleared => totals.cleared_events += 1,
+                KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
+                    totals.cleared_events += 1
+                }
             },
         }
     }

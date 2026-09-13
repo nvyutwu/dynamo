@@ -160,12 +160,24 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared {
+                medium: normalize_medium(medium.unwrap_or(None)),
+                ownership: ownership.unwrap_or(None),
+            }),
+            Some("TierBlocksCleared") => Ok(RawKvEvent::TierBlocksCleared {
+                medium: normalize_medium(medium.unwrap_or(None))
+                    .ok_or_else(|| de::Error::missing_field("medium"))?,
                 ownership: ownership.unwrap_or(None),
             }),
             Some("Ignored") => Ok(RawKvEvent::Ignored),
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -268,9 +280,25 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             "AllBlocksCleared" => {
+                // The legacy positional schema owns slot 1 as `ownership`.
+                // A later field may only be appended, so its value must never
+                // change how the ownership slot is interpreted. In particular,
+                // unsupported ownership strings such as `GPU` and `CPU` must
+                // remain ownership rather than being guessed to be a medium.
+                let ownership: Option<String> = seq.next_element()?.unwrap_or(None);
+                let medium: Option<String> = normalize_medium(seq.next_element()?.unwrap_or(None));
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::AllBlocksCleared { medium, ownership })
+            }
+            "TierBlocksCleared" => {
+                let medium: Option<String> = seq.next_element()?.unwrap_or(None);
                 let ownership: Option<String> = seq.next_element()?.unwrap_or(None);
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(RawKvEvent::AllBlocksCleared { ownership })
+                Ok(RawKvEvent::TierBlocksCleared {
+                    medium: normalize_medium(medium)
+                        .ok_or_else(|| de::Error::missing_field("medium"))?,
+                    ownership,
+                })
             }
             "Ignored" => {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -278,7 +306,13 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
             }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
         }
     }

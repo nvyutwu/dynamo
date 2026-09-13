@@ -19,6 +19,15 @@ use crate::services::common::zmq::{
 };
 
 const WATERMARK_UNSET: u64 = u64::MAX;
+const DROP_REASON_DECODE_ERROR: &str = "decode_error";
+
+fn decode_event_batch_observed(
+    payload: &[u8],
+) -> Result<crate::zmq_wire::KvEventBatch, rmp_serde::decode::Error> {
+    decode_event_batch(payload).inspect_err(|_| {
+        super::metrics::increment_decode_failed_batch();
+    })
+}
 
 fn cursor_from_watermark(watermark: u64) -> CursorState {
     if watermark == WATERMARK_UNSET {
@@ -259,8 +268,14 @@ impl ListenerLoop {
             }
             let seq = u64::from_be_bytes(seq_bytes[..8].try_into().expect("length checked above"));
 
-            let Ok(batch) = decode_event_batch(payload) else {
-                tracing::warn!(worker_id, dp_rank, seq, "Failed to decode replayed batch");
+            let Ok(batch) = decode_event_batch_observed(payload) else {
+                tracing::warn!(
+                    worker_id,
+                    dp_rank,
+                    seq,
+                    reason = DROP_REASON_DECODE_ERROR,
+                    "Failed to decode replayed batch"
+                );
                 continue;
             };
 
@@ -328,12 +343,14 @@ impl ListenerLoop {
     }
 
     async fn apply_live_batch(&mut self, seq: u64, payload: &[u8]) -> Result<(), String> {
-        let batch = match decode_event_batch(payload) {
+        let batch = match decode_event_batch_observed(payload) {
             Ok(batch) => batch,
             Err(error) => {
                 tracing::warn!(
                     self.worker_id,
                     self.dp_rank,
+                    seq,
+                    reason = DROP_REASON_DECODE_ERROR,
                     "Failed to decode KvEventBatch: {error}"
                 );
                 return Ok(());
@@ -553,5 +570,37 @@ async fn connect_replay_socket(
             );
             None
         }
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use rmp_serde::to_vec;
+
+    use super::*;
+
+    #[test]
+    fn decode_failure_counts_one_dropped_batch_and_valid_batch_counts_none() {
+        let before = super::super::metrics::decode_failed_batches_for_test();
+
+        let valid = to_vec(&(
+            0.0_f64,
+            Vec::<crate::zmq_wire::RawKvEvent>::new(),
+            None::<i32>,
+        ))
+        .expect("encode valid empty batch");
+        decode_event_batch_observed(&valid).expect("valid batch must decode");
+        assert_eq!(
+            super::super::metrics::decode_failed_batches_for_test(),
+            before,
+            "valid batches must not increment the dropped-batch counter"
+        );
+
+        assert!(decode_event_batch_observed(&[0xc1]).is_err());
+        assert_eq!(
+            super::super::metrics::decode_failed_batches_for_test(),
+            before + 1,
+            "one decode failure must increment exactly once"
+        );
     }
 }

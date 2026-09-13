@@ -1453,7 +1453,7 @@ fn event_payload_weight(event: &RouterEvent) -> usize {
     match &event.event.data {
         KvCacheEventData::Stored(store) => store.blocks.len().max(1),
         KvCacheEventData::Removed(remove) => remove.block_hashes.len().max(1),
-        KvCacheEventData::Cleared => 1,
+        KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => 1,
     }
 }
 

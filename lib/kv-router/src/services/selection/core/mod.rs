@@ -454,11 +454,14 @@ impl SelectionCore {
                 let indexer = self
                     .indexer_registry
                     .get_or_create_indexer(key.clone(), block_size);
-                let overlap_refresh = Arc::new(TieredOverlapRefresher::new(
-                    indexer.clone(),
-                    self.kv_router_config.clone(),
-                    block_size,
-                ));
+                let overlap_refresh = Arc::new(
+                    TieredOverlapRefresher::new(
+                        indexer.clone(),
+                        self.kv_router_config.clone(),
+                        block_size,
+                    )
+                    .with_raw_cache_coverage_supported(indexer.supports_raw_cache_coverage()),
+                );
                 let selector = self.worker_selection_policy_factory.as_ref().map_or_else(
                     || WorkerSelectionPolicy::default(self.kv_router_config.clone(), worker_label),
                     |factory| factory(&self.kv_router_config, self.worker_type, key.as_ref()),
@@ -1184,8 +1187,17 @@ impl SelectionCore {
                 .await
                 .map_err(|error| SelectionError::Internal(error.to_string()))?
         };
-        let overlap =
+        let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, entry.block_size, &tiered).signals();
+        // A positive sub-block prompt has a known zero full-block overlap.
+        // An empty prompt or omitted hashes for a full block is still unknown.
+        if !entry.indexer.supports_raw_cache_coverage()
+            || normalized.isl_tokens == 0
+            || (normalized.block_hashes.is_empty()
+                && normalized.isl_tokens >= entry.block_size as usize)
+        {
+            overlap.raw_index_state = crate::scheduling::RawIndexState::Missing;
+        }
         drop(tiered);
         Ok(PreparedSelectionInputs {
             block_hashes: normalized.block_hashes,
@@ -1337,6 +1349,111 @@ mod tests {
             SelectionError::NotReady(message)
                 if message == "selection service is shutting down"
         ));
+    }
+
+    #[tokio::test]
+    async fn raw_subblock_prompt_is_observed_zero_in_selection_service() {
+        for threads in [1, 2] {
+            let core = SelectionCore::try_new_local(
+                test_config(false),
+                threads,
+                CancellationToken::new(),
+                SelectionCacheConfig::default(),
+            )
+            .expect("valid config");
+            core.upsert_worker(worker(1)).await.expect("worker");
+            let entry = core
+                .entry(&RoutingPartitionId::new("model", "default"))
+                .expect("entry");
+            let mut input = prompt();
+            input.token_ids = Some(vec![1, 2, 3]);
+            let prepared = core
+                .prepare_selection_inputs(&entry, &input, true)
+                .await
+                .expect("prepared");
+            assert!(prepared.block_hashes.is_empty());
+            assert_eq!(prepared.isl_tokens, 3);
+            assert_eq!(
+                prepared.overlap.raw_index_state,
+                crate::scheduling::RawIndexState::Observed
+            );
+            let response = entry
+                .scheduler
+                .schedule_request(ScheduleRequest {
+                    mode: ScheduleMode::QueryOnly { request_id: None },
+                    token_seq: Some(prepared.sequence_hashes),
+                    block_hashes: Some(prepared.block_hashes),
+                    isl_tokens: prepared.isl_tokens,
+                    overlap: prepared.overlap,
+                    kv_transfer_candidates: None,
+                    retain_kv_transfer_chain: false,
+                    router_config_override: None,
+                    lora_name: None,
+                    priority_jump: 0.0,
+                    strict_priority: 0,
+                    policy_class: None,
+                    session_context: None,
+                    expected_output_tokens: None,
+                    affinity_target: None,
+                    pinned_worker: None,
+                    allowed_worker_ids: None,
+                    routing_constraints: RoutingConstraints::default(),
+                    shared_cache_hits: None,
+                })
+                .await
+                .expect("schedule");
+            let raw = response.raw_cache_coverage;
+            assert_eq!(
+                raw.observation,
+                crate::scheduling::RawCacheObservation::Complete
+            );
+            assert_eq!(raw.input_tokens, 3);
+            for candidate in [raw.resident, raw.eligible, raw.selected] {
+                let candidate = candidate.expect("observed candidate");
+                assert_eq!(candidate.worker_id, 1);
+                assert_eq!(candidate.dp_rank, 0);
+                assert_eq!(candidate.total_tokens, 0);
+            }
+            core.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_empty_or_missing_full_block_prompt_stays_unknown() {
+        let core = SelectionCore::try_new_local(
+            test_config(false),
+            1,
+            CancellationToken::new(),
+            SelectionCacheConfig::default(),
+        )
+        .expect("valid config");
+        core.upsert_worker(worker(1)).await.expect("worker");
+        let entry = core
+            .entry(&RoutingPartitionId::new("model", "default"))
+            .expect("entry");
+        let mut input = prompt();
+        input.token_ids = Some(vec![]);
+        let empty = core
+            .prepare_selection_inputs(&entry, &input, true)
+            .await
+            .expect("empty");
+        assert_eq!(
+            empty.overlap.raw_index_state,
+            crate::scheduling::RawIndexState::Missing
+        );
+        input.token_ids = None;
+        input.block_hashes = Some(vec![]);
+        input.sequence_hashes = Some(vec![]);
+        input.isl_tokens = Some(4);
+        let missing = core
+            .prepare_selection_inputs(&entry, &input, true)
+            .await
+            .expect("missing hashes");
+        assert_eq!(
+            missing.overlap.raw_index_state,
+            crate::scheduling::RawIndexState::Missing
+        );
+        core.shutdown();
     }
 
     #[test]

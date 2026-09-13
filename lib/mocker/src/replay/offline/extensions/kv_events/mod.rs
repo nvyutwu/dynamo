@@ -80,7 +80,8 @@ impl ReplayEngineObservation for RouterEventObservation {
                     store.blocks.as_slice()
                 }
                 dynamo_kv_router::protocols::KvCacheEventData::Removed(_)
-                | dynamo_kv_router::protocols::KvCacheEventData::Cleared => &[],
+                | dynamo_kv_router::protocols::KvCacheEventData::Cleared
+                | dynamo_kv_router::protocols::KvCacheEventData::TierCleared(_) => &[],
             })
             .map(|block| block.tokens_hash.0)
             .collect()
@@ -149,6 +150,10 @@ fn encode_events(
                 }
             }
             KvCacheEventData::Cleared => encoder.begin_kind(2, "cleared"),
+            KvCacheEventData::TierCleared(tier) => {
+                encoder.begin_kind(3, "tier_cleared");
+                encoder.put_u8(storage_tier_identity(*tier).0);
+            }
         }
     }
     Ok(())
@@ -247,4 +252,195 @@ pub(in crate::replay) fn generate_trace_worker_artifacts_with_visibility(
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use aisimulate_core::replay::{
+        AggregatedRoundRobinPlacement, NoReplayMetadata, PoolRoundRobinPlacement,
+        ReplayCaptureOptions, ReplayComposition, WorkerTopology,
+    };
+    use anyhow::Result;
+    use dynamo_kv_router::protocols::{KvCacheEvent, KvCacheEventData};
+
+    use super::*;
+    use crate::loadgen::{SessionTrace, TurnTrace};
+
+    const BROAD_CLEAR: u8 = 0;
+    const DEVICE_CLEAR: u8 = 1;
+    const HOST_CLEAR: u8 = 2;
+
+    #[derive(Debug, Default)]
+    struct ClearObservation<const MODE: u8>;
+
+    impl<const MODE: u8> ReplayEngineObservation for ClearObservation<MODE> {
+        type Batch = RouterEventBatch;
+
+        const CAPTURE_ENGINE_KV_EVENTS: bool = true;
+
+        fn observe_engine_events(
+            _stage: WorkerStage,
+            worker_id: usize,
+            dp_rank: u32,
+            events: Vec<KvEvent>,
+        ) -> Self::Batch {
+            let worker_id = u64::try_from(worker_id).unwrap();
+            RouterEventBatch(
+                events
+                    .into_iter()
+                    .map(|event| {
+                        let data = match MODE {
+                            BROAD_CLEAR => KvCacheEventData::Cleared,
+                            DEVICE_CLEAR => KvCacheEventData::TierCleared(StorageTier::Device),
+                            HOST_CLEAR => KvCacheEventData::TierCleared(StorageTier::HostPinned),
+                            _ => unreachable!("unsupported test clear mode"),
+                        };
+                        RouterEvent::with_storage_tier(
+                            worker_id,
+                            KvCacheEvent {
+                                event_id: event.event_id,
+                                data,
+                                dp_rank,
+                            },
+                            StorageTier::Device,
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        fn kv_ingest_event_count(batch: &Self::Batch) -> Option<usize> {
+            Some(batch.0.len())
+        }
+
+        fn encode_kv_ingest(
+            batch: &Self::Batch,
+            encoder: &mut KvIngestEventEncoder<'_>,
+        ) -> anyhow::Result<()> {
+            encode_events(encoder, &batch.0)
+        }
+    }
+
+    struct ClearComposition<const MODE: u8>;
+
+    impl<const MODE: u8> ReplayComposition for ClearComposition<MODE> {
+        type Metadata = NoReplayMetadata;
+        type Observation = ClearObservation<MODE>;
+        type AggregatedPlacement = AggregatedRoundRobinPlacement<RouterEventBatch>;
+        type DisaggregatedPlacement = PoolRoundRobinPlacement<RouterEventBatch>;
+
+        fn create_aggregated_placement(
+            &mut self,
+            dp_size: u32,
+            topology: Vec<WorkerTopology>,
+        ) -> Result<Self::AggregatedPlacement> {
+            Ok(AggregatedRoundRobinPlacement::new(dp_size, topology))
+        }
+
+        fn create_disaggregated_placements(
+            &mut self,
+            _prefill_dp_size: u32,
+            prefill_topology: Vec<WorkerTopology>,
+            _decode_dp_size: u32,
+            decode_topology: Vec<WorkerTopology>,
+        ) -> Result<(Self::DisaggregatedPlacement, Self::DisaggregatedPlacement)> {
+            Ok((
+                PoolRoundRobinPlacement::new(prefill_topology),
+                PoolRoundRobinPlacement::new(decode_topology),
+            ))
+        }
+    }
+
+    fn clear_evidence<const MODE: u8>() -> aisimulate_core::replay::KvIngestEvidence {
+        let args = MockEngineArgs::builder()
+            .block_size(4)
+            .num_gpu_blocks(128)
+            .max_num_batched_tokens(Some(64))
+            .max_num_seqs(Some(8))
+            .speedup_ratio(1000.0)
+            .build()
+            .unwrap();
+        let (engine, factory) = crate::engine_adapter::aggregated_replay_setup(&args).unwrap();
+        let trace = Trace {
+            block_size: 4,
+            sessions: vec![SessionTrace {
+                session_id: "clear-evidence".to_string(),
+                first_arrival_timestamp_ms: Some(0.0),
+                turns: vec![TurnTrace {
+                    input_length: 4,
+                    max_output_tokens: 1,
+                    hash_ids: vec![1],
+                    ..Default::default()
+                }],
+            }],
+        };
+        let driver = trace.into_trace_driver_with_block_size(4).unwrap();
+        let spec = ReplaySpec {
+            version: CURRENT_REPLAY_SPEC_VERSION,
+            topology: ReplayTopology::Aggregated {
+                workers: WorkerPoolSpec::default(),
+            },
+            engine: serde_json::to_value(engine).unwrap(),
+            adapters: ReplayAdapters {
+                placement: ProviderSpec::round_robin(),
+                scaling: ProviderSpec::no_scaling(),
+            },
+            max_sim_time_ms: None,
+            max_in_flight: None,
+            record_per_request: false,
+            sla: Default::default(),
+            requests: Vec::new(),
+        };
+        Replayer::with_composition(spec, factory, ClearComposition::<MODE>)
+            .unwrap()
+            .with_capture_options(ReplayCaptureOptions {
+                capture_canonical_evidence: true,
+                ..Default::default()
+            })
+            .with_runtime_input(ReplayRuntimeInput::Workload(driver))
+            .run()
+            .unwrap()
+            .runtime_evidence
+            .kv_ingest
+            .unwrap()
+    }
+
+    #[test]
+    fn canonical_evidence_distinguishes_broad_and_device_tier_clears() {
+        let broad = clear_evidence::<BROAD_CLEAR>();
+        let device = clear_evidence::<DEVICE_CLEAR>();
+
+        assert!(broad.events > 0);
+        assert_eq!(broad.events, device.events);
+        assert_eq!(
+            broad.blake3_256,
+            "03406de87245a4c7324656f106c185d09eb6b36faeb1df3854a4d208e472cb1d"
+        );
+        assert_ne!(broad.blake3_256, device.blake3_256);
+        assert_eq!(
+            broad.kind_counts,
+            BTreeMap::from([("cleared".into(), broad.events)])
+        );
+        assert_eq!(
+            device.kind_counts,
+            BTreeMap::from([("tier_cleared".into(), device.events)])
+        );
+    }
+
+    #[test]
+    fn canonical_evidence_includes_inner_tier_for_tier_clears() {
+        let device = clear_evidence::<DEVICE_CLEAR>();
+        let host = clear_evidence::<HOST_CLEAR>();
+
+        assert!(device.events > 0);
+        assert_eq!(device.events, host.events);
+        assert_ne!(device.blake3_256, host.blake3_256);
+        assert_eq!(device.kind_counts, host.kind_counts);
+        assert_eq!(
+            device.kind_counts,
+            BTreeMap::from([("tier_cleared".into(), device.events)])
+        );
+    }
 }

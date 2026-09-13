@@ -1176,7 +1176,8 @@ pub fn run_mocker_trace_replay(
         )
         .map(Py::into_any);
     }
-    pythonize(py, &report).map(Bound::unbind).map_err(to_pyerr)
+    let value = dynamo_mocker::replay::online_replay_report(&report);
+    pythonize(py, &value).map(Bound::unbind).map_err(to_pyerr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1715,7 +1716,8 @@ pub fn run_mocker_synthetic_trace_replay(
         )
         .map(Py::into_any);
     }
-    pythonize(py, &report).map(Bound::unbind).map_err(to_pyerr)
+    let value = dynamo_mocker::replay::online_replay_report(&report);
+    pythonize(py, &value).map(Bound::unbind).map_err(to_pyerr)
 }
 
 enum ReplayArgsSelection {

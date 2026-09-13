@@ -568,7 +568,7 @@ impl DcCkfState {
                     }
                 }
             }
-            KvCacheEventData::Cleared => {
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
                 if let Err(error) = self.remove_member(worker) {
                     retain_first_error(&mut first_error, error);
                 }

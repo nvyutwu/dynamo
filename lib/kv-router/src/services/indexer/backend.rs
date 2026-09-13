@@ -34,6 +34,16 @@ pub enum Indexer {
 }
 
 impl Indexer {
+    /// Whether this backend exposes coherent device-prefix and CPU-extension
+    /// counts. Keep this match exhaustive so new approximate/side variants must
+    /// explicitly choose their raw-evidence capability.
+    pub(crate) fn supports_raw_cache_coverage(&self) -> bool {
+        match self {
+            Self::Single { .. } => true,
+            Self::Concurrent { .. } => true,
+        }
+    }
+
     /// Apply an event without tier dispatch — kept for callers that have
     /// already determined this is a device-tier event. Most callers should
     /// use [`Self::apply_event_routed`].
@@ -60,7 +70,10 @@ impl Indexer {
                 return Ok(());
             }
         };
-        let is_clear = matches!(&event.event.data, KvCacheEventData::Cleared);
+        let is_clear = matches!(
+            &event.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        );
         match self {
             Indexer::Single {
                 primary,
@@ -74,8 +87,10 @@ impl Indexer {
                         tracing::warn!(%error, "Failed to reset primary residency");
                         reset_error = Some(error);
                     }
-                    for indexer in lower_tier.all() {
-                        if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
+                    for (tier, indexer) in lower_tier.entries() {
+                        if event.targets_lower_tier(tier).unwrap_or(false)
+                            && let Err(error) = indexer.apply_event_and_wait(event.clone()).await
+                        {
                             tracing::warn!(%error, "Failed to reset lower-tier residency");
                             reset_error.get_or_insert(error);
                         }
@@ -104,8 +119,10 @@ impl Indexer {
                         tracing::warn!(%error, "Failed to reset primary residency");
                         reset_error = Some(error);
                     }
-                    for indexer in lower_tier.all() {
-                        if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
+                    for (tier, indexer) in lower_tier.entries() {
+                        if event.targets_lower_tier(tier).unwrap_or(false)
+                            && let Err(error) = indexer.apply_event_and_wait(event.clone()).await
+                        {
                             tracing::warn!(%error, "Failed to reset lower-tier residency");
                             reset_error.get_or_insert(error);
                         }
@@ -338,6 +355,14 @@ mod tests {
         KvCacheEvent, LocalBlockHash, ResidencyDomain, StorageTier, WorkerWithDpRank,
     };
 
+    #[tokio::test]
+    async fn raw_cache_capability_covers_all_service_backends() {
+        for threads in [1, 2] {
+            let indexer = create_indexer(4, threads);
+            assert!(indexer.supports_raw_cache_coverage());
+        }
+    }
+
     /// Apply a Device store and a HostPinned store anchored on it. The tiered
     /// query must surface both tier hits, and the device-tier `find_matches`
     /// must still see the device store (i.e. dispatch routed it to the
@@ -563,6 +588,93 @@ mod tests {
 
         assert!(matches!(error, KvRouterError::IndexerOffline));
         assert!(healthy_tier.dump_events().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gpu_scoped_clear_preserves_cpu_for_single_and_concurrent_indexers() {
+        for num_threads in [1, 2] {
+            let indexer = create_indexer(4, num_threads);
+            let worker = WorkerWithDpRank::new(7, 0);
+            indexer
+                .apply_event_routed(store_event(7, 0, 1, &[], &[11], StorageTier::Device))
+                .await
+                .unwrap();
+            indexer
+                .apply_event_routed(store_event(7, 0, 2, &[], &[11], StorageTier::HostPinned))
+                .await
+                .unwrap();
+            indexer
+                .apply_event_routed(RouterEvent::with_residency_domain(
+                    7,
+                    KvCacheEvent {
+                        event_id: 3,
+                        data: KvCacheEventData::TierCleared(StorageTier::Device),
+                        dp_rank: 0,
+                    },
+                    StorageTier::Device,
+                    ResidencyDomain::Worker,
+                ))
+                .await
+                .unwrap();
+
+            let matches = indexer
+                .find_tiered_matches(vec![LocalBlockHash(11)])
+                .await
+                .unwrap();
+            assert_eq!(matches.device.overlap_scores.scores.get(&worker), None);
+            assert_eq!(
+                matches
+                    .lower_tier
+                    .get(&StorageTier::HostPinned)
+                    .and_then(|details| details.hits.get(&worker)),
+                Some(&1),
+                "CPU residency must survive a GPU clear ({num_threads} thread(s))"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_scoped_clear_preserves_gpu_for_single_and_concurrent_indexers() {
+        for num_threads in [1, 2] {
+            let indexer = create_indexer(4, num_threads);
+            let worker = WorkerWithDpRank::new(7, 0);
+            for tier in [StorageTier::Device, StorageTier::HostPinned] {
+                indexer
+                    .apply_event_routed(store_event(7, 0, 1, &[], &[11], tier))
+                    .await
+                    .unwrap();
+            }
+            indexer
+                .apply_event_routed(RouterEvent::with_residency_domain(
+                    7,
+                    KvCacheEvent {
+                        event_id: 2,
+                        data: KvCacheEventData::TierCleared(StorageTier::HostPinned),
+                        dp_rank: 0,
+                    },
+                    StorageTier::HostPinned,
+                    ResidencyDomain::Worker,
+                ))
+                .await
+                .unwrap();
+
+            let matches = indexer
+                .find_tiered_matches(vec![LocalBlockHash(11)])
+                .await
+                .unwrap();
+            assert_eq!(
+                matches.device.overlap_scores.scores.get(&worker),
+                Some(&1),
+                "GPU residency must survive a CPU clear ({num_threads} thread(s))"
+            );
+            assert_eq!(
+                matches
+                    .lower_tier
+                    .get(&StorageTier::HostPinned)
+                    .and_then(|details| details.hits.get(&worker)),
+                Some(&0)
+            );
+        }
     }
 
     #[cfg(feature = "metrics")]

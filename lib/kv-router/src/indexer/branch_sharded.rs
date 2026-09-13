@@ -797,7 +797,7 @@ impl<S: AsyncShardHandle> KvIndexerInterface for BranchShardedIndexer<S> {
         match &event.event.data {
             KvCacheEventData::Stored(_) => self.apply_stored(event).await,
             KvCacheEventData::Removed(_) => self.apply_removed(event).await,
-            KvCacheEventData::Cleared => {
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
                 self.remove_worker_entries(WorkerWithDpRank::new(
                     event.worker_id,
                     event.event.dp_rank,

@@ -297,7 +297,7 @@ impl ConcurrentRadixTree {
         match op {
             KvCacheEventData::Stored(op) => self.apply_stored(lookup, worker, op, id, counters),
             KvCacheEventData::Removed(op) => self.apply_removed(lookup, worker, op, id),
-            KvCacheEventData::Cleared => {
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
                 self.remove_worker_dp_rank(lookup, worker.worker_id, worker.dp_rank);
                 Ok(())
             }

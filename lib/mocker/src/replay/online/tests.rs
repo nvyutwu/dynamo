@@ -959,3 +959,24 @@ async fn router_bookkeeping_failures_fail_replay_closed() {
     let free_error = free_runtime.run().await.unwrap_err();
     assert!(free_error.to_string().contains("injected free failure"));
 }
+
+#[tokio::test]
+async fn online_replay_serialized_report_declares_raw_cache_unsupported() {
+    let recorder = OnlineTraceRecorder::start(OnlineRecorderOptions::default());
+    let report = recorder.finish(0.0, None, None).await.expect("report");
+    let original = serde_json::to_value(&report).expect("original report");
+    let serialized = serde_json::to_value(crate::replay::online_replay_report(&report))
+        .expect("serialized report");
+    for (key, value) in original.as_object().expect("report object") {
+        assert_eq!(&serialized[key], value, "existing report field {key}");
+    }
+    assert_eq!(
+        serialized["raw_cache_coverage_capability"]["supported"],
+        false
+    );
+    assert_eq!(
+        serialized["raw_cache_coverage_capability"]["reason"],
+        "gpu_only_effective_replay"
+    );
+    assert!(serialized.get("raw_cache_coverage").is_none());
+}

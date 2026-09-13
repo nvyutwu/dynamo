@@ -515,7 +515,10 @@ impl LowerTierIndexer {
     ) -> Result<(), KvCacheEventError> {
         let worker = WorkerWithDpRank::new(event.worker_id, event.event.dp_rank);
 
-        if matches!(&event.event.data, KvCacheEventData::Cleared) {
+        if matches!(
+            &event.event.data,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+        ) {
             let scope = event
                 .reset_scope()
                 .map_err(|_| KvCacheEventError::UnsupportedResidencyDomain)?
@@ -553,7 +556,9 @@ impl LowerTierIndexer {
             KvCacheEventData::Removed(remove_data) => {
                 self.remove_blocks_impl(worker_blocks, owner, &remove_data.block_hashes)
             }
-            KvCacheEventData::Cleared => unreachable!("Cleared returned above"),
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
+                unreachable!("Cleared returned above")
+            }
         }
     }
 

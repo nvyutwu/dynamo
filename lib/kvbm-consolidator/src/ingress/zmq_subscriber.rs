@@ -197,8 +197,21 @@ fn process_event(tracker: &mut Tracker, event: RawKvEvent, engine_source: EventS
             }
         }
 
-        RawKvEvent::AllBlocksCleared { .. } => {
-            tracker.handle_clear_all();
+        RawKvEvent::AllBlocksCleared { medium, .. } => {
+            if medium.is_none() {
+                tracker.handle_clear_all();
+            } else {
+                tracing::warn!(
+                    ?medium,
+                    "Ignoring tier-scoped clear in all-tier consolidator"
+                );
+            }
+        }
+        RawKvEvent::TierBlocksCleared { medium, .. } => {
+            tracing::warn!(
+                ?medium,
+                "Ignoring tier-scoped clear in all-tier consolidator"
+            );
         }
 
         RawKvEvent::Ignored => {}
@@ -269,6 +282,38 @@ mod tests {
         assert!(matches!(
             tracker.drain_events().as_slice(),
             [ConsolidatedEvent::Store { .. }]
+        ));
+    }
+
+    #[test]
+    fn tier_scoped_clear_is_not_widened_to_all_tiers() {
+        let mut tracker = Tracker::new(None);
+        process_event(&mut tracker, stored_event(None, None), EventSource::Vllm);
+        tracker.drain_events();
+
+        process_event(
+            &mut tracker,
+            RawKvEvent::TierBlocksCleared {
+                medium: "GPU".to_string(),
+                ownership: None,
+            },
+            EventSource::Vllm,
+        );
+        assert_eq!(tracker.num_blocks(), 1);
+        assert!(tracker.drain_events().is_empty());
+
+        process_event(
+            &mut tracker,
+            RawKvEvent::AllBlocksCleared {
+                medium: None,
+                ownership: None,
+            },
+            EventSource::Vllm,
+        );
+        assert_eq!(tracker.num_blocks(), 0);
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::ClearAll]
         ));
     }
 }

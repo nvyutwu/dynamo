@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod cache_coverage;
 pub mod config;
 mod filter;
 mod local;
@@ -17,10 +18,11 @@ pub mod selector;
 mod worker_selection_config;
 
 mod types;
+pub use cache_coverage::{RawCacheCandidate, RawCacheCoverage, RawCacheObservation};
 pub use filter::*;
 pub use local::LocalScheduler;
 pub use overlap::{
-    CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals,
+    CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals, RawIndexState,
     SelectedWorkerTierSnapshot, SharedCacheOverlapScore, WorkerOverlapScore,
 };
 pub use overlap_refresh::{

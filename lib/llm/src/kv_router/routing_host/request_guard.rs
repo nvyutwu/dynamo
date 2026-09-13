@@ -1213,6 +1213,31 @@ mod prefill_start_tests {
                 "test",
             )
             .unwrap(),
+            raw_cache_prompt_tokens_total: prometheus::IntCounter::new(
+                "raw_cache_prompt_tokens_total",
+                "test",
+            )
+            .unwrap(),
+            raw_cache_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("raw_cache_tokens_total", "test"),
+                &["candidate", "cache_tier"],
+            )
+            .unwrap(),
+            raw_cache_gap_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("raw_cache_gap_tokens_total", "test"),
+                &["boundary"],
+            )
+            .unwrap(),
+            raw_cache_observations_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("raw_cache_observations_total", "test"),
+                &["result"],
+            )
+            .unwrap(),
+            raw_cache_rejected_candidates_total: prometheus::IntCounter::new(
+                "raw_cache_rejected_candidates_total",
+                "test",
+            )
+            .unwrap(),
             cache_loss_observation_input_tokens_total: prometheus::IntCounter::new(
                 "cache_loss_observation_input_tokens_total",
                 "test",
@@ -1334,5 +1359,176 @@ mod prefill_start_tests {
         let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
         RequestObservability::new(Some(tracker.clone()), metrics).record_prefill_start(&request);
         assert_eq!(tracker.prefill_wait_time_ms(), recorded_by_prefill);
+    }
+
+    #[test]
+    fn raw_cache_rejected_candidates_count_without_complete_denominators() {
+        use dynamo_kv_router::scheduling::{
+            RawCacheCandidate, RawCacheCoverage, RawCacheObservation,
+        };
+        use prometheus::core::Collector;
+
+        let metrics = test_metrics();
+        let candidate = RawCacheCandidate {
+            worker_id: 1,
+            dp_rank: 0,
+            hbm_prefix_tokens: 8,
+            cpu_extension_tokens: 0,
+            total_tokens: 8,
+        };
+        let invalid: RawCacheCoverage = serde_json::from_value(serde_json::json!({
+            "schema": "dynamo.router.raw_cache_coverage.v1",
+            "basis": "router_index",
+            "observation": "invariant_failure",
+            "input_tokens": 16,
+            "resident": null, "eligible": null, "selected": null,
+            "overload_gap_tokens": null, "selection_gap_tokens": null,
+            "candidate_diagnostics": {
+                "rejected_candidates": 2,
+                "best_valid_resident": candidate,
+                "best_valid_eligible": candidate,
+                "valid_selected": candidate,
+            },
+        }))
+        .unwrap();
+        super::super::record_raw_cache_coverage_metrics(&metrics, &invalid);
+        assert_eq!(metrics.raw_cache_rejected_candidates_total.get(), 2);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 0);
+        assert_eq!(
+            metrics
+                .raw_cache_tokens_total
+                .with_label_values(&["selected", "total"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .raw_cache_observations_total
+                .with_label_values(&["invariant_failure"])
+                .get(),
+            1
+        );
+
+        let mut funnel_only = invalid.clone();
+        funnel_only
+            .candidate_diagnostics
+            .as_mut()
+            .unwrap()
+            .rejected_candidates = 0;
+        super::super::record_raw_cache_coverage_metrics(&metrics, &funnel_only);
+        assert_eq!(metrics.raw_cache_rejected_candidates_total.get(), 2);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 0);
+
+        let complete = RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::Complete,
+            input_tokens: 16,
+            resident: Some(candidate),
+            eligible: Some(candidate),
+            selected: Some(candidate),
+            overload_gap_tokens: Some(0),
+            selection_gap_tokens: Some(0),
+            candidate_diagnostics: None,
+        };
+        super::super::record_raw_cache_coverage_metrics(&metrics, &complete);
+        assert_eq!(metrics.raw_cache_rejected_candidates_total.get(), 2);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 16);
+        assert_eq!(
+            metrics
+                .raw_cache_tokens_total
+                .with_label_values(&["selected", "total"])
+                .get(),
+            8
+        );
+        let families = metrics.raw_cache_rejected_candidates_total.collect();
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].get_metric().len(), 1);
+        assert!(families[0].get_metric()[0].get_label().is_empty());
+    }
+
+    #[test]
+    fn raw_cache_metrics_keep_unknown_out_of_token_denominators_and_preserve_zero() {
+        use dynamo_kv_router::scheduling::{
+            RawCacheCandidate, RawCacheCoverage, RawCacheObservation,
+        };
+
+        let metrics = test_metrics();
+        let missing = RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::MissingIndex,
+            input_tokens: 24_704,
+            resident: None,
+            eligible: None,
+            selected: None,
+            overload_gap_tokens: None,
+            selection_gap_tokens: None,
+            candidate_diagnostics: None,
+        };
+        super::super::record_raw_cache_coverage_metrics(&metrics, &missing);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 0);
+        assert_eq!(
+            metrics
+                .raw_cache_observations_total
+                .with_label_values(&["missing_index"])
+                .get(),
+            1
+        );
+
+        let zero = RawCacheCandidate {
+            worker_id: 1,
+            dp_rank: 0,
+            hbm_prefix_tokens: 0,
+            cpu_extension_tokens: 0,
+            total_tokens: 0,
+        };
+        let mut invalid_wire = serde_json::to_value(&missing).unwrap();
+        invalid_wire["observation"] = serde_json::json!("invariant_failure");
+        invalid_wire["candidate_diagnostics"] = serde_json::json!({
+            "rejected_candidates": 1,
+            "best_valid_resident": zero,
+            "best_valid_eligible": zero,
+            "valid_selected": zero,
+        });
+        let invalid: RawCacheCoverage = serde_json::from_value(invalid_wire).unwrap();
+        assert!(invalid.candidate_diagnostics.is_some());
+        super::super::record_raw_cache_coverage_metrics(&metrics, &invalid);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 0);
+        assert_eq!(
+            metrics
+                .raw_cache_observations_total
+                .with_label_values(&["invariant_failure"])
+                .get(),
+            1,
+        );
+        let complete = RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::Complete,
+            input_tokens: 24_704,
+            resident: Some(zero),
+            eligible: Some(zero),
+            selected: Some(zero),
+            overload_gap_tokens: Some(0),
+            selection_gap_tokens: Some(0),
+            candidate_diagnostics: None,
+        };
+        super::super::record_raw_cache_coverage_metrics(&metrics, &complete);
+        assert_eq!(metrics.raw_cache_prompt_tokens_total.get(), 24_704);
+        assert_eq!(
+            metrics
+                .raw_cache_tokens_total
+                .with_label_values(&["selected", "total"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .raw_cache_observations_total
+                .with_label_values(&["complete"])
+                .get(),
+            1
+        );
     }
 }

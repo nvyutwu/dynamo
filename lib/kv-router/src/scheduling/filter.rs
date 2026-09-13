@@ -90,6 +90,14 @@ impl<'a> RoutingEligibility<'a> {
         self.pinned_worker
     }
 
+    /// Preserve the resolved structural candidate universe while removing only
+    /// transient overload. In particular, do not resolve affinity a second time:
+    /// an overloaded affinity target may already have released fallback workers.
+    pub(crate) fn without_overload(mut self) -> Self {
+        self.overloaded_worker_ids = None;
+        self
+    }
+
     #[inline]
     pub fn caller_allows_worker_id(&self, worker_id: WorkerId) -> bool {
         self.allowed_worker_ids
@@ -397,6 +405,53 @@ mod tests {
                 taints: HashSet::from(["zone-a".to_string()]),
             },
         )])
+    }
+
+    #[test]
+    fn removing_overload_preserves_rank_pin_affinity_and_structural_constraints() {
+        let workers = workers();
+        let allowed = HashSet::from([7]);
+        let available = HashSet::from([7]);
+        let overloaded = HashSet::from([7]);
+        let constraints = RoutingConstraints {
+            required_taints: HashSet::from(["zone-a".to_string()]),
+            preferred_taints: HashMap::new(),
+        };
+        let pinned = WorkerWithDpRank::new(7, 3);
+        let eligibility = RoutingEligibility::new(
+            Some(&allowed),
+            Some(&overloaded),
+            Some(pinned),
+            &constraints,
+        )
+        .with_available_workers(Some(&available))
+        .with_affinity_target(pinned.into());
+        assert!(eligibility.validate_worker_rank(&workers, pinned).is_err());
+        let resident = eligibility.without_overload();
+        assert_eq!(resident.pinned_worker(), Some(pinned));
+        assert!(resident.validate_worker_rank(&workers, pinned).is_ok());
+        assert!(
+            resident
+                .validate_worker_rank(&workers, WorkerWithDpRank::new(7, 2))
+                .is_err()
+        );
+        assert!(
+            resident
+                .validate_worker_rank(&workers, WorkerWithDpRank::new(8, 3))
+                .is_err()
+        );
+        assert!(
+            !resident
+                .with_available_workers(Some(&HashSet::new()))
+                .is_worker_available(7)
+        );
+        let mut incompatible = workers.clone();
+        incompatible.get_mut(&7).unwrap().taints.clear();
+        assert!(
+            resident
+                .validate_worker_rank(&incompatible, pinned)
+                .is_err()
+        );
     }
 
     #[test]

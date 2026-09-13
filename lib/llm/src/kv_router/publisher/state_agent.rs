@@ -638,8 +638,13 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                 }
                 KvCacheEventData::Cleared => {
                     self.dedup
-                        .clear_rank_domain(event.dp_rank, domain, dedup_policy);
+                        .clear_rank_domain(event.dp_rank, domain, None, dedup_policy);
                     KvCacheEventData::Cleared
+                }
+                KvCacheEventData::TierCleared(tier) => {
+                    self.dedup
+                        .clear_rank_domain(event.dp_rank, domain, Some(tier), dedup_policy);
+                    KvCacheEventData::TierCleared(tier)
                 }
             };
             event.event_id = self.next_outbound_id;
@@ -676,7 +681,10 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
             // Do not add per-event completion or listener stop-and-wait without changing
             // this invariant and revalidating ingestion throughput.
             if let Err(error) = admit_local_event(Some(&self.local_indexer), &router_event).await {
-                if matches!(router_event.event.data, KvCacheEventData::Cleared) {
+                if matches!(
+                    router_event.event.data,
+                    KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+                ) {
                     self.fail_domain(
                         self.attachment
                             .as_ref()
@@ -697,7 +705,10 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                     "Failed to admit ordinary residency event locally; continuing lossy stream"
                 );
             }
-            if matches!(router_event.event.data, KvCacheEventData::Cleared) {
+            if matches!(
+                router_event.event.data,
+                KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+            ) {
                 cleared_domains.push(domain);
             }
             output.push(router_event);
@@ -1475,7 +1486,7 @@ fn event_block_count(events: &[PlacementEvent]) -> usize {
         .map(|event| match &event.event.data {
             KvCacheEventData::Stored(data) => data.blocks.len(),
             KvCacheEventData::Removed(data) => data.block_hashes.len(),
-            KvCacheEventData::Cleared => 0,
+            KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => 0,
         })
         .sum()
 }
@@ -1706,6 +1717,7 @@ fn normalize_raw_batch(
             && !matches!(
                 raw_event,
                 dynamo_kv_router::zmq_wire::RawKvEvent::AllBlocksCleared { .. }
+                    | dynamo_kv_router::zmq_wire::RawKvEvent::TierBlocksCleared { .. }
             )
         {
             cache_owner_fault.get_or_insert("KVCR ownership has an unsupported storage medium");
@@ -1746,8 +1758,10 @@ fn normalize_raw_batch(
             KvEventOwnership::Kvcr => {
                 if !matches!(
                     (&event.event.data, event.placement.tier),
-                    (KvCacheEventData::Cleared, _)
-                        | (_, StorageTier::HostPinned | StorageTier::Disk)
+                    (
+                        KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_),
+                        _
+                    ) | (_, StorageTier::HostPinned | StorageTier::Disk)
                 ) {
                     cache_owner_fault.get_or_insert("unsupported KVCR storage medium");
                     continue;
@@ -1946,6 +1960,7 @@ mod tests {
                 raw_store(Some("CPU_PINNED"), Some("kvcr"), 103),
                 raw_store(Some("STORAGE"), Some("kvcr"), 104),
                 RawKvEvent::AllBlocksCleared {
+                    medium: None,
                     ownership: Some("kvcr".to_string()),
                 },
             ],
@@ -2544,7 +2559,10 @@ mod tests {
                 .map(|event| (
                     event.event.event_id,
                     event.resolved_residency_domain().unwrap(),
-                    matches!(event.event.data, KvCacheEventData::Cleared),
+                    matches!(
+                        event.event.data,
+                        KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_)
+                    ),
                 ))
                 .collect::<Vec<_>>(),
             vec![

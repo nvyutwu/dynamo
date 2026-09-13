@@ -96,12 +96,18 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                                 )
                                 .await;
                         }
-                        KvCacheEventData::Cleared => {
+                        KvCacheEventData::Cleared | KvCacheEventData::TierCleared(_) => {
                             batching_state.flush(&local_indexer, worker_id, &mut dedup, &mut output).await;
                             let event = placement_event.event;
+                            let reset_storage_tier = match &event.data {
+                                KvCacheEventData::TierCleared(tier) => Some(*tier),
+                                KvCacheEventData::Cleared => None,
+                                _ => unreachable!("clear arm only accepts clear events"),
+                            };
                             dedup.clear_rank_domain(
                                 event.dp_rank,
                                 residency_domain,
+                                reset_storage_tier,
                                 EventDedupPolicy::RefCounted,
                             );
                             let applied = emit(
@@ -111,7 +117,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                                 residency_domain,
                                 KvCacheEvent {
                                     event_id: batching_state.next_publish_id,
-                                    data: KvCacheEventData::Cleared,
+                                    data: event.data,
                                     dp_rank: event.dp_rank,
                                 },
                                 &mut output,
