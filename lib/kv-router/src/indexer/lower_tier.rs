@@ -30,7 +30,7 @@ use crate::protocols::{
     ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheEventError, KvCacheStoreData,
     KvCacheStoredBlockData, LocalBlockHash, OverlapScores, ResetScope, ResidencyDomain,
     ResidencyOwner, ResidencyOwnerKey, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent,
-    WorkerWithDpRank,
+    StorageTier, WorkerWithDpRank,
 };
 
 type WorkerSet = FxHashSet<WorkerWithDpRank>;
@@ -498,14 +498,30 @@ pub struct LowerTierMatchDetails {
 
 /// Standalone lower-tier continuation index.
 pub struct LowerTierIndexer {
+    /// The one physical tier this instance indexes.
+    ///
+    /// Carried so a tier-scoped clear can be rejected here, not only by the
+    /// caller that routed it. Dispatch narrowing and this check are independent
+    /// layers on purpose: a clear that reaches the wrong index must be a no-op
+    /// even if some future dispatcher forgets to narrow.
+    storage_tier: StorageTier,
     edges: DashMap<TransitionKey, EdgeOwnersEntry, FxBuildHasher>,
 }
 
 impl LowerTierIndexer {
-    pub fn new() -> Self {
+    pub fn new(storage_tier: StorageTier) -> Self {
+        debug_assert!(
+            !storage_tier.is_gpu(),
+            "the device tier is indexed by the primary radix tree"
+        );
         Self {
+            storage_tier,
             edges: DashMap::with_hasher(FxBuildHasher),
         }
+    }
+
+    pub fn storage_tier(&self) -> StorageTier {
+        self.storage_tier
     }
 
     fn apply_event(
@@ -539,13 +555,13 @@ impl LowerTierIndexer {
                         .ok_or(KvCacheEventError::UnsupportedResidencyDomain)?;
                     self.remove_owner_impl(worker_blocks, ResidencyOwner::cache_owner(cache_owner));
                 }
-                // One `LowerTierIndexer` instance *is* one physical tier, so the
-                // caller has already selected the tier by routing the event
-                // here. Only the ownership half of the scope remains. The tier
-                // is re-checked so a misrouted scoped clear is a no-op instead
-                // of wiping a tier it never named.
+                // One `LowerTierIndexer` instance *is* one physical tier. A
+                // scoped clear that names a different tier -- the device tier,
+                // or another lower tier reached through a dispatcher that did
+                // not narrow -- must be a no-op here rather than wipe residency
+                // it never named. Only the ownership half of the scope acts.
                 ResetScope::Tier { tier, domain } => {
-                    if tier.is_gpu() {
+                    if tier != self.storage_tier {
                         return Ok(());
                     }
                     match domain {
@@ -1036,12 +1052,6 @@ impl LowerTierIndexer {
     }
 }
 
-impl Default for LowerTierIndexer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SyncIndexer for LowerTierIndexer {
     fn worker(
         &self,
@@ -1496,7 +1506,7 @@ mod tests {
     impl TestLowerTierIndex {
         fn new() -> Self {
             Self {
-                index: LowerTierIndexer::new(),
+                index: LowerTierIndexer::new(StorageTier::HostPinned),
                 worker_blocks: WorkerBlockIndex::default(),
             }
         }
@@ -1703,7 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_pool_backend_remove_worker_dp_rank_keeps_other_rank() {
-        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(), 2, 1);
+        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(StorageTier::HostPinned), 2, 1);
         let worker_dp0 = WorkerWithDpRank::new(43, 0);
         let worker_dp1 = WorkerWithDpRank::new(43, 1);
 
@@ -1731,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_pool_backend_cleared_event_preserves_other_workers() {
-        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(), 2, 1);
+        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(StorageTier::HostPinned), 2, 1);
         let worker_a = WorkerWithDpRank::new(29, 0);
         let worker_b = WorkerWithDpRank::new(30, 0);
 
@@ -2831,7 +2841,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_pool_dump_events_round_trip() {
-        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(), 2, 1);
+        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(StorageTier::HostPinned), 2, 1);
         let worker = WorkerWithDpRank::new(7, 0);
 
         index
@@ -2842,7 +2852,7 @@ mod tests {
         assert_eq!(events.len(), 3);
 
         // Replay into a fresh ThreadPoolIndexer.
-        let restored = ThreadPoolIndexer::new(LowerTierIndexer::new(), 2, 1);
+        let restored = ThreadPoolIndexer::new(LowerTierIndexer::new(StorageTier::HostPinned), 2, 1);
         for event in events {
             restored.apply_event(event).await;
         }
@@ -2934,10 +2944,13 @@ mod tests {
     }
 
     #[test]
-    fn a_device_scoped_clear_is_inert_in_a_lower_tier_index() {
-        // The primary radix tree owns the device tier. A device-scoped clear that
-        // reaches a lower-tier index (misrouted, or replayed from a buffer) must
-        // be a no-op rather than wipe the tier it never named.
+    fn a_clear_naming_another_tier_is_inert_in_this_index() {
+        // This fixture is the host tier. A clear naming the device tier (owned by
+        // the primary radix tree) or any other lower tier must be a no-op here,
+        // however it arrived -- misrouted by a dispatcher that forgot to narrow,
+        // or replayed out of a recovery buffer. This is the second, independent
+        // layer: one clear-dispatch path in the tree was in fact never narrowed,
+        // so the per-index check is not decorative.
         let mut index = TestLowerTierIndex::new();
         let worker = WorkerWithDpRank::new(7, 0);
         let continuations = FxHashMap::from_iter([(worker, LowerTierContinuation::from_root(0))]);
@@ -2945,20 +2958,37 @@ mod tests {
             .apply_event(store_event(7, 0, 1, None, &[11, 12], &[101, 102]))
             .unwrap();
 
+        for (event_id, tier) in [
+            (2, StorageTier::Device),
+            (3, StorageTier::Disk),
+            (4, StorageTier::External),
+        ] {
+            index
+                .apply_event(scoped_clear(7, event_id, tier, ResidencyDomain::Worker))
+                .unwrap();
+            assert_eq!(
+                index
+                    .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
+                    .get(&worker),
+                Some(&2),
+                "a {tier:?}-scoped clear must not touch the host index"
+            );
+        }
+
+        // The clear that does name this tier still works.
         index
             .apply_event(scoped_clear(
                 7,
-                2,
-                StorageTier::Device,
+                5,
+                StorageTier::HostPinned,
                 ResidencyDomain::Worker,
             ))
             .unwrap();
-
         assert_eq!(
             index
                 .query_contiguous_hits(&local_hashes(&[11, 12]), &continuations)
                 .get(&worker),
-            Some(&2)
+            Some(&0)
         );
     }
 

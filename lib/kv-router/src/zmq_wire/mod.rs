@@ -355,6 +355,14 @@ impl ZmqEventNormalizer {
             // memo survives, and a stale memo can at worst mis-score overlap,
             // whereas dropping it would break salted continuation for tiers the
             // reset never touched.
+            //
+            // Known cost: entries for blocks that were only ever device-resident
+            // are reclaimed by `BlockRemoved`, which vLLM does not emit for a
+            // pool reset. On a salted/LoRA-namespaced deployment doing repeated
+            // GPU resets those `(worker, hash)` entries accumulate until the
+            // next all-tier clear or worker removal. Bounding that needs
+            // per-tier residency tracking in the memo, which this change does
+            // not add.
             RawKvEvent::TierBlocksCleared { .. } => {}
             RawKvEvent::Ignored => {}
         }

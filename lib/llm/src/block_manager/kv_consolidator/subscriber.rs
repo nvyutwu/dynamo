@@ -267,11 +267,20 @@ fn process_event(
             }
         }
 
-        // This ingress is G1-only: the medium gate above already dropped every
-        // non-Device event, so the tracker's entire scope is the device tier and
-        // clearing all of it *is* the scoped clear. This is a narrowing of the
-        // producer's event to this consumer's scope, not a widening of it -- a
-        // CPU- or disk-scoped clear returned before reaching this match.
+        // The medium gate above is G1-only, so a CPU- or disk-scoped clear
+        // returns before reaching this match and only a device-scoped clear
+        // arrives here.
+        //
+        // The TRACKER, however, is not device-only: this module consolidates
+        // vLLM's G1 events with KVBM's G2/G3 events into one
+        // `SharedCacheStatusTracker`, and `handle_clear_all` drops every source
+        // and every tier, then republishes `AllBlocksCleared` downstream. So a
+        // device-scoped clear still over-invalidates KVBM's host/disk state
+        // here. That is not a regression -- the legacy `AllBlocksCleared` did
+        // exactly the same -- but the tier-scoped reset does NOT reach
+        // consolidator deployments. Fixing it needs a tier-aware
+        // `handle_clear_tier` on both trackers; until then do not describe this
+        // path as tier-scoped.
         RawKvEvent::AllBlocksCleared { .. } | RawKvEvent::TierBlocksCleared { .. } => {
             tracing::debug!("Processing cache clear for the device tier");
             tracker.handle_clear_all();
@@ -359,10 +368,12 @@ mod tests {
             }]
         ));
     }
-    /// The consolidator tracks the device tier and nothing else, so a
-    /// device-scoped clear is a full clear *of its scope*. A clear naming any
-    /// other tier must never reach the tracker: turning it into `ClearAll` would
-    /// be exactly the widening the scoped-clear contract forbids.
+    /// A clear naming any tier other than the device tier must never reach the
+    /// tracker: turning it into `ClearAll` would be exactly the widening the
+    /// scoped-clear contract forbids. A device-scoped clear does reach it and is
+    /// still handled as a full clear, which over-invalidates KVBM's G2/G3
+    /// entries in the shared tracker -- unchanged from the legacy all-tier
+    /// clear, and the reason this path is out of scope for tier-scoped resets.
     #[test]
     fn device_scoped_clear_clears_g1_and_other_tier_clears_are_ignored() {
         let mut tracker = PassthroughCacheStatusTracker::new();

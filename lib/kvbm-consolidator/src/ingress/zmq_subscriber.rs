@@ -197,10 +197,13 @@ fn process_event(tracker: &mut Tracker, event: RawKvEvent, engine_source: EventS
             }
         }
 
-        // G1-only ingress: the medium gate above already returned for every
-        // non-Device event, so this tracker's whole scope is the device tier.
-        // Clearing all of it narrows the producer's scoped clear to this
-        // consumer's scope; it never widens one.
+        // The medium gate above is G1-only, so only a device-scoped clear
+        // reaches this match. The tracker behind it is shared with the KVBM
+        // G2/G3 bridge, though, and `handle_clear_all` drops every source and
+        // tier, so a device-scoped clear still over-invalidates KVBM state here.
+        // Unchanged from the legacy all-tier clear; a tier-scoped reset does not
+        // reach consolidator deployments until both trackers grow a tier-aware
+        // clear.
         RawKvEvent::AllBlocksCleared { .. } | RawKvEvent::TierBlocksCleared { .. } => {
             tracker.handle_clear_all();
         }
@@ -275,10 +278,10 @@ mod tests {
             [ConsolidatedEvent::Store { .. }]
         ));
     }
-    /// This ingress tracks the device tier and nothing else, so a device-scoped
-    /// clear is a full clear *of its scope*. A clear naming any other tier must
-    /// never reach the tracker: turning it into `ClearAll` would be exactly the
-    /// widening the scoped-clear contract forbids.
+    /// A clear naming any tier other than the device tier must never reach the
+    /// tracker: turning it into `ClearAll` would be exactly the widening the
+    /// scoped-clear contract forbids. A device-scoped clear does reach it and is
+    /// still a full clear of the shared tracker.
     #[test]
     fn device_scoped_clear_clears_g1_and_other_tier_clears_are_ignored() {
         let mut tracker = Tracker::new(None);

@@ -95,7 +95,7 @@ impl LowerTierIndexers {
             .entry(storage_tier)
             .or_insert_with(|| {
                 Arc::new(ThreadPoolIndexer::new_with_metrics(
-                    LowerTierIndexer::new(),
+                    LowerTierIndexer::new(storage_tier),
                     self.num_threads,
                     self.block_size,
                     self.metrics.clone(),
@@ -107,6 +107,28 @@ impl LowerTierIndexers {
     /// All currently allocated lower-tier indexers, in unspecified order.
     pub fn all(&self) -> Vec<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
         self.indexers.read().unwrap().values().cloned().collect()
+    }
+
+    /// Lower-tier indexers a `Cleared` event must reach.
+    ///
+    /// `None` is the legacy all-tier clear. `Some(Device)` is handled by the
+    /// primary radix tree alone, so no lower tier is touched. `Some(other)`
+    /// selects exactly that tier, and a tier with no allocated index has nothing
+    /// to clear.
+    ///
+    /// Every clear dispatcher must route through this: the tree has three
+    /// (`Indexer::try_apply_event`, `LocalKvIndexer::apply_event_by_tier`, and
+    /// the served indexer's `apply_event_routed`), and one of them silently
+    /// kept fanning out to every tier when the first two were narrowed.
+    pub fn clear_targets(
+        &self,
+        clear_tier: Option<StorageTier>,
+    ) -> Vec<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
+        match clear_tier {
+            None => self.all(),
+            Some(tier) if tier.is_gpu() => Vec::new(),
+            Some(tier) => self.get(tier).into_iter().collect(),
+        }
     }
 
     /// All currently allocated lower-tier indexers paired with the

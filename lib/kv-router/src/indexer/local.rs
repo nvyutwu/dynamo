@@ -790,7 +790,7 @@ impl LocalKvIndexer {
             .entry(storage_tier)
             .or_insert_with(|| {
                 Arc::new(ThreadPoolIndexer::new_with_metrics(
-                    LowerTierIndexer::new(),
+                    LowerTierIndexer::new(storage_tier),
                     1,
                     self.block_size(),
                     Some(self.metrics.clone()),

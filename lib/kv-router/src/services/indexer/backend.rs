@@ -61,6 +61,9 @@ impl Indexer {
             }
         };
         let is_clear = matches!(&event.event.data, KvCacheEventData::Cleared);
+        // `targets_primary` already resolved the scope, so an unreadable tier
+        // took the Err branch above and never reaches a tier index.
+        let clear_tier = event.clear_tier().unwrap_or(None);
         match self {
             Indexer::Single {
                 primary,
@@ -74,7 +77,7 @@ impl Indexer {
                         tracing::warn!(%error, "Failed to reset primary residency");
                         reset_error = Some(error);
                     }
-                    for indexer in lower_tier.all() {
+                    for indexer in lower_tier.clear_targets(clear_tier) {
                         if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
                             tracing::warn!(%error, "Failed to reset lower-tier residency");
                             reset_error.get_or_insert(error);
@@ -104,7 +107,7 @@ impl Indexer {
                         tracing::warn!(%error, "Failed to reset primary residency");
                         reset_error = Some(error);
                     }
-                    for indexer in lower_tier.all() {
+                    for indexer in lower_tier.clear_targets(clear_tier) {
                         if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
                             tracing::warn!(%error, "Failed to reset lower-tier residency");
                             reset_error.get_or_insert(error);
@@ -337,6 +340,173 @@ mod tests {
     use crate::protocols::{
         KvCacheEvent, LocalBlockHash, ResidencyDomain, StorageTier, WorkerWithDpRank,
     };
+
+    async fn flush(indexer: &Indexer) {
+        match indexer {
+            Indexer::Single {
+                primary,
+                lower_tier,
+            } => {
+                let _ = primary.flush().await;
+                for inner in lower_tier.all() {
+                    let _ = inner.dump_events().await.unwrap();
+                }
+            }
+            Indexer::Concurrent {
+                primary,
+                lower_tier,
+            } => {
+                let _ = primary.dump_events().await.unwrap();
+                for inner in lower_tier.all() {
+                    let _ = inner.dump_events().await.unwrap();
+                }
+            }
+        }
+    }
+
+    fn tier_clear(worker: WorkerWithDpRank, event_id: u64, tier: StorageTier) -> RouterEvent {
+        RouterEvent::with_tier_reset(
+            worker.worker_id,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Cleared,
+                dp_rank: worker.dp_rank,
+            },
+            tier,
+            ResidencyDomain::Worker,
+        )
+    }
+
+    /// The served indexer is a third clear-dispatch path, separate from
+    /// `Indexer::try_apply_event` and `LocalKvIndexer::apply_event_by_tier`, and
+    /// it is the only one that runs in a `serve_indexer` / `use_remote_indexer`
+    /// deployment. A scoped clear must narrow here too: it fanned out to every
+    /// allocated lower tier until the other two paths were narrowed and this one
+    /// was not.
+    async fn assert_scoped_clear_narrows_on_the_served_path(indexer: Indexer) {
+        let worker = WorkerWithDpRank::new(7, 0);
+        for (event_id, tier) in [
+            (1, StorageTier::Device),
+            (2, StorageTier::HostPinned),
+            (3, StorageTier::Disk),
+        ] {
+            indexer
+                .apply_event_routed(store_event(
+                    worker.worker_id,
+                    worker.dp_rank,
+                    event_id,
+                    &[],
+                    &[11, 12],
+                    tier,
+                ))
+                .await
+                .unwrap();
+        }
+        flush(&indexer).await;
+
+        // Clear the host tier only, then drop the device copy so the surviving
+        // lower tiers become visible to the tiered query.
+        indexer
+            .apply_event_routed(tier_clear(worker, 4, StorageTier::HostPinned))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_routed(tier_clear(worker, 5, StorageTier::Device))
+            .await
+            .unwrap();
+        flush(&indexer).await;
+
+        let tiered = indexer
+            .find_tiered_matches(vec![LocalBlockHash(11), LocalBlockHash(12)])
+            .await
+            .unwrap();
+        let hits = |tier| {
+            tiered
+                .lower_tier
+                .get(&tier)
+                .and_then(|tier| tier.hits.get(&worker).copied())
+                .unwrap_or(0)
+        };
+        assert!(
+            !tiered.device.overlap_scores.scores.contains_key(&worker),
+            "the device-scoped clear must empty the device tree"
+        );
+        assert_eq!(
+            hits(StorageTier::HostPinned),
+            0,
+            "the named tier is cleared"
+        );
+        assert_eq!(
+            hits(StorageTier::Disk),
+            2,
+            "a host-scoped clear must not reach the disk index on the served path"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_thread_scoped_clear_narrows_on_the_served_path() {
+        assert_scoped_clear_narrows_on_the_served_path(create_indexer(4, 1)).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_scoped_clear_narrows_on_the_served_path() {
+        assert_scoped_clear_narrows_on_the_served_path(create_indexer(4, 2)).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_clear_still_empties_every_tier_on_the_served_path() {
+        let indexer = create_indexer(4, 1);
+        let worker = WorkerWithDpRank::new(7, 0);
+        for (event_id, tier) in [
+            (1, StorageTier::Device),
+            (2, StorageTier::HostPinned),
+            (3, StorageTier::Disk),
+        ] {
+            indexer
+                .apply_event_routed(store_event(
+                    worker.worker_id,
+                    worker.dp_rank,
+                    event_id,
+                    &[],
+                    &[11, 12],
+                    tier,
+                ))
+                .await
+                .unwrap();
+        }
+        flush(&indexer).await;
+
+        indexer
+            .apply_event_routed(RouterEvent::with_storage_tier(
+                worker.worker_id,
+                KvCacheEvent {
+                    event_id: 4,
+                    data: KvCacheEventData::Cleared,
+                    dp_rank: worker.dp_rank,
+                },
+                StorageTier::Device,
+            ))
+            .await
+            .unwrap();
+        flush(&indexer).await;
+
+        let tiered = indexer
+            .find_tiered_matches(vec![LocalBlockHash(11), LocalBlockHash(12)])
+            .await
+            .unwrap();
+        assert!(!tiered.device.overlap_scores.scores.contains_key(&worker));
+        for tier in [StorageTier::HostPinned, StorageTier::Disk] {
+            assert_eq!(
+                tiered
+                    .lower_tier
+                    .get(&tier)
+                    .and_then(|tier| tier.hits.get(&worker).copied())
+                    .unwrap_or(0),
+                0,
+                "a clear with no selector keeps its all-tier meaning"
+            );
+        }
+    }
 
     /// Apply a Device store and a HostPinned store anchored on it. The tiered
     /// query must surface both tier hits, and the device-tier `find_matches`

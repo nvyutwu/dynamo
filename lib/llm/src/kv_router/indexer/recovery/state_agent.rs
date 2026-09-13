@@ -1613,11 +1613,14 @@ async fn apply_recovery_response(
                 }
                 // Snapshots are rank-wide by construction, so a tier-scoped
                 // snapshot means the peer represents state this consumer cannot
-                // reconstruct. Fail before any clear so the recovery cursor does
-                // not advance over state that was never replaced.
+                // reconstruct. Fail before replaying anything and before
+                // returning a cursor, so recovery does not advance over state
+                // that was never replaced. The caller's earlier clears have
+                // already run, so the rank is left empty rather than stale --
+                // the safe direction, and recovery retries.
                 ResetScope::Tier { tier, domain } => {
                     anyhow::bail!(
-                        "state-agent recovery returned a tier-scoped snapshot                          (tier {tier:?}, domain {domain:?}); snapshots must be rank-wide"
+                        "state-agent recovery returned a tier-scoped snapshot (tier {tier:?}, domain {domain:?}); snapshots must be rank-wide"
                     )
                 }
             }

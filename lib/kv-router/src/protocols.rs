@@ -1840,8 +1840,13 @@ pub struct RouterEvent {
     /// additive trailing field rather than a new `KvCacheEventData` variant,
     /// which older readers would fail to decode at all.
     ///
-    /// Keep this field last, after `state_source`, so legacy positional
-    /// MessagePack stays prefix-compatible.
+    /// That compatibility holds for the MAP encodings this type actually travels
+    /// under -- the event plane uses `rmp_serde::to_vec_named` and the indexer
+    /// service dump is JSON. It does NOT hold for a positional/array encoder:
+    /// `state_source` and `residency_domain` both carry `skip_serializing_if`,
+    /// so field indices already shift with content and a positional reader would
+    /// mis-bind this value. Do not introduce a positional encoder for
+    /// `RouterEvent` without first making those fields unconditional.
     #[serde(default, skip_serializing_if = "WireStorageTier::is_missing")]
     pub reset_tier: WireStorageTier,
 }

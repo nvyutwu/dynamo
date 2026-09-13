@@ -372,7 +372,7 @@ impl Indexer {
                             .await?;
                     }
 
-                    for indexer in clear_target_indexers(lower_tier, clear_tier) {
+                    for indexer in lower_tier.clear_targets(clear_tier) {
                         indexer.apply_event_and_wait(event.clone()).await?;
                     }
                 } else if targets_primary {
@@ -397,7 +397,7 @@ impl Indexer {
                         primary.apply_event_and_wait(event.clone()).await?;
                     }
 
-                    for indexer in clear_target_indexers(lower_tier, clear_tier) {
+                    for indexer in lower_tier.clear_targets(clear_tier) {
                         indexer.apply_event_and_wait(event.clone()).await?;
                     }
                 } else if targets_primary {
@@ -1799,42 +1799,45 @@ mod tests {
         assert_scoped_clear_is_idempotent_under_replay(make_test_indexer()).await;
     }
 
+    #[tokio::test]
+    async fn concurrent_scoped_clear_spares_other_ranks() {
+        assert_scoped_clear_spares_other_ranks(make_test_concurrent_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_unreadable_selector_is_dropped_not_widened() {
+        assert_unreadable_selector_is_dropped_not_widened(make_test_concurrent_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_scoped_clear_is_idempotent_under_replay() {
+        assert_scoped_clear_is_idempotent_under_replay(make_test_concurrent_indexer()).await;
+    }
+
     #[test]
     fn clear_fanout_selects_exactly_one_lower_tier() {
         let lower_tier = LowerTierIndexers::new(1, 4);
         let host = lower_tier.get_or_create(StorageTier::HostPinned);
         let disk = lower_tier.get_or_create(StorageTier::Disk);
 
-        assert_eq!(super::clear_target_indexers(&lower_tier, None).len(), 2);
+        assert_eq!(lower_tier.clear_targets(None).len(), 2);
         assert!(
-            super::clear_target_indexers(&lower_tier, Some(StorageTier::Device)).is_empty(),
+            lower_tier
+                .clear_targets(Some(StorageTier::Device))
+                .is_empty(),
             "the primary tree owns the device tier"
         );
-        let host_targets = super::clear_target_indexers(&lower_tier, Some(StorageTier::HostPinned));
+        let host_targets = lower_tier.clear_targets(Some(StorageTier::HostPinned));
         assert_eq!(host_targets.len(), 1);
         assert!(Arc::ptr_eq(&host_targets[0], &host));
-        let disk_targets = super::clear_target_indexers(&lower_tier, Some(StorageTier::Disk));
+        let disk_targets = lower_tier.clear_targets(Some(StorageTier::Disk));
         assert_eq!(disk_targets.len(), 1);
         assert!(Arc::ptr_eq(&disk_targets[0], &disk));
         assert!(
-            super::clear_target_indexers(&lower_tier, Some(StorageTier::External)).is_empty(),
+            lower_tier
+                .clear_targets(Some(StorageTier::External))
+                .is_empty(),
             "an unseen tier has nothing to clear and must not be materialized"
         );
-    }
-}
-
-/// Lower-tier indexers a `Cleared` event must reach.
-///
-/// `None` is the legacy all-tier clear. `Some(Device)` is handled by the primary
-/// tree alone, so no lower tier is touched. `Some(other)` selects exactly that
-/// tier, and a tier with no allocated index has nothing to clear.
-fn clear_target_indexers(
-    lower_tier: &LowerTierIndexers,
-    clear_tier: Option<dynamo_kv_router::protocols::StorageTier>,
-) -> Vec<Arc<ThreadPoolIndexer<dynamo_kv_router::indexer::LowerTierIndexer>>> {
-    match clear_tier {
-        None => lower_tier.all(),
-        Some(tier) if tier.is_gpu() => Vec::new(),
-        Some(tier) => lower_tier.get(tier).into_iter().collect(),
     }
 }

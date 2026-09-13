@@ -254,6 +254,14 @@ router drops an event it cannot map to a known tier rather than falling back to
 an all-tier clear, so a backend must not invent new medium strings without a
 matching router release.
 
+**Upgrade order: router first.** `TierBlocksCleared` is a new wire tag, and a
+router that predates it rejects the event. Because a ZMQ payload decodes as one
+batch, that rejection discards the *whole* batch — every `BlockStored` and
+`BlockRemoved` published alongside the clear — and the router's index silently
+goes stale in the dangerous direction. Upgrade every router that consumes a
+backend's stream before enabling scoped clears in that backend. A malformed
+`medium` (missing or empty) fails the same way against any router version.
+
 ## API Reference
 
 ### `KvEventPublisher`
