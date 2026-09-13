@@ -77,6 +77,7 @@ pub(crate) fn emit_request_end(
         input_tokens: tracker.isl_tokens().map(|v| v as u64),
         output_tokens: Some(tracker.osl_tokens()),
         cached_tokens: tracker.cached_tokens().map(|v| v as u64),
+        backend_actual_cached_tokens: tracker.backend_cached_tokens().map(|v| v as u64),
         request_received_ms: Some(timing.request_received_ms),
         prefill_wait_time_ms: timing.prefill_wait_time_ms,
         prefill_time_ms: timing.prefill_time_ms,
@@ -186,6 +187,7 @@ pub(crate) fn validate_tool_record(record: &RequestTraceRecord) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::common::timing::{RoutingDecisionCandidate, RoutingDecisionTrace};
     use crate::request_trace::BUS;
     use crate::request_trace::RequestTraceToolEvent;
 
@@ -195,6 +197,7 @@ mod tests {
         let mut rx = BUS.subscribe();
         let tracker = RequestTracker::new();
         tracker.record_isl(8, Some(4));
+        tracker.record_backend_cached_tokens(Some(4));
         tracker.record_kv_hit(2.0, 4);
         tracker.record_osl(7);
         tracker.record_finish();
@@ -224,6 +227,7 @@ mod tests {
         assert_eq!(request.input_tokens, Some(8));
         assert_eq!(request.output_tokens, Some(7));
         assert_eq!(request.cached_tokens, Some(4));
+        assert_eq!(request.backend_actual_cached_tokens, Some(4));
         assert_eq!(request.kv_hit_rate, Some(0.5));
         assert_eq!(
             request.request_received_ms,
@@ -243,6 +247,205 @@ mod tests {
                 .input_length,
             3
         );
+    }
+
+    async fn emitted_cached_tokens(
+        request_id: &str,
+        predicted_cached_tokens: usize,
+        backend_cached_tokens: Option<usize>,
+    ) -> Option<u64> {
+        BUS.init(16);
+        let mut rx = BUS.subscribe();
+        let tracker = RequestTracker::new();
+        tracker.record_isl(24_576, Some(predicted_cached_tokens));
+        tracker.record_backend_cached_tokens(backend_cached_tokens);
+
+        emit_request_end(
+            request_id.to_string(),
+            &tracker,
+            RequestReplayMetrics {
+                trace_block_size: 12_288,
+                input_length: 24_576,
+                input_sequence_hashes: vec![11, 22],
+            },
+        );
+
+        let request = loop {
+            let record = rx.recv().await.unwrap();
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|request| request.request_id == request_id)
+            {
+                break record.request.unwrap();
+            }
+        };
+        assert_eq!(tracker.cached_tokens(), Some(predicted_cached_tokens));
+        assert_eq!(request.cached_tokens, Some(predicted_cached_tokens as u64));
+        request.backend_actual_cached_tokens
+    }
+
+    #[tokio::test]
+    async fn request_end_uses_backend_actual_instead_of_router_prediction() {
+        assert_eq!(
+            emitted_cached_tokens("actual-partial", 24_576, Some(12_288)).await,
+            Some(12_288)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_end_preserves_backend_actual_zero() {
+        assert_eq!(
+            emitted_cached_tokens("actual-zero", 24_576, Some(0)).await,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_end_keeps_missing_backend_actual_unknown() {
+        assert_eq!(
+            emitted_cached_tokens("actual-missing", 24_576, None).await,
+            None
+        );
+    }
+
+    fn routing_trace_with_raw(
+        raw: dynamo_kv_router::scheduling::RawCacheCoverage,
+    ) -> RoutingDecisionTrace {
+        let selected = raw
+            .selected
+            .unwrap_or(dynamo_kv_router::scheduling::RawCacheCandidate {
+                worker_id: 7,
+                dp_rank: 0,
+                hbm_prefix_tokens: 0,
+                cpu_extension_tokens: 0,
+                total_tokens: 0,
+            });
+        RoutingDecisionTrace {
+            score_decision: None,
+            decision_explanation: None,
+            frontend_instance: Some("frontend-test".into()),
+            schema: "dynamo.router.decision.v44.v2".into(),
+            candidate_scope: "selected_and_best_eligible_cache_holder".into(),
+            block_size: 12_288,
+            input_tokens: 24_704,
+            selected: RoutingDecisionCandidate {
+                worker_id: selected.worker_id,
+                dp_rank: selected.dp_rank,
+                effective_overlap_blocks: 2.0,
+                cached_tokens: 24_576,
+                hbm_blocks: 1,
+                cpu_ram_cumulative_blocks: 2,
+                cpu_ram_only_blocks: 1,
+                disk_cumulative_blocks: 2,
+            },
+            eligible_oracle: None,
+            raw_cache_coverage: Some(raw),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_end_preserves_complete_raw_coverage_and_backend_actual_separately() {
+        use dynamo_kv_router::scheduling::{
+            RawCacheCandidate, RawCacheCoverage, RawCacheObservation,
+        };
+
+        BUS.init(16);
+        let mut rx = BUS.subscribe();
+        let tracker = RequestTracker::new();
+        tracker.record_isl(24_704, Some(24_576));
+        tracker.record_backend_cached_tokens(Some(24_704));
+        let selected = RawCacheCandidate {
+            worker_id: u64::MAX,
+            dp_rank: u32::MAX,
+            hbm_prefix_tokens: 12_288,
+            cpu_extension_tokens: 12_288,
+            total_tokens: 24_576,
+        };
+        tracker.record_routing_decision_trace(routing_trace_with_raw(RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::Complete,
+            input_tokens: 24_704,
+            resident: Some(RawCacheCandidate {
+                total_tokens: 24_704,
+                hbm_prefix_tokens: 24_704,
+                cpu_extension_tokens: 0,
+                ..selected
+            }),
+            eligible: Some(selected),
+            selected: Some(selected),
+            overload_gap_tokens: Some(128),
+            selection_gap_tokens: Some(0),
+            candidate_diagnostics: None,
+        }));
+
+        emit_request_end(
+            "raw-complete".into(),
+            &tracker,
+            RequestReplayMetrics {
+                trace_block_size: 12_288,
+                input_length: 24_704,
+                input_sequence_hashes: vec![11, 22, 33],
+            },
+        );
+        let record = loop {
+            let record = rx.recv().await.unwrap();
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|r| r.request_id == "raw-complete")
+            {
+                break record;
+            }
+        };
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["request"]["backend_actual_cached_tokens"], 24_704);
+        let raw = &value["request"]["routing_decision"]["raw_cache_coverage"];
+        assert_eq!(raw["schema"], "dynamo.router.raw_cache_coverage.v1");
+        assert_eq!(raw["input_tokens"], 24_704);
+        assert_eq!(raw["selected"]["worker_id"], u64::MAX);
+        assert_eq!(raw["selected"]["cpu_extension_tokens"], 12_288);
+        assert_eq!(raw["overload_gap_tokens"], 128);
+
+        let missing_tracker = RequestTracker::new();
+        missing_tracker.record_isl(24_704, Some(0));
+        missing_tracker.record_routing_decision_trace(routing_trace_with_raw(RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: RawCacheObservation::MissingIndex,
+            input_tokens: 24_704,
+            resident: None,
+            eligible: None,
+            selected: None,
+            overload_gap_tokens: None,
+            selection_gap_tokens: None,
+            candidate_diagnostics: None,
+        }));
+        emit_request_end(
+            "raw-missing".into(),
+            &missing_tracker,
+            RequestReplayMetrics {
+                trace_block_size: 12_288,
+                input_length: 24_704,
+                input_sequence_hashes: vec![11, 22, 33],
+            },
+        );
+        let missing_record = loop {
+            let record = rx.recv().await.unwrap();
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|r| r.request_id == "raw-missing")
+            {
+                break record;
+            }
+        };
+        let missing_value = serde_json::to_value(missing_record).unwrap();
+        let missing_raw = &missing_value["request"]["routing_decision"]["raw_cache_coverage"];
+        assert_eq!(missing_raw["observation"], "missing_index");
+        assert!(missing_raw["resident"].is_null());
+        assert!(missing_raw["overload_gap_tokens"].is_null());
     }
 
     #[test]

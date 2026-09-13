@@ -91,8 +91,12 @@ pub struct RequestTraceMetrics {
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Router-effective cached-token prediction retained for trace-v1 compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// Cached tokens the backend reports it actually reused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_actual_cached_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_received_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -326,6 +330,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: Some(4),
                 cached_tokens: None,
+                backend_actual_cached_tokens: None,
                 request_received_ms: Some(1_000),
                 prefill_wait_time_ms: None,
                 prefill_time_ms: None,
@@ -357,6 +362,37 @@ mod tests {
         assert!(value.get("payload").is_none());
         assert!(value["request"].get("model").is_none());
         assert!(value["request"].get("finish_reason_metadata").is_none());
+        assert!(
+            value["request"]
+                .get("backend_actual_cached_tokens")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_request_trace_without_backend_actual_keeps_it_unknown() {
+        let request: RequestTraceMetrics = serde_json::from_value(serde_json::json!({
+            "request_id": "legacy-request",
+            "cached_tokens": 24_576
+        }))
+        .unwrap();
+
+        assert_eq!(request.cached_tokens, Some(24_576));
+        assert_eq!(request.backend_actual_cached_tokens, None);
+    }
+
+    #[test]
+    fn request_trace_serializes_prediction_and_backend_actual_separately() {
+        let request: RequestTraceMetrics = serde_json::from_value(serde_json::json!({
+            "request_id": "fine-grained-request",
+            "cached_tokens": 24_576,
+            "backend_actual_cached_tokens": 24_704
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["cached_tokens"], 24_576);
+        assert_eq!(value["backend_actual_cached_tokens"], 24_704);
     }
 
     #[test]

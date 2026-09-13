@@ -49,6 +49,8 @@ pub struct RoutingDecisionTrace {
     pub selected: RoutingDecisionCandidate,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eligible_oracle: Option<RoutingDecisionCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_cache_coverage: Option<dynamo_kv_router::scheduling::RawCacheCoverage>,
 }
 
 /// Tiered cache snapshot for one router candidate.
@@ -151,6 +153,10 @@ pub struct RequestTracker {
 
     /// Number of cached tokens derived from the effective cache hit - set once via OnceLock
     cached_tokens: OnceLock<usize>,
+
+    /// Number of tokens the backend reports it actually reused - set once via OnceLock.
+    /// Kept separate from the router's effective-cache prediction in `cached_tokens`.
+    backend_cached_tokens: OnceLock<usize>,
 
     /// Output sequence length in tokens - updated atomically as tokens stream back
     osl_tokens: AtomicU64,
@@ -263,6 +269,7 @@ impl RequestTracker {
             isl_blocks: OnceLock::new(),
             isl_tokens: OnceLock::new(),
             cached_tokens: OnceLock::new(),
+            backend_cached_tokens: OnceLock::new(),
             osl_tokens: AtomicU64::new(0),
             prefill_worker_id: OnceLock::new(),
             prefill_dp_rank: OnceLock::new(),
@@ -324,6 +331,17 @@ impl RequestTracker {
 
     pub fn cached_tokens(&self) -> Option<usize> {
         self.cached_tokens.get().copied()
+    }
+
+    /// Record the backend's actual reused-token count when the backend provides it.
+    pub fn record_backend_cached_tokens(&self, cached_tokens: Option<usize>) {
+        if let Some(cached_tokens) = cached_tokens {
+            let _ = self.backend_cached_tokens.set(cached_tokens);
+        }
+    }
+
+    pub fn backend_cached_tokens(&self) -> Option<usize> {
+        self.backend_cached_tokens.get().copied()
     }
 
     /// Record current output sequence length in tokens. Updated at each output block boundary.
@@ -986,10 +1004,45 @@ mod tests {
                 disk_cumulative_blocks: 0,
             },
             eligible_oracle: None,
+            raw_cache_coverage: Some(dynamo_kv_router::scheduling::RawCacheCoverage {
+                schema: "dynamo.router.raw_cache_coverage.v1".into(),
+                basis: "router_index".into(),
+                observation: dynamo_kv_router::scheduling::RawCacheObservation::Complete,
+                input_tokens: 24_704,
+                resident: Some(dynamo_kv_router::scheduling::RawCacheCandidate {
+                    worker_id: u64::MAX,
+                    dp_rank: u32::MAX,
+                    hbm_prefix_tokens: 24_704,
+                    cpu_extension_tokens: 0,
+                    total_tokens: 24_704,
+                }),
+                eligible: Some(dynamo_kv_router::scheduling::RawCacheCandidate {
+                    worker_id: result.worker.worker_id,
+                    dp_rank: result.worker.dp_rank,
+                    hbm_prefix_tokens: 12_288,
+                    cpu_extension_tokens: 12_288,
+                    total_tokens: 24_576,
+                }),
+                selected: Some(dynamo_kv_router::scheduling::RawCacheCandidate {
+                    worker_id: result.worker.worker_id,
+                    dp_rank: result.worker.dp_rank,
+                    hbm_prefix_tokens: 12_288,
+                    cpu_extension_tokens: 12_288,
+                    total_tokens: 24_576,
+                }),
+                overload_gap_tokens: Some(128),
+                selection_gap_tokens: Some(0),
+                candidate_diagnostics: None,
+            }),
         };
         let json = serde_json::to_string(&trace).unwrap();
         let decoded: RoutingDecisionTrace = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.selected.worker_id, worker.worker_id);
+        let raw = decoded.raw_cache_coverage.unwrap();
+        assert_eq!(raw.input_tokens, 24_704);
+        assert_eq!(raw.resident.unwrap().worker_id, u64::MAX);
+        assert_eq!(raw.selected.unwrap().cpu_extension_tokens, 12_288);
+        assert_eq!(raw.overload_gap_tokens, Some(128));
         if dynamo_kv_router::protocols::routing_decision_trace_enabled() {
             assert!(decoded.score_decision.is_some());
             assert_eq!(
@@ -1025,6 +1078,7 @@ mod tests {
                 disk_cumulative_blocks: 2,
             },
             eligible_oracle: None,
+            raw_cache_coverage: None,
         };
         tracker.record_routing_decision_trace(trace);
         tracker.record_routing_decision_trace(RoutingDecisionTrace {
@@ -1046,11 +1100,35 @@ mod tests {
                 disk_cumulative_blocks: 0,
             },
             eligible_oracle: None,
+            raw_cache_coverage: None,
         });
 
         let trace = tracker.routing_decision_trace().unwrap();
         assert_eq!(trace.selected.worker_id, 1);
         assert_eq!(trace.selected.cpu_ram_only_blocks, 1);
+    }
+
+    #[test]
+    fn raw_cache_missing_index_serializes_unknown_candidates_as_null() {
+        let coverage = dynamo_kv_router::scheduling::RawCacheCoverage {
+            schema: "dynamo.router.raw_cache_coverage.v1".into(),
+            basis: "router_index".into(),
+            observation: dynamo_kv_router::scheduling::RawCacheObservation::MissingIndex,
+            input_tokens: 24_704,
+            resident: None,
+            eligible: None,
+            selected: None,
+            overload_gap_tokens: None,
+            selection_gap_tokens: None,
+            candidate_diagnostics: None,
+        };
+        let value = serde_json::to_value(coverage).unwrap();
+        assert_eq!(value["observation"], "missing_index");
+        assert!(value["resident"].is_null());
+        assert!(value["eligible"].is_null());
+        assert!(value["selected"].is_null());
+        assert!(value["overload_gap_tokens"].is_null());
+        assert!(value["selection_gap_tokens"].is_null());
     }
 
     #[test]

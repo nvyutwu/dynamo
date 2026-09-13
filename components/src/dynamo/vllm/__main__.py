@@ -13,6 +13,10 @@ if __name__ == "__main__":
     # env and hold without importing vLLM or constructing backend/runtime state.
     maybe_run_restore_standby_mode()
 
+    from dynamo.vllm.worker_evidence import start_worker_evidence_collector
+
+    start_worker_evidence_collector()
+
     from dynamo.vllm.main import main
 
     main()

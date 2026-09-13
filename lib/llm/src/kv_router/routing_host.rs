@@ -129,6 +129,11 @@ fn record_routing_decision_trace(
             &selection.selected_worker_tiers,
         ),
         eligible_oracle,
+        raw_cache_coverage: matches!(
+            selection.attempt,
+            dynamo_kv_router::scheduling::AdmissionAttempt::Tracked(_)
+        )
+        .then(|| selection.raw_cache_coverage.clone()),
     });
 }
 
