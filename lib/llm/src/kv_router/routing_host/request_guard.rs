@@ -25,6 +25,7 @@ use crate::{
         preprocessor::MigrationState,
         timing::{RequestPhase, RequestTracker},
     },
+    request_trace::RequestCacheTierTokens,
 };
 use dynamo_kv_router::{
     indexer::{ApproximateAcquireMode, ApproximateLruBlock, RoutingDecisionHashes},
@@ -110,6 +111,10 @@ impl CacheLossTracking {
             request,
         }
     }
+}
+
+fn tier_tokens([hbm, cpu]: [u64; 2]) -> RequestCacheTierTokens {
+    RequestCacheTierTokens { hbm, cpu }
 }
 
 fn cache_loss_stages(
@@ -703,6 +708,9 @@ where
             request_metrics.requests_started_total().inc();
             if let Some(cache_loss) = cache_loss {
                 request_metrics.observe_cache_loss_input(cache_loss.prompt_tokens);
+                if let Some(tracker) = &request.tracker {
+                    tracker.record_cache_loss_route(cache_loss.into_trace());
+                }
             }
         }
         let approximate_lru = cleanup.approximate_lru.clone();
@@ -957,6 +965,10 @@ where
         self.observability
             .request_metrics()
             .observe_cache_loss_funnel(stages);
+        if let Some(tracker) = &self.observability.tracker {
+            let [_, _, found, used] = stages.tiers;
+            tracker.record_cache_loss_outcome(tier_tokens(found), tier_tokens(used));
+        }
         if let Some(history_request) = self.cache_history_request.as_mut() {
             let prompt_hashes = history_request.prompt_hashes();
             let Some(cache_history) = self.cache_history.as_ref() else {

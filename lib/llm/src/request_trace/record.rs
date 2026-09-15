@@ -77,6 +77,7 @@ pub(crate) fn emit_request_end(
         input_tokens: tracker.isl_tokens().map(|v| v as u64),
         output_tokens: Some(tracker.osl_tokens()),
         cached_tokens: tracker.cached_tokens().map(|v| v as u64),
+        cache_loss: tracker.cache_loss_trace(),
         request_received_ms: Some(timing.request_received_ms),
         prefill_wait_time_ms: timing.prefill_wait_time_ms,
         prefill_time_ms: timing.prefill_time_ms,
@@ -196,6 +197,18 @@ mod tests {
         tracker.record_isl(8, Some(4));
         tracker.record_kv_hit(2.0, 4);
         tracker.record_osl(7);
+        tracker.record_cache_loss_route(crate::request_trace::RequestCacheLossTrace {
+            prompt_tokens: 8,
+            previously_computed_tokens: 6,
+            best_eligible: crate::request_trace::RequestCacheTierTokens { hbm: 4, cpu: 2 },
+            selected: crate::request_trace::RequestCacheTierTokens { hbm: 4, cpu: 0 },
+            found: None,
+            used: None,
+        });
+        tracker.record_cache_loss_outcome(
+            crate::request_trace::RequestCacheTierTokens { hbm: 4, cpu: 2 },
+            crate::request_trace::RequestCacheTierTokens { hbm: 4, cpu: 1 },
+        );
         tracker.record_finish();
 
         emit_request_end(
@@ -224,6 +237,16 @@ mod tests {
         assert_eq!(request.output_tokens, Some(7));
         assert_eq!(request.cached_tokens, Some(4));
         assert_eq!(request.kv_hit_rate, Some(0.5));
+        let cache_loss = request
+            .cache_loss
+            .as_ref()
+            .expect("cache-loss funnel on the trace");
+        assert_eq!(cache_loss.previously_computed_tokens, 6);
+        assert_eq!(cache_loss.best_eligible.cpu, 2);
+        assert_eq!(cache_loss.used.map(|used| used.cpu), Some(1));
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["cache_loss"]["selected"]["hbm"], 4);
+        assert_eq!(json["cache_loss"]["found"]["cpu"], 2);
         assert_eq!(
             request.request_received_ms,
             Some(tracker.request_received_epoch_ms())

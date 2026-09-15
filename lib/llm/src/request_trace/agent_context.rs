@@ -211,6 +211,7 @@ pub(crate) fn request_metrics(
         input_tokens: tracker.and_then(|tracker| tracker.isl_tokens().map(|v| v as u64)),
         output_tokens: tracker.map(RequestTracker::osl_tokens),
         cached_tokens: tracker.and_then(|tracker| tracker.cached_tokens().map(|v| v as u64)),
+        cache_loss: tracker.and_then(RequestTracker::cache_loss_trace),
         request_received_ms: timing.as_ref().map(|timing| timing.request_received_ms),
         prefill_wait_time_ms: timing
             .as_ref()

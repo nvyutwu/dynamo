@@ -356,6 +356,30 @@ pub struct CacheLossStages {
     pub tiers: [[u64; 2]; 4],
 }
 
+impl RouteObservation {
+    /// The router half of the request-trace funnel; the engine half is filled in when the
+    /// worker reports.
+    pub fn into_trace(self) -> crate::request_trace::RequestCacheLossTrace {
+        crate::request_trace::RequestCacheLossTrace {
+            prompt_tokens: self.prompt_tokens,
+            previously_computed_tokens: self.previously_computed_tokens,
+            best_eligible: self.best_router_tiers.into(),
+            selected: self.selected_router_tiers.into(),
+            found: None,
+            used: None,
+        }
+    }
+}
+
+impl From<TierTokens> for crate::request_trace::RequestCacheTierTokens {
+    fn from(tiers: TierTokens) -> Self {
+        Self {
+            hbm: tiers.hbm,
+            cpu: tiers.cpu,
+        }
+    }
+}
+
 /// Resident prompt tokens split by KV storage tier, in raw (unweighted) tokens.
 ///
 /// `hbm` is the contiguous prefix in GPU memory; `cpu` is the host-pinned continuation

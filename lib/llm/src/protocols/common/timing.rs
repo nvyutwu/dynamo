@@ -21,6 +21,7 @@ use crate::http::service::metrics::{
     WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE,
 };
 use crate::protocols::common::extensions::WorkerIdInfo;
+use crate::request_trace::{RequestCacheLossTrace, RequestCacheTierTokens};
 
 /// Worker type constants for Prometheus metric labels.
 /// These are stored in RequestTracker at routing time to avoid costly MDC lookups
@@ -116,6 +117,11 @@ pub struct RequestTracker {
 
     /// Number of cached tokens derived from the effective cache hit - set once via OnceLock
     cached_tokens: OnceLock<usize>,
+
+    /// Cache-reuse funnel for the request trace. The router half is set at selection, the
+    /// engine half when the worker's final outcome arrives; only present when the
+    /// cache-loss funnel is enabled.
+    cache_loss: Mutex<Option<RequestCacheLossTrace>>,
 
     /// Output sequence length in tokens - updated atomically as tokens stream back
     osl_tokens: AtomicU64,
@@ -227,6 +233,7 @@ impl RequestTracker {
             isl_blocks: OnceLock::new(),
             isl_tokens: OnceLock::new(),
             cached_tokens: OnceLock::new(),
+            cache_loss: Mutex::new(None),
             osl_tokens: AtomicU64::new(0),
             prefill_worker_id: OnceLock::new(),
             prefill_dp_rank: OnceLock::new(),
@@ -287,6 +294,28 @@ impl RequestTracker {
 
     pub fn cached_tokens(&self) -> Option<usize> {
         self.cached_tokens.get().copied()
+    }
+
+    /// Record the router-side cache-reuse stages (F0-F3) decided at worker selection.
+    pub fn record_cache_loss_route(&self, route: RequestCacheLossTrace) {
+        *self.cache_loss.lock() = Some(route);
+    }
+
+    /// Record the engine-side stages (F4 found, F5 used) once the worker reports them.
+    /// A no-op if the router side was never recorded (funnel disabled or query-only).
+    pub fn record_cache_loss_outcome(
+        &self,
+        found: RequestCacheTierTokens,
+        used: RequestCacheTierTokens,
+    ) {
+        if let Some(trace) = self.cache_loss.lock().as_mut() {
+            trace.found = Some(found);
+            trace.used = Some(used);
+        }
+    }
+
+    pub fn cache_loss_trace(&self) -> Option<RequestCacheLossTrace> {
+        self.cache_loss.lock().clone()
     }
 
     /// Record current output sequence length in tokens. Updated at each output block boundary.
@@ -755,6 +784,61 @@ pub struct TimingInfo {
 
 #[cfg(test)]
 mod tests {
+    use crate::request_trace::{RequestCacheLossTrace, RequestCacheTierTokens};
+
+    fn route_trace() -> RequestCacheLossTrace {
+        RequestCacheLossTrace {
+            prompt_tokens: 128,
+            previously_computed_tokens: 96,
+            best_eligible: RequestCacheTierTokens { hbm: 64, cpu: 32 },
+            selected: RequestCacheTierTokens { hbm: 64, cpu: 0 },
+            found: None,
+            used: None,
+        }
+    }
+
+    #[test]
+    fn cache_loss_trace_is_absent_until_the_router_records_it() {
+        let tracker = RequestTracker::new();
+        assert_eq!(tracker.cache_loss_trace(), None);
+        // An outcome without a route (funnel disabled, query-only) is dropped, not invented.
+        tracker.record_cache_loss_outcome(
+            RequestCacheTierTokens { hbm: 1, cpu: 1 },
+            RequestCacheTierTokens { hbm: 1, cpu: 1 },
+        );
+        assert_eq!(tracker.cache_loss_trace(), None);
+    }
+
+    #[test]
+    fn cache_loss_trace_keeps_router_stages_when_the_engine_never_reports() {
+        // A request cancelled before the worker's final item still traces F0-F3.
+        let tracker = RequestTracker::new();
+        tracker.record_cache_loss_route(route_trace());
+        let trace = tracker.cache_loss_trace().expect("router half recorded");
+        assert_eq!(
+            trace.best_eligible,
+            RequestCacheTierTokens { hbm: 64, cpu: 32 }
+        );
+        assert_eq!(trace.found, None);
+        assert_eq!(trace.used, None);
+    }
+
+    #[test]
+    fn cache_loss_trace_adds_engine_stages_on_outcome() {
+        let tracker = RequestTracker::new();
+        tracker.record_cache_loss_route(route_trace());
+        tracker.record_cache_loss_outcome(
+            RequestCacheTierTokens { hbm: 64, cpu: 16 },
+            RequestCacheTierTokens { hbm: 64, cpu: 8 },
+        );
+        let trace = tracker.cache_loss_trace().expect("recorded");
+        assert_eq!(trace.selected, RequestCacheTierTokens { hbm: 64, cpu: 0 });
+        assert_eq!(
+            trace.found,
+            Some(RequestCacheTierTokens { hbm: 64, cpu: 16 })
+        );
+        assert_eq!(trace.used, Some(RequestCacheTierTokens { hbm: 64, cpu: 8 }));
+    }
     use super::*;
     use std::thread;
     use std::time::Duration;

@@ -116,6 +116,40 @@ pub struct RequestTraceMetrics {
     pub replay: Option<RequestReplayMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason_metadata: Option<FinishReasonMetadata>,
+    /// Cache-reuse funnel for this request, present only when
+    /// `DYN_CACHE_LOSS_FUNNEL_ENABLED` is set. Carries the same numbers as the
+    /// `router_cache_loss_funnel*` metrics so trace and dashboard reconcile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_loss: Option<RequestCacheLossTrace>,
+}
+
+/// Prompt tokens split by KV storage tier: `hbm` is the GPU prefix, `cpu` the host-pinned
+/// continuation beyond it. Raw token counts, no weighting.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestCacheTierTokens {
+    pub hbm: u64,
+    pub cpu: u64,
+}
+
+/// Per-request cache-reuse stages. Router-side stages are what the router believed at
+/// decision time; engine-side stages are what the worker reported after execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestCacheLossTrace {
+    /// F0: prompt tokens.
+    pub prompt_tokens: u64,
+    /// F1: leading prompt tokens whose blocks Dynamo has computed within the history window.
+    pub previously_computed_tokens: u64,
+    /// F2: router-predicted resident tokens on the eligible worker holding the most.
+    pub best_eligible: RequestCacheTierTokens,
+    /// F3: router-predicted resident tokens on the selected worker.
+    pub selected: RequestCacheTierTokens,
+    /// F4: tokens the engine found (`hbm` = GPU hit, `cpu` = looked up in host cache).
+    /// Absent when the request ended before the worker reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found: Option<RequestCacheTierTokens>,
+    /// F5: tokens the engine reused (`hbm` = GPU hit, `cpu` = host cache hit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<RequestCacheTierTokens>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,6 +373,7 @@ mod tests {
                     input_sequence_hashes: vec![11, 22],
                 }),
                 finish_reason_metadata: None,
+                cache_loss: None,
             }),
             tool: None,
             payload: None,
