@@ -137,6 +137,9 @@ pub struct SchedulingResponse {
     /// Greatest router-visible cached-token count among eligible workers.
     pub max_cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    /// Raw per-tier overlap on the eligible worker with the most resident blocks, from the
+    /// same exact inputs as `selected_worker_tiers`. Cache-loss telemetry only.
+    pub best_eligible_worker_tiers: SelectedWorkerTierSnapshot,
     pub target_cached_prefix_blocks: u32,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub potential_decode_blocks: usize,

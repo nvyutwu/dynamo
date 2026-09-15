@@ -342,8 +342,48 @@ impl CacheHistoryRequest {
 pub struct RouteObservation {
     pub prompt_tokens: u64,
     pub previously_computed_tokens: u64,
-    pub best_router_tokens: u64,
-    pub selected_router_tokens: u64,
+    /// Raw resident tokens per tier on the eligible worker holding the most (F2).
+    pub best_router_tiers: TierTokens,
+    /// Raw resident tokens per tier on the worker the router selected (F3).
+    pub selected_router_tiers: TierTokens,
+}
+
+/// The six funnel stages of one request: `totals` is F0..F5 in raw tokens, `tiers` splits
+/// F2..F5 into `[hbm, cpu]` (F0 and F1 have no tier). Each tier pair sums to its total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheLossStages {
+    pub totals: [u64; 6],
+    pub tiers: [[u64; 2]; 4],
+}
+
+/// Resident prompt tokens split by KV storage tier, in raw (unweighted) tokens.
+///
+/// `hbm` is the contiguous prefix in GPU memory; `cpu` is the host-pinned continuation
+/// beyond it, so the two never overlap and `total()` is the worker's reusable prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TierTokens {
+    pub hbm: u64,
+    pub cpu: u64,
+}
+
+impl TierTokens {
+    /// Convert the router's per-tier block snapshot to tokens. The snapshot's host count is
+    /// cumulative (it includes the HBM prefix), so the CPU share is the host count beyond HBM.
+    pub fn from_snapshot(
+        snapshot: &dynamo_kv_router::scheduling::SelectedWorkerTierSnapshot,
+        block_size: u64,
+    ) -> Self {
+        let hbm = u64::from(snapshot.gpu_blocks) * block_size;
+        let host = u64::from(snapshot.host_pinned_blocks) * block_size;
+        Self {
+            hbm,
+            cpu: host.saturating_sub(hbm),
+        }
+    }
+
+    pub fn total(self) -> u64 {
+        self.hbm + self.cpu
+    }
 }
 
 #[cfg(test)]

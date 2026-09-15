@@ -368,8 +368,8 @@ where
                     previously_computed_tokens: cache_history
                         .lock()
                         .previously_computed_tokens(&prompt_hashes),
-                    best_router_tokens: selection.max_cached_tokens as u64,
-                    selected_router_tokens: selection.cached_tokens as u64,
+                    best_router_tiers: selection.best_router_tiers,
+                    selected_router_tiers: selection.selected_router_tiers,
                 };
                 CacheLossTracking::new(cache_loss, Arc::clone(cache_history), cache_history_request)
             });

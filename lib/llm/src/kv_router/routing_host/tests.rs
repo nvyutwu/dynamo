@@ -704,8 +704,8 @@ async fn terminal_item_does_not_skip_transport_eof() {
             RouteObservation {
                 prompt_tokens: 1,
                 previously_computed_tokens: 0,
-                best_router_tokens: 0,
-                selected_router_tokens: 0,
+                best_router_tiers: Default::default(),
+                selected_router_tiers: Default::default(),
             },
             Arc::new(parking_lot::Mutex::new(CacheHistory::new(1, 1))),
             CacheHistoryRequest::new(vec![1], None, None, None, 1, false),

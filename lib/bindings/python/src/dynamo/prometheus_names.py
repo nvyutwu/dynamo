@@ -125,6 +125,32 @@ class frontend_service:
     NON_MAX_OVERLAP_SELECTIONS_TOTAL = "non_max_overlap_selections_total"
     # Effective KV overlap blocks lost by non-max-overlap selections
     OVERLAP_BLOCKS_LOST = "overlap_blocks_lost"
+    # Prompt tokens observed by cache-loss accounting, including incomplete outcomes (opt-in funnel)
+    CACHE_LOSS_OBSERVATION_INPUT_TOKENS_TOTAL = (
+        "cache_loss_observation_input_tokens_total"
+    )
+    # Tokens at each cache-loss funnel stage f0-f5, raw and unclamped; later stages may exceed earlier ones
+    CACHE_LOSS_FUNNEL_TOKENS_TOTAL = "cache_loss_funnel_tokens_total"
+    # Tokens at cache-loss stages f2-f5 split by KV storage tier (`hbm`, `cpu` beyond hbm); tiers sum to the stage total
+    CACHE_LOSS_FUNNEL_TIER_TOKENS_TOTAL = "cache_loss_funnel_tier_tokens_total"
+    # Cache-loss funnel observations by result (complete, incomplete)
+    CACHE_LOSS_OBSERVATIONS_TOTAL = "cache_loss_observations_total"
+    # Complete canonical sequence-hash records currently retained for cache-loss history
+    CACHE_LOSS_HISTORY_BLOCK_RECORDS = "cache_loss_history_block_records"
+    # Distinct canonical sequence hashes currently retained for cache-loss history
+    CACHE_LOSS_HISTORY_UNIQUE_HASHES = "cache_loss_history_unique_hashes"
+    # Estimated full KV tokens represented by retained cache-loss history records
+    CACHE_LOSS_HISTORY_REPRESENTED_TOKENS = "cache_loss_history_represented_tokens"
+    # Conservative estimated bytes used by retained cache-loss history records
+    CACHE_LOSS_HISTORY_ESTIMATED_BYTES = "cache_loss_history_estimated_bytes"
+    # Configured byte budget for cache-loss history records
+    CACHE_LOSS_HISTORY_CAPACITY_BYTES = "cache_loss_history_capacity_bytes"
+    # Configured maximum complete canonical sequence-hash records retained for cache-loss history
+    CACHE_LOSS_HISTORY_CAPACITY_BLOCKS = "cache_loss_history_capacity_blocks"
+    # Approximate retention horizon: age of the oldest retained cache-loss history chunk
+    CACHE_LOSS_HISTORY_OLDEST_CHUNK_AGE_SECONDS = (
+        "cache_loss_history_oldest_chunk_age_seconds"
+    )
     # Number of cached tokens (prefix cache hits) per request
     CACHED_TOKENS = "cached_tokens"
     # Tokenizer latency in milliseconds
@@ -471,6 +497,34 @@ class router:
     NON_MAX_OVERLAP_SELECTIONS_TOTAL = "router_non_max_overlap_selections_total"
     # Effective KV overlap blocks lost by non-max-overlap selections
     OVERLAP_BLOCKS_LOST = "router_overlap_blocks_lost"
+    # Prompt tokens observed by cache-loss accounting, including incomplete outcomes (opt-in funnel)
+    CACHE_LOSS_OBSERVATION_INPUT_TOKENS_TOTAL = (
+        "router_cache_loss_observation_input_tokens_total"
+    )
+    # Tokens at each cache-loss funnel stage f0-f5, raw and unclamped; later stages may exceed earlier ones
+    CACHE_LOSS_FUNNEL_TOKENS_TOTAL = "router_cache_loss_funnel_tokens_total"
+    # Tokens at cache-loss stages f2-f5 split by KV storage tier (`hbm`, `cpu` beyond hbm); tiers sum to the stage total
+    CACHE_LOSS_FUNNEL_TIER_TOKENS_TOTAL = "router_cache_loss_funnel_tier_tokens_total"
+    # Cache-loss funnel observations by result (complete, incomplete)
+    CACHE_LOSS_OBSERVATIONS_TOTAL = "router_cache_loss_observations_total"
+    # Complete canonical sequence-hash records currently retained for cache-loss history
+    CACHE_LOSS_HISTORY_BLOCK_RECORDS = "router_cache_loss_history_block_records"
+    # Distinct canonical sequence hashes currently retained for cache-loss history
+    CACHE_LOSS_HISTORY_UNIQUE_HASHES = "router_cache_loss_history_unique_hashes"
+    # Estimated full KV tokens represented by retained cache-loss history records
+    CACHE_LOSS_HISTORY_REPRESENTED_TOKENS = (
+        "router_cache_loss_history_represented_tokens"
+    )
+    # Conservative estimated bytes used by retained cache-loss history records
+    CACHE_LOSS_HISTORY_ESTIMATED_BYTES = "router_cache_loss_history_estimated_bytes"
+    # Configured byte budget for cache-loss history records
+    CACHE_LOSS_HISTORY_CAPACITY_BYTES = "router_cache_loss_history_capacity_bytes"
+    # Configured maximum complete canonical sequence-hash records retained for cache-loss history
+    CACHE_LOSS_HISTORY_CAPACITY_BLOCKS = "router_cache_loss_history_capacity_blocks"
+    # Approximate retention horizon: age of the oldest retained cache-loss history chunk
+    CACHE_LOSS_HISTORY_OLDEST_CHUNK_AGE_SECONDS = (
+        "router_cache_loss_history_oldest_chunk_age_seconds"
+    )
     # Whether the router currently has a worker/dp_rank registered (1 = registered)
     WORKER_REGISTERED = "router_worker_registered"
 

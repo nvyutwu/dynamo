@@ -66,13 +66,19 @@ use crate::http::service::metrics::generate_log_buckets;
 use crate::protocols::common::timing::WORKER_TYPE_PREFILL;
 use dynamo_kv_router::indexer::ApproximateLruStats;
 
-use super::minimal_cache_loss::CacheHistoryStats;
+use super::minimal_cache_loss::{CacheHistoryStats, CacheLossStages};
 
 pub(crate) const ROUTER_WORKER_ID_LABEL: &str = "router_worker_id";
 const TARGET_NAMESPACE_LABEL: &str = "target_namespace";
 const TARGET_COMPONENT_LABEL: &str = "target_component";
 const TARGET_ENDPOINT_LABEL: &str = "target_endpoint";
 const CACHE_LOSS_FUNNEL_STAGES: [&str; 6] = ["f0", "f1", "f2", "f3", "f4", "f5"];
+/// Stages with a per-tier split: router residency (f2, f3) and worker reuse (f4, f5). f0 and
+/// f1 describe the prompt and Dynamo-wide history and have no tier.
+const CACHE_LOSS_TIERED_STAGES: [&str; 4] = ["f2", "f3", "f4", "f5"];
+/// `hbm` is the GPU prefix; `cpu` is the host-pinned continuation beyond it. The two never
+/// overlap, so summing over `tier` reproduces the stage total.
+const CACHE_LOSS_TIERS: [&str; 2] = ["hbm", "cpu"];
 
 /// Buckets for CPU-bound compute phases (block hashing, sequence hashing).
 fn compute_overhead_buckets() -> Vec<f64> {
@@ -859,6 +865,7 @@ pub struct RouterRequestMetrics {
     pub overlap_blocks_lost: HistogramVec,
     pub cache_loss_observation_input_tokens_total: prometheus::IntCounter,
     pub cache_loss_funnel_tokens_total: IntCounterVec,
+    pub cache_loss_funnel_tier_tokens_total: IntCounterVec,
     pub cache_loss_observations_total: IntCounterVec,
     pub cache_loss_history_block_records: IntGauge,
     pub cache_loss_history_unique_hashes: IntGauge,
@@ -1004,22 +1011,30 @@ impl RouterRequestMetrics {
                 overlap_blocks_lost.with_label_values(&[WORKER_TYPE_PREFILL]);
                 let cache_loss_observation_input_tokens_total = metrics
                     .create_intcounter(
-                        &router_metric("cache_loss_observation_input_tokens_total"),
+                        &router_metric(frontend_service::CACHE_LOSS_OBSERVATION_INPUT_TOKENS_TOTAL),
                         "Prompt tokens observed by cache-loss accounting, including incomplete outcomes",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_observation_input_tokens_total");
                 let cache_loss_funnel_tokens_total = metrics
                     .create_intcountervec(
-                        &router_metric("cache_loss_funnel_tokens_total"),
+                        &router_metric(frontend_service::CACHE_LOSS_FUNNEL_TOKENS_TOTAL),
                         "Tokens observed at each cache-loss stage; later stages may exceed earlier stages",
                         &["stage"],
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_funnel_tokens_total");
+                let cache_loss_funnel_tier_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric(frontend_service::CACHE_LOSS_FUNNEL_TIER_TOKENS_TOTAL),
+                        "Tokens observed at cache-loss stages f2-f5 split by KV storage tier (hbm, cpu beyond hbm); tiers sum to the stage total",
+                        &["stage", "tier"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_funnel_tier_tokens_total");
                 let cache_loss_observations_total = metrics
                     .create_intcountervec(
-                        &router_metric("cache_loss_observations_total"),
+                        &router_metric(frontend_service::CACHE_LOSS_OBSERVATIONS_TOTAL),
                         "Cache-loss funnel observations by result",
                         &["result"],
                         extra_labels,
@@ -1028,54 +1043,59 @@ impl RouterRequestMetrics {
                 for stage in CACHE_LOSS_FUNNEL_STAGES {
                     cache_loss_funnel_tokens_total.with_label_values(&[stage]);
                 }
+                for stage in CACHE_LOSS_TIERED_STAGES {
+                    for tier in CACHE_LOSS_TIERS {
+                        cache_loss_funnel_tier_tokens_total.with_label_values(&[stage, tier]);
+                    }
+                }
                 for result in ["complete", "incomplete"] {
                     cache_loss_observations_total.with_label_values(&[result]);
                 }
                 let cache_loss_history_block_records = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_block_records"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_BLOCK_RECORDS),
                         "Complete canonical sequence-hash records currently retained for cache-loss history",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_block_records");
                 let cache_loss_history_unique_hashes = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_unique_hashes"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_UNIQUE_HASHES),
                         "Distinct canonical sequence hashes currently retained for cache-loss history",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_unique_hashes");
                 let cache_loss_history_represented_tokens = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_represented_tokens"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_REPRESENTED_TOKENS),
                         "Estimated full KV tokens represented by retained cache-loss history records",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_represented_tokens");
                 let cache_loss_history_estimated_bytes = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_estimated_bytes"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_ESTIMATED_BYTES),
                         "Conservative estimated bytes used by retained cache-loss history records",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_estimated_bytes");
                 let cache_loss_history_capacity_bytes = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_capacity_bytes"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_CAPACITY_BYTES),
                         "Configured byte budget for cache-loss history records",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_capacity_bytes");
                 let cache_loss_history_capacity_blocks = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_capacity_blocks"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_CAPACITY_BLOCKS),
                         "Configured maximum complete canonical sequence-hash records retained for cache-loss history",
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_capacity_blocks");
                 let cache_loss_history_oldest_chunk_age_seconds = metrics
                     .create_intgauge(
-                        &router_metric("cache_loss_history_oldest_chunk_age_seconds"),
+                        &router_metric(frontend_service::CACHE_LOSS_HISTORY_OLDEST_CHUNK_AGE_SECONDS),
                         "Approximate retention horizon: age of the oldest retained cache-loss history chunk",
                         extra_labels,
                     )
@@ -1094,6 +1114,7 @@ impl RouterRequestMetrics {
                     overlap_blocks_lost,
                     cache_loss_observation_input_tokens_total,
                     cache_loss_funnel_tokens_total,
+                    cache_loss_funnel_tier_tokens_total,
                     cache_loss_observations_total,
                     cache_loss_history_block_records,
                     cache_loss_history_unique_hashes,
@@ -1123,11 +1144,18 @@ impl RouterRequestMetrics {
             .inc_by(prompt_tokens);
     }
 
-    pub fn observe_cache_loss_funnel(&self, stages: [u64; CACHE_LOSS_FUNNEL_STAGES.len()]) {
-        for (stage, tokens) in CACHE_LOSS_FUNNEL_STAGES.into_iter().zip(stages) {
+    pub fn observe_cache_loss_funnel(&self, stages: CacheLossStages) {
+        for (stage, tokens) in CACHE_LOSS_FUNNEL_STAGES.into_iter().zip(stages.totals) {
             self.cache_loss_funnel_tokens_total
                 .with_label_values(&[stage])
                 .inc_by(tokens);
+        }
+        for (stage, tiers) in CACHE_LOSS_TIERED_STAGES.into_iter().zip(stages.tiers) {
+            for (tier, tokens) in CACHE_LOSS_TIERS.into_iter().zip(tiers) {
+                self.cache_loss_funnel_tier_tokens_total
+                    .with_label_values(&[stage, tier])
+                    .inc_by(tokens);
+            }
         }
         self.cache_loss_observations_total
             .with_label_values(&["complete"])

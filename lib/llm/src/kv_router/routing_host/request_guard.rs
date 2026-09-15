@@ -10,7 +10,9 @@ use crate::{
         KvRouter,
         indexer::ApproximateRequestLease,
         metrics::RouterRequestMetrics,
-        minimal_cache_loss::{CacheHistory, CacheHistoryRequest, RouteObservation},
+        minimal_cache_loss::{
+            CacheHistory, CacheHistoryRequest, CacheLossStages, RouteObservation,
+        },
         prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
         request_lease::RequestAttemptLease,
         scheduler::{DefaultWorkerSelector, SchedulerBookingDescriptor},
@@ -113,15 +115,28 @@ impl CacheLossTracking {
 fn cache_loss_stages(
     route: RouteObservation,
     outcome: &CacheLossWorkerOutcome,
-) -> Option<[u64; 6]> {
+) -> Option<CacheLossStages> {
     let f1 = route.previously_computed_tokens;
-    let f2 = route.best_router_tokens;
-    let f3 = route.selected_router_tokens;
-    let f4 = outcome
-        .gpu_hit_tokens
-        .checked_add(outcome.cpu_lookup_tokens)?;
-    let f5 = outcome.gpu_hit_tokens.checked_add(outcome.cpu_hit_tokens)?;
-    Some([route.prompt_tokens, f1, f2, f3, f4, f5])
+    let f2 = [route.best_router_tiers.hbm, route.best_router_tiers.cpu];
+    let f3 = [
+        route.selected_router_tiers.hbm,
+        route.selected_router_tiers.cpu,
+    ];
+    // F4 counts CPU blocks the worker looked up; F5 counts those it actually reused.
+    let f4 = [outcome.gpu_hit_tokens, outcome.cpu_lookup_tokens];
+    let f5 = [outcome.gpu_hit_tokens, outcome.cpu_hit_tokens];
+    let total = |[hbm, cpu]: [u64; 2]| hbm.checked_add(cpu);
+    Some(CacheLossStages {
+        totals: [
+            route.prompt_tokens,
+            f1,
+            total(f2)?,
+            total(f3)?,
+            total(f4)?,
+            total(f5)?,
+        ],
+        tiers: [f2, f3, f4, f5],
+    })
 }
 
 pub(crate) fn prompt_private_blocks(
@@ -1007,14 +1022,15 @@ where
 #[cfg(test)]
 mod cache_loss_tests {
     use super::*;
+    use crate::kv_router::minimal_cache_loss::TierTokens;
 
     #[test]
     fn worker_outcomes_can_exceed_router_observations() {
         let route = RouteObservation {
             prompt_tokens: 100,
             previously_computed_tokens: 80,
-            best_router_tokens: 75,
-            selected_router_tokens: 60,
+            best_router_tiers: TierTokens { hbm: 50, cpu: 25 },
+            selected_router_tiers: TierTokens { hbm: 60, cpu: 0 },
         };
         let outcome = CacheLossWorkerOutcome {
             complete: true,
@@ -1026,7 +1042,10 @@ mod cache_loss_tests {
 
         assert_eq!(
             cache_loss_stages(route, &outcome),
-            Some([100, 80, 75, 60, 90, 85])
+            Some(CacheLossStages {
+                totals: [100, 80, 75, 60, 90, 85],
+                tiers: [[50, 25], [60, 0], [70, 20], [70, 15]],
+            })
         );
     }
 
@@ -1035,8 +1054,8 @@ mod cache_loss_tests {
         let route = RouteObservation {
             prompt_tokens: 100,
             previously_computed_tokens: 120,
-            best_router_tokens: 110,
-            selected_router_tokens: 105,
+            best_router_tiers: TierTokens { hbm: 110, cpu: 0 },
+            selected_router_tiers: TierTokens { hbm: 100, cpu: 5 },
         };
         let outcome = CacheLossWorkerOutcome {
             complete: true,
@@ -1047,7 +1066,7 @@ mod cache_loss_tests {
         };
 
         assert_eq!(
-            cache_loss_stages(route, &outcome),
+            cache_loss_stages(route, &outcome).map(|stages| stages.totals),
             Some([100, 120, 110, 105, 140, 135])
         );
     }
@@ -1057,8 +1076,8 @@ mod cache_loss_tests {
         let route = RouteObservation {
             prompt_tokens: 100,
             previously_computed_tokens: 80,
-            best_router_tokens: 75,
-            selected_router_tokens: 60,
+            best_router_tiers: TierTokens { hbm: 75, cpu: 0 },
+            selected_router_tiers: TierTokens { hbm: 60, cpu: 0 },
         };
         let outcome = CacheLossWorkerOutcome {
             complete: true,
@@ -1268,6 +1287,11 @@ mod prefill_start_tests {
                 "cache_loss_observation_input_tokens_total",
             ),
             cache_loss_funnel_tokens_total: counter_vec("cache_loss_funnel_tokens_total", "stage"),
+            cache_loss_funnel_tier_tokens_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("cache_loss_funnel_tier_tokens_total", "test"),
+                &["stage", "tier"],
+            )
+            .unwrap(),
             cache_loss_observations_total: counter_vec("cache_loss_observations_total", "result"),
             cache_loss_history_block_records: gauge("cache_loss_history_block_records"),
             cache_loss_history_unique_hashes: gauge("cache_loss_history_unique_hashes"),

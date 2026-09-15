@@ -351,6 +351,8 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         max_cached_tokens: usize,
+        selected_router_tiers: minimal_cache_loss::TierTokens,
+        best_router_tiers: minimal_cache_loss::TierTokens,
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
@@ -371,6 +373,8 @@ pub enum FindBestMatchAdvisoryOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         max_cached_tokens: usize,
+        selected_router_tiers: minimal_cache_loss::TierTokens,
+        best_router_tiers: minimal_cache_loss::TierTokens,
         potential_decode_blocks: u64,
         selected_worker_load: scheduling::AdvisoryWorkerLoad,
         routing_hashes: Option<RoutingDecisionHashes>,
@@ -1780,6 +1784,15 @@ where
             "find_best_match completed"
         );
 
+        let block_size = u64::from(self.block_size());
+        let selected_router_tiers = minimal_cache_loss::TierTokens::from_snapshot(
+            &response.selected_worker_tiers,
+            block_size,
+        );
+        let best_router_tiers = minimal_cache_loss::TierTokens::from_snapshot(
+            &response.best_eligible_worker_tiers,
+            block_size,
+        );
         match admission {
             FindBestMatchAdmission::WithAdmission { .. } => Ok(
                 FindBestMatchInnerOutcome::WithAdmission(AdmittedFindBestMatchOutcome {
@@ -1789,6 +1802,8 @@ where
                         effective_overlap_blocks: response.effective_overlap_blocks,
                         cached_tokens: response.cached_tokens,
                         max_cached_tokens: response.max_cached_tokens,
+                        selected_router_tiers,
+                        best_router_tiers,
                         potential_decode_blocks: response.potential_decode_blocks as u64,
                         routing_hashes,
                         kv_hint,
@@ -1803,6 +1818,8 @@ where
                     effective_overlap_blocks: response.effective_overlap_blocks,
                     cached_tokens: response.cached_tokens,
                     max_cached_tokens: response.max_cached_tokens,
+                    selected_router_tiers,
+                    best_router_tiers,
                     potential_decode_blocks: response.potential_decode_blocks as u64,
                     selected_worker_load: selected_worker_load
                         .expect("without-admission selection returns advisory load"),
