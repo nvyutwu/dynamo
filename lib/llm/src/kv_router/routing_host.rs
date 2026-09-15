@@ -9,7 +9,9 @@ use std::{
 };
 
 use dynamo_kv_router::{
-    protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
+    protocols::{
+        TokensWithHashes, WorkerConfigLike, WorkerWithDpRank, cache_reuse_funnel_f2_onward_enabled,
+    },
     selector::{WorkerInputs, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -248,6 +250,7 @@ where
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     policy: RoutingPolicy<Sel>,
     request_metrics: Arc<RouterRequestMetrics>,
+    cache_reuse_funnel_f2_onward_enabled: bool,
     affinity: Option<AffinityCoordinator>,
     session_affinity_mode: SessionAffinityMode,
     hosted_occupancy: Option<HostedOccupancy>,
@@ -420,11 +423,13 @@ where
         // and the standalone router create RoutingHost, so this covers both.
         let request_metrics =
             RouterRequestMetrics::from_component(kv_router.client().endpoint.component());
+        let cache_reuse_funnel_f2_onward_enabled = cache_reuse_funnel_f2_onward_enabled();
 
         RoutingHost {
             inner,
             policy: RoutingPolicy::Kv(kv_router),
             request_metrics,
+            cache_reuse_funnel_f2_onward_enabled,
             affinity,
             session_affinity_mode,
             hosted_occupancy: None,
@@ -513,6 +518,7 @@ where
             inner,
             policy,
             request_metrics,
+            cache_reuse_funnel_f2_onward_enabled: false,
             affinity,
             session_affinity_mode,
             hosted_occupancy,
@@ -793,9 +799,6 @@ where
                 );
                 tracker.record_router_queue_depth(self.kv_router().pending_count());
             }
-            self.request_metrics
-                .input_sequence_tokens
-                .observe(request.token_ids.len() as f64);
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker

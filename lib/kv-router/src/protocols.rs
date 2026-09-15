@@ -22,6 +22,21 @@ const fn default_track_prefill_tokens() -> bool {
 /// The event subject that workers publish KV cache events on.
 pub const KV_EVENT_SUBJECT: &str = "kv-events";
 
+/// Enables request-level router/worker cache reuse stage telemetry.
+/// Disabled by default.
+pub const CACHE_REUSE_METRICS_ENABLED_ENV: &str = "DYN_ROUTER_CACHE_REUSE_METRICS";
+
+static CACHE_REUSE_METRICS_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| dynamo_truthy::env_is_truthy(CACHE_REUSE_METRICS_ENABLED_ENV));
+
+/// Returns the process-level worker-stage telemetry setting.
+///
+/// The environment is read once so the disabled request path is only a cached
+/// boolean branch and performs no allocation or metadata collection.
+pub fn cache_reuse_funnel_f2_onward_enabled() -> bool {
+    *CACHE_REUSE_METRICS_ENABLED
+}
+
 /// Seed for XXH3 hashing, consistent with indexer.rs
 pub const XXH3_SEED: u64 = 1337;
 
@@ -1118,6 +1133,10 @@ pub struct WorkerSelectionResult {
 
     /// Approximate cached-token count derived from the weighted cache hit.
     pub cached_tokens: usize,
+
+    /// Greatest raw router-visible overlap among eligible workers, in tokens,
+    /// when worker-stage telemetry is enabled.
+    pub max_raw_cached_tokens: Option<usize>,
 
     /// Selected worker's projected decode load after adding this request's
     /// prompt blocks, in scheduler-tracked block units.
