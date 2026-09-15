@@ -373,25 +373,6 @@ fn convert_input_content_to_text(content: &[InputContent]) -> String {
         .join("")
 }
 
-/// Counterpart to `convert_input_content_to_text` for upstream's
-/// `InputContent`. Reachable only via `FunctionCallOutput::Content`, which is
-/// not Dynamo-owned and therefore carries upstream variants. The sibling
-/// `EasyInputContent::ContentList` is Dynamo-owned and routed through
-/// `convert_input_content_to_text` / `convert_input_content_to_user_content`.
-fn convert_upstream_input_content_to_text(
-    content: &[dynamo_protocols::types::responses::UpstreamInputContent],
-) -> String {
-    use dynamo_protocols::types::responses::UpstreamInputContent;
-    content
-        .iter()
-        .filter_map(|p| match p {
-            UpstreamInputContent::InputText(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 /// Accumulator for consecutive assistant-side items (OutputMessage, FunctionCall,
 /// Reasoning, assistant EasyMessage). Chat Completions represents an assistant
 /// turn as a single message carrying `content`, `tool_calls`, and
@@ -473,6 +454,7 @@ impl PendingAssistant {
             ChatCompletionRequestAssistantMessage {
                 content,
                 reasoning_content,
+                partial: None,
                 refusal: None,
                 name: None,
                 audio: None,
@@ -510,6 +492,7 @@ fn convert_input_items_to_messages(
                                             text,
                                         ),
                                         name: None,
+                                        tools: None,
                                     },
                                 )
                             }
@@ -559,9 +542,7 @@ fn convert_input_items_to_messages(
                     std::mem::take(&mut pending).flush_into(&mut messages);
                     let output_text = match &fco.output {
                         FunctionCallOutput::Text(text) => text.clone(),
-                        FunctionCallOutput::Content(parts) => {
-                            convert_upstream_input_content_to_text(parts)
-                        }
+                        FunctionCallOutput::Content(parts) => convert_input_content_to_text(parts),
                     };
                     messages.push(ChatCompletionRequestMessage::Tool(
                         ChatCompletionRequestToolMessage {
@@ -623,6 +604,7 @@ fn convert_input_items_to_messages(
                             ChatCompletionRequestSystemMessage {
                                 content: ChatCompletionRequestSystemMessageContent::Text(text),
                                 name: None,
+                                tools: None,
                             },
                         ));
                     }
@@ -799,6 +781,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Text(instructions.clone()),
                     name: None,
+                    tools: None,
                 },
             ));
         }
@@ -859,6 +842,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                     ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                         content: ChatCompletionRequestSystemMessageContent::Text(combined),
                         name: None,
+                        tools: None,
                     }),
                 );
             }
