@@ -92,6 +92,9 @@ pub const MAX_TOOLS: usize = 1536;
 // Metadata validation constants removed - we are no longer restricting the metadata field char limits
 /// Both `/v1/messages` and `/v1/responses` define a 128-character tool-name limit.
 pub const MAX_FUNCTION_NAME_LENGTH: usize = 128;
+/// Moonshot's limit for Kimi K3 dynamic tool names declared on system messages
+/// (`messages[].tools`), as enforced by the production K3 frontend.
+pub const MAX_DYNAMIC_TOOL_NAME_LENGTH: usize = 96;
 /// Minimum allowed value for `repetition_penalty`
 pub const MIN_REPETITION_PENALTY: f32 = 0.0;
 /// Maximum allowed value for `repetition_penalty`
@@ -621,6 +624,47 @@ pub fn validate_tools(
                 "Function parameters at index {} for \"{}\" must be a JSON Schema object",
                 i,
                 tool.function.name,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Moonshot's dynamic-tool name rule: an ASCII letter or underscore, then
+/// ASCII letters, digits, underscores, or dashes. Stricter than the top-level
+/// tool rule in [`validate_tools`], which also allows a leading digit.
+fn is_valid_dynamic_tool_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Validates Kimi K3 dynamic tools declared on system messages
+/// (`messages[].tools`).
+///
+/// `dynamo-protocols` already rejects `tools` on any other role and a
+/// non-array value; the K3 renderer rejects entries that are not function
+/// tools and a system message carrying both `content` and `tools`. This
+/// enforces the name policy the vendor API applies to dynamic tools, which
+/// neither of those layers covers.
+pub fn validate_dynamic_system_tools<'a>(
+    tools: impl Iterator<Item = &'a serde_json::Value>,
+) -> Result<(), anyhow::Error> {
+    for (i, tool) in tools.enumerate() {
+        let Some(name) = dynamo_protocols::types::dynamic_tool_name(tool) else {
+            anyhow::bail!("Dynamic tool at index {i} needs a string `function.name`");
+        };
+        if name.len() > MAX_DYNAMIC_TOOL_NAME_LENGTH {
+            anyhow::bail!(
+                "Dynamic tool name at index {i} exceeds {MAX_DYNAMIC_TOOL_NAME_LENGTH} character \
+                 limit, got {} characters",
+                name.len()
+            );
+        }
+        if !is_valid_dynamic_tool_name(name) {
+            anyhow::bail!(
+                "Dynamic tool at index {i} has an invalid name: \"{name}\". Names start with a \
+                 letter or underscore and contain only a-z, A-Z, 0-9, underscores, and dashes."
             );
         }
     }

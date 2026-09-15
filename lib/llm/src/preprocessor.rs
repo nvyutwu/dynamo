@@ -2984,11 +2984,22 @@ impl OpenAIPreprocessor {
         request: &R,
         hidden_stop_token_ids: &mut Vec<TokenIdType>,
     ) -> Result<Vec<TokenIdType>> {
+        // Kimi K3 dynamic tools live on system messages rather than the
+        // top-level list; they still make the tool parser's end markers
+        // load-bearing, so count them here.
         let has_tools = request
             .tools()
             .as_ref()
             .and_then(|tools| tools.len())
-            .is_some_and(|len| len > 0);
+            .is_some_and(|len| len > 0)
+            || request.typed_messages().is_some_and(|messages| {
+                messages.iter().any(|message| match message {
+                    dynamo_protocols::types::ChatCompletionRequestMessage::System(system) => {
+                        system.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                    }
+                    _ => false,
+                })
+            });
         let tool_choice_none = request
             .tool_choice()
             .as_ref()
@@ -4705,16 +4716,18 @@ impl OpenAIPreprocessor {
         // it does not need the same entry gate.
         //
         if let ToolProcessingRoute::MuseUnified(family) = &tool_processing_route {
-            let tool_definitions = request.inner.tools.as_ref().map(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                        name: tool.function.name.clone(),
-                        parameters: tool.function.parameters.clone(),
-                        strict: tool.function.strict,
-                    })
-                    .collect()
-            });
+            let tool_definitions = Some(request.effective_tools())
+                .filter(|tools| !tools.is_empty())
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                            name: tool.function.name.clone(),
+                            parameters: tool.function.parameters.clone(),
+                            strict: tool.function.strict,
+                        })
+                        .collect()
+                });
             let unified: Pin<Box<dyn Stream<Item = _> + Send>> =
                 Box::pin(tool_parser_v2::apply_unified_stream(
                     stream,
@@ -4730,16 +4743,18 @@ impl OpenAIPreprocessor {
         }
 
         if let ToolProcessingRoute::QwenUnified(family) = &tool_processing_route {
-            let tool_definitions = request.inner.tools.as_ref().map(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                        name: tool.function.name.clone(),
-                        parameters: tool.function.parameters.clone(),
-                        strict: tool.function.strict,
-                    })
-                    .collect()
-            });
+            let tool_definitions = Some(request.effective_tools())
+                .filter(|tools| !tools.is_empty())
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                            name: tool.function.name.clone(),
+                            parameters: tool.function.parameters.clone(),
+                            strict: tool.function.strict,
+                        })
+                        .collect()
+                });
             let unified: Pin<Box<dyn Stream<Item = _> + Send>> =
                 Box::pin(unified_parser::apply_stream_with_constraint(
                     stream,
@@ -4863,16 +4878,18 @@ impl OpenAIPreprocessor {
         let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
-        let tool_definitions = request.inner.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-                    name: tool.function.name.clone(),
-                    parameters: tool.function.parameters.clone(),
-                    strict: tool.function.strict,
-                })
-                .collect()
-        });
+        let tool_definitions = Some(request.effective_tools())
+            .filter(|tools| !tools.is_empty())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                        name: tool.function.name.clone(),
+                        parameters: tool.function.parameters.clone(),
+                        strict: tool.function.strict,
+                    })
+                    .collect()
+            });
 
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
             match tool_processing_route {

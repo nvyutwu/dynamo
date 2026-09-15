@@ -129,6 +129,26 @@ pub struct NvCreateChatCompletionRequest {
 }
 
 impl NvCreateChatCompletionRequest {
+    /// Every tool the model can see, as typed tool definitions: top-level
+    /// `tools` first, then Kimi K3 dynamic tools declared on system messages
+    /// (`messages[].tools`) in message order.
+    ///
+    /// `dynamo-protocols` keeps dynamic tools as passthrough JSON so the K3
+    /// renderer can emit them in place; validation, tool-choice forcing, and
+    /// tool-call parsing still need the typed shape, so convert here. Both the
+    /// OpenAI wrapped form and the bare function-schema form some Kimi clients
+    /// send are accepted; entries that are not a function tool are left for the
+    /// renderer to reject with a request error.
+    pub(crate) fn effective_tools(&self) -> Vec<dynamo_protocols::types::ChatCompletionTool> {
+        let mut tools = self.inner.tools.clone().unwrap_or_default();
+        tools.extend(
+            self.inner
+                .dynamic_system_tools()
+                .filter_map(dynamic_tool_as_chat_completion_tool),
+        );
+        tools
+    }
+
     /// Resolve the request's reasoning controls into `chat_template_args`.
     /// Runs once at the HTTP boundary, so every render path reads one answer.
     /// Model-specific overrides still apply later in the default preprocessor.
@@ -220,6 +240,19 @@ impl NvCreateChatCompletionRequest {
 /// same decision as a string; families split over which one they read.
 const THINKING_TOGGLES: [&str; 2] = ["thinking", "enable_thinking"];
 const THINKING_KEYS: [&str; 3] = ["thinking", "enable_thinking", "thinking_mode"];
+
+/// Convert one dynamic system-message tool entry into a typed tool definition.
+///
+/// Accepts the OpenAI wrapped form `{"type": "function", "function": {...}}`
+/// and the bare function-schema form `{"name": ..., "parameters": ...}`.
+fn dynamic_tool_as_chat_completion_tool(
+    tool: &serde_json::Value,
+) -> Option<dynamo_protocols::types::ChatCompletionTool> {
+    if tool.get("function").is_some() {
+        return serde_json::from_value(tool.clone()).ok();
+    }
+    serde_json::from_value(serde_json::json!({"type": "function", "function": tool})).ok()
+}
 
 fn set_thinking(args: &mut HashMap<String, serde_json::Value>, on: bool) {
     args.insert("thinking".to_string(), serde_json::Value::Bool(on));
@@ -623,8 +656,14 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for stream_options
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
-        validate::validate_tools(&self.inner.tools.as_deref())?;
-        validate::validate_tool_choice(&self.inner.tool_choice, self.inner.tools.as_deref())?;
+        // Kimi K3 dynamic tools on system messages count toward the tool set
+        // that `tool_choice` resolves against; they also carry a stricter name
+        // policy than top-level tools.
+        validate::validate_dynamic_system_tools(self.inner.dynamic_system_tools())?;
+        let effective_tools = self.effective_tools();
+        let effective_tools = (!effective_tools.is_empty()).then_some(effective_tools.as_slice());
+        validate::validate_tools(&effective_tools)?;
+        validate::validate_tool_choice(&self.inner.tool_choice, effective_tools)?;
         // none for parallel_tool_calls
         validate::validate_user(self.inner.user.as_deref())?;
         // none for function call
@@ -1010,6 +1049,94 @@ mod tests {
             err.to_string()
                 .contains("tool_choice is \"required\" but tools is empty")
         );
+    }
+
+    /// Request whose only tool declaration is a Kimi K3 dynamic tool on a
+    /// system message (`messages[].tools`), with the given `tool_choice`.
+    fn dynamic_tool_request(
+        tool: serde_json::Value,
+        tool_choice: serde_json::Value,
+    ) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool]},
+                {"role": "user", "content": "compute 1+1"}
+            ],
+            "tool_choice": tool_choice
+        }))
+        .expect("Failed to deserialize request")
+    }
+
+    fn calculator_tool(name: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    #[test]
+    fn test_validate_tool_choice_required_accepts_dynamic_message_tools() {
+        // Kimi K3 dynamic tools live on `messages[].tools`, not top-level
+        // `tools`. `tool_choice=required` must resolve against the effective
+        // union, so a dynamic-only request is accepted.
+        let request = dynamic_tool_request(calculator_tool("Calculator"), json!("required"));
+        ValidateRequest::validate(&request)
+            .expect("required tool_choice is satisfied by dynamic message tools");
+    }
+
+    #[test]
+    fn test_validate_tool_choice_named_accepts_dynamic_message_tool() {
+        let request = dynamic_tool_request(
+            calculator_tool("Calculator"),
+            json!({"type": "function", "function": {"name": "Calculator"}}),
+        );
+        ValidateRequest::validate(&request)
+            .expect("named tool_choice resolves against dynamic message tools");
+    }
+
+    #[test]
+    fn test_effective_tools_accepts_bare_function_schema_dynamic_tool() {
+        // Some Kimi clients send the bare function schema without the
+        // `{"type": "function", "function": ...}` wrapper.
+        let request = dynamic_tool_request(
+            json!({"name": "Calculator", "parameters": {"type": "object", "properties": {}}}),
+            json!("auto"),
+        );
+        let tools = request.effective_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "Calculator");
+        ValidateRequest::validate(&request).expect("bare dynamic tool validates");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_dynamic_tool_names() {
+        // Kimi-Vendor-Verifier k3_features test_invalid_dynamic_tool_name_rejected.
+        for name in ["1bad_name", "bad@name", "", &"a".repeat(257)] {
+            let request = dynamic_tool_request(calculator_tool(name), json!("auto"));
+            let err = ValidateRequest::validate(&request)
+                .expect_err(&format!("dynamic tool name {name:?} must be rejected"));
+            assert!(err.to_string().contains("Dynamic tool"), "{err}");
+        }
+        // The top-level rule allows a leading digit; the dynamic rule does not.
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [calculator_tool("1ok_for_top_level")]
+        }))
+        .unwrap();
+        ValidateRequest::validate(&request).expect("top-level names may start with a digit");
+    }
+
+    #[test]
+    fn test_validate_rejects_dynamic_tool_without_name() {
+        // Kimi-Vendor-Verifier k3_features test_dynamic_tool_missing_required_field_rejected.
+        let request = dynamic_tool_request(
+            json!({"type": "function", "function": {"parameters": {"type": "object"}}}),
+            json!("auto"),
+        );
+        let err = ValidateRequest::validate(&request).expect_err("nameless dynamic tool");
+        assert!(err.to_string().contains("function.name"), "{err}");
     }
 
     #[test]
