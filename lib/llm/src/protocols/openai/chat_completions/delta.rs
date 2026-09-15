@@ -273,6 +273,12 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             Some(common::FinishReason::ContentFilter) => {
                 Some(dynamo_protocols::types::FinishReason::ContentFilter)
             }
+            // vLLM's repetition detector. OpenAI has no `repetition` finish_reason, so the
+            // client-facing value is Stop; the true label survives on the internal
+            // common::FinishReason for request_trace / payload logging.
+            Some(common::FinishReason::Repetition) => {
+                Some(dynamo_protocols::types::FinishReason::Stop)
+            }
             Some(common::FinishReason::Error(err_msg)) => {
                 return Err(anyhow::anyhow!(err_msg.clone()));
             }
