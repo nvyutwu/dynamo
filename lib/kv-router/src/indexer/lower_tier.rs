@@ -620,6 +620,7 @@ impl LowerTierIndexer {
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<(), KvCacheEventError> {
         let indexed_owner = IndexedResidencyOwner::from_exact(owner);
+        let mut first_error: Option<KvCacheEventError> = None;
         let remove_worker_entry = {
             let Some(owner_state) = worker_blocks.get_mut(&indexed_owner) else {
                 return Err(KvCacheEventError::BlockNotFound);
@@ -629,9 +630,16 @@ impl LowerTierIndexer {
             }
             let worker_map = &mut owner_state.blocks;
 
+            // A removal batch may carry hashes this tier never indexed: the
+            // engine batches every key evicted together into one event, and
+            // stores with a foreign block size (partial tails, placeholder
+            // groups) are dropped at conversion. Skip those and keep removing
+            // the rest, so the indexed blocks after an unknown hash still track
+            // the engine's pool; report BlockNotFound once for the batch.
             for block_hash in block_hashes {
                 let Some(key) = worker_map.remove(block_hash) else {
-                    return Err(KvCacheEventError::BlockNotFound);
+                    first_error.get_or_insert(KvCacheEventError::BlockNotFound);
+                    continue;
                 };
 
                 self.remove_owner_from_edge(key, indexed_owner);
@@ -644,7 +652,7 @@ impl LowerTierIndexer {
             worker_blocks.remove(&indexed_owner);
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn clear_worker_impl(&self, worker_blocks: &mut WorkerBlockIndex, worker_id: u64) {
@@ -1378,9 +1386,10 @@ mod tests {
     use crate::indexer::{KvIndexerInterface, ThreadPoolIndexer};
     use crate::kv_hints::KvTransferCandidateSource;
     use crate::protocols::{
-        ExternalSequenceBlockHash, KvCacheEventData, KvCacheStoreData, LocalBlockHash,
-        ResidencyDomain, ResidencyOwner, ResidencyProjection, ResidencyRoutingSnapshot,
-        RouterEvent, RouterHintSourceMetadata, StorageTier, WireResidencyDomain, WorkerWithDpRank,
+        ExternalSequenceBlockHash, KvCacheEventData, KvCacheEventError, KvCacheStoreData,
+        LocalBlockHash, ResidencyDomain, ResidencyOwner, ResidencyProjection,
+        ResidencyRoutingSnapshot, RouterEvent, RouterHintSourceMetadata, StorageTier,
+        WireResidencyDomain, WorkerWithDpRank,
     };
     use crate::test_utils::{remove_event, router_event, stored_blocks_with_sequence_hashes};
 
@@ -2046,6 +2055,50 @@ mod tests {
 
         assert_eq!(hits.get(&worker_a), Some(&0));
         assert_eq!(hits.get(&worker_b), Some(&2));
+    }
+
+    #[test]
+    fn remove_skips_unknown_hashes_and_still_removes_the_rest() {
+        // vLLM batches every key evicted together into one BlockRemoved; the
+        // batch can lead with hashes this tier never indexed (a partial-tail
+        // row dropped at conversion for its 128-token block size). The indexed
+        // blocks after it must still be removed.
+        let mut index = TestLowerTierIndex::new();
+        index
+            .apply_event(store_event(
+                19,
+                0,
+                0,
+                Some(900),
+                &[81, 82, 83],
+                &[801, 802, 803],
+            ))
+            .unwrap();
+
+        let result = index.apply_event(remove_event(
+            19,
+            1,
+            0,
+            vec![
+                ExternalSequenceBlockHash(4242),
+                ExternalSequenceBlockHash(802),
+                ExternalSequenceBlockHash(4343),
+                ExternalSequenceBlockHash(803),
+            ],
+        ));
+        assert!(matches!(result, Err(KvCacheEventError::BlockNotFound)));
+
+        let query = local_hashes(&[81, 82, 83]);
+        let mut continuations = FxHashMap::default();
+        continuations.insert(
+            WorkerWithDpRank::new(19, 0),
+            LowerTierContinuation::new(0, ExternalSequenceBlockHash(900)),
+        );
+        let hits = index.query_contiguous_hits(&query, &continuations);
+        assert_eq!(hits.get(&WorkerWithDpRank::new(19, 0)), Some(&1));
+
+        // Only 801 remains indexed.
+        assert_eq!(index.dump_events().len(), 1);
     }
 
     #[test]
