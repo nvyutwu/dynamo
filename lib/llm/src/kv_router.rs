@@ -14,7 +14,8 @@ use dynamo_kv_router::{
     SharedKvCache, TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope,
     config::{KvRouterConfig, RouterConfigOverride, min_initial_workers_from_env},
     indexer::{
-        ApproximateLruIncarnation, ApproximateLruStats, KvRouterError, RoutingDecisionHashes,
+        ApproximateLruIncarnation, ApproximateLruStats, KvRouterError, PartialTailQuery,
+        RoutingDecisionHashes,
     },
     kv_hints::{
         KvHint, KvHintAction, KvSourceLocationsPayload, KvTransferCandidateSource,
@@ -24,7 +25,7 @@ use dynamo_kv_router::{
     protocols::{
         BlockExtraInfo, BlockHashOptions, LocalBlockHash, PrefillLoadHint, RouterEvent,
         RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike,
-        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq, partial_tail_sub_block_size,
     },
     scheduling::{
         AdmissionAttempt, AttemptId, CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider,
@@ -1647,6 +1648,12 @@ where
                 cache_namespace: cache_namespace.as_deref(),
                 retain_block_hashes,
                 retain_kv_transfer_chain,
+                partial_tail: Some(PartialTailQuery {
+                    tokens,
+                    block_size: self.block_size,
+                    sub_block_size: partial_tail_sub_block_size(),
+                    hash_options,
+                }),
             },
         )
         .await?;

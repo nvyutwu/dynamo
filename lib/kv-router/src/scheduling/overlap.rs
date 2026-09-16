@@ -235,6 +235,15 @@ pub fn cache_hit_estimates_from_tiered_matches(
             }
             *effective_overlap_blocks.entry(*worker).or_insert(0.0) += *hits as f64 * weight;
         }
+        // A matched partial tail is a fraction of one block at the same tier
+        // weight, so cached_tokens reflects what the engine will restore.
+        if tier_matches.tail_sub_block_size > 0 && block_size > 0 {
+            let block_fraction = tier_matches.tail_sub_block_size as f64 / block_size as f64;
+            for (worker, sub_blocks) in &tier_matches.tail_hits {
+                *effective_overlap_blocks.entry(*worker).or_insert(0.0) +=
+                    *sub_blocks as f64 * block_fraction * weight;
+            }
+        }
     }
 
     let cached_tokens = effective_overlap_blocks
@@ -272,6 +281,14 @@ pub fn tier_overlap_blocks_from_tiered_matches(
                 .hits
                 .iter()
                 .map(|(worker, hits)| (*worker, *hits)),
+        );
+        let sub = host_matches.tail_sub_block_size as usize;
+        tier_overlap_blocks.host_pinned_tail_tokens.extend(
+            host_matches
+                .tail_hits
+                .iter()
+                .filter(|(_, sub_blocks)| **sub_blocks > 0)
+                .map(|(worker, sub_blocks)| (*worker, *sub_blocks * sub)),
         );
     }
 
@@ -446,7 +463,41 @@ mod tests {
         assert_eq!(estimates.cached_tokens[&worker], 92);
         assert_eq!(tiers.device[&worker], 2);
         assert_eq!(tiers.host_pinned[&worker], 3);
+        assert!(tiers.host_pinned_tail_tokens.is_empty());
         assert_eq!(tiers.disk[&worker], 9);
+    }
+
+    #[test]
+    fn host_partial_tail_counts_as_a_weighted_block_fraction() {
+        // Block 16, sub-block 4: 2 device blocks + 1 host block + a 3-sub-block
+        // (12-token) host tail at host weight 0.5.
+        let worker = WorkerWithDpRank::new(7, 1);
+        let mut device = OverlapScores::new();
+        device.scores.insert(worker, 2);
+        let mut host = LowerTierMatchDetails::default();
+        host.hits.insert(worker, 1);
+        host.tail_hits.insert(worker, 3);
+        host.tail_sub_block_size = 4;
+        let tiered = TieredMatchDetails {
+            device: MatchDetails {
+                overlap_scores: device,
+                ..Default::default()
+            },
+            lower_tier: HashMap::from([(StorageTier::HostPinned, host)]),
+        };
+        let config = KvRouterConfig {
+            host_cache_hit_weight: 0.5,
+            ..Default::default()
+        };
+
+        let estimates = cache_hit_estimates_from_tiered_matches(&config, 16, &tiered);
+        let tiers = tier_overlap_blocks_from_tiered_matches(&tiered);
+
+        // 2 + 0.5 * (1 + 12/16) = 2.875 blocks = 46 tokens
+        assert_eq!(estimates.effective_overlap_blocks[&worker], 2.875);
+        assert_eq!(estimates.cached_tokens[&worker], 46);
+        assert_eq!(tiers.host_pinned[&worker], 1);
+        assert_eq!(tiers.host_pinned_tail_tokens[&worker], 12);
     }
 
     #[test]

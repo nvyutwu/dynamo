@@ -491,6 +491,11 @@ impl LowerTierContinuation {
 #[derive(Debug, Clone, Default)]
 pub struct LowerTierMatchDetails {
     pub hits: FxHashMap<WorkerWithDpRank, usize>,
+    /// Sub-blocks of the request's partial tail matched after `hits` complete
+    /// blocks, per worker; each sub-block is `tail_sub_block_size` tokens.
+    /// Empty unless the query carried a [`PartialTailQuery`].
+    pub tail_hits: FxHashMap<WorkerWithDpRank, usize>,
+    pub tail_sub_block_size: u32,
     pub next_continuations: FxHashMap<WorkerWithDpRank, LowerTierContinuation>,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub kv_transfer_extensions: Option<KvTransferExtensions>,

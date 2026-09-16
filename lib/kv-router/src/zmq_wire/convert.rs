@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
     KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, Placement, PlacementEvent,
-    StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
+    StorageTier, WorkerWithDpRank, compute_block_hash_for_seq, partial_tail_sub_block_size,
 };
 
 use super::types::{BlockHashValue, Locality, RawKvEvent};
@@ -22,6 +22,30 @@ pub fn convert_event(
     warning_count: &Arc<AtomicU32>,
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,
+) -> Option<PlacementEvent> {
+    convert_event_with_partial_tail(
+        raw,
+        event_id,
+        kv_block_size,
+        worker,
+        warning_count,
+        image_token_id,
+        video_token_id,
+        partial_tail_sub_block_size(),
+    )
+}
+
+/// [`convert_event`] with an explicit partial-tail sub-block size (0 = off).
+#[allow(clippy::too_many_arguments)]
+pub fn convert_event_with_partial_tail(
+    raw: RawKvEvent,
+    event_id: u64,
+    kv_block_size: u32,
+    worker: WorkerWithDpRank,
+    warning_count: &Arc<AtomicU32>,
+    image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
+    partial_tail_sub_block_size: u32,
 ) -> Option<PlacementEvent> {
     if matches!(
         &raw,
@@ -130,6 +154,22 @@ pub fn convert_event(
                 .into_iter()
                 .map(BlockHashValue::into_u64)
                 .collect();
+            // A lower-tier partial tail arrives as a chain of sub-blocks at
+            // the engine's hash granularity, hanging off the last complete
+            // block. Index it with its own block size; the lower-tier edge
+            // index chains blocks by parent hash, so it needs no other change.
+            // Device events and other sizes keep the exact-size rule below.
+            let hash_block_size = if storage_tier != StorageTier::Device
+                && u32::try_from(block_size).is_ok_and(|size| {
+                    is_partial_tail_block_size(kv_block_size, size, partial_tail_sub_block_size)
+                })
+                && is_eagle != Some(true)
+                && block_mm_infos.is_none()
+            {
+                block_size as u32
+            } else {
+                kv_block_size
+            };
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
@@ -138,7 +178,7 @@ pub fn convert_event(
                         .map(ExternalSequenceBlockHash::from),
                     start_position: None,
                     blocks: create_stored_blocks(
-                        kv_block_size,
+                        hash_block_size,
                         &token_ids,
                         &num_block_tokens,
                         &block_hashes_u64,
@@ -274,6 +314,15 @@ pub fn normalize_mm_placeholder_runs(
         out[start..end].fill(pad);
     }
     Some((out, group_count))
+}
+
+/// True when `block_size` is the partial-tail sub-block size `sub` for a
+/// router running at `kv_block_size`. See [`partial_tail_sub_block_size`].
+pub fn is_partial_tail_block_size(kv_block_size: u32, block_size: u32, sub: u32) -> bool {
+    sub > 0
+        && block_size == sub
+        && block_size < kv_block_size
+        && kv_block_size.is_multiple_of(block_size)
 }
 
 /// Rewrite each `image_token_id` run in `token_ids` to `pad_value(mm_hash)`,

@@ -5,7 +5,8 @@ use dynamo_kv_router::{
     ConcurrentRadixTreeCompressed,
     indexer::{
         KvIndexer, KvRouterError, LowerTierIndexers, LowerTierQueryOptions, MatchDetails,
-        ThreadPoolIndexer, TieredMatchProvider, query_lower_tiers_with_options,
+        PartialTailQuery, ThreadPoolIndexer, TieredMatchProvider, query_lower_tiers_with_options,
+        query_lower_tiers_with_options_and_tail,
     },
     protocols::{LocalBlockHash, OverlapScores},
 };
@@ -124,7 +125,34 @@ impl Indexer {
         lower_tier_options: LowerTierQueryOptions,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         self.lookup_pipeline()
-            .find_matches_by_tier(HashInput::Owned(sequence), lower_tier_options)
+            .find_matches_by_tier(HashInput::Owned(sequence), lower_tier_options, None)
+            .await
+    }
+
+    /// Tiered lookup that also walks the request's lower-tier partial tail.
+    pub(crate) async fn find_matches_by_tier_with_tail(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        lower_tier_options: LowerTierQueryOptions,
+        partial_tail: Option<&PartialTailQuery<'_>>,
+    ) -> Result<TieredMatchDetails, KvRouterError> {
+        self.lookup_pipeline()
+            .find_matches_by_tier(HashInput::Owned(sequence), lower_tier_options, partial_tail)
+            .await
+    }
+
+    pub(crate) async fn find_matches_by_tier_ref_with_tail(
+        &self,
+        sequence: &[LocalBlockHash],
+        lower_tier_options: LowerTierQueryOptions,
+        partial_tail: Option<&PartialTailQuery<'_>>,
+    ) -> Result<TieredMatchDetails, KvRouterError> {
+        self.lookup_pipeline()
+            .find_matches_by_tier(
+                HashInput::Borrowed(sequence),
+                lower_tier_options,
+                partial_tail,
+            )
             .await
     }
 
@@ -142,7 +170,7 @@ impl Indexer {
         lower_tier_options: LowerTierQueryOptions,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         self.lookup_pipeline()
-            .find_matches_by_tier(HashInput::Borrowed(sequence), lower_tier_options)
+            .find_matches_by_tier(HashInput::Borrowed(sequence), lower_tier_options, None)
             .await
     }
 
@@ -200,6 +228,7 @@ impl<'a> LookupPipeline<'a> {
         &self,
         sequence: HashInput<'_>,
         lower_tier_options: LowerTierQueryOptions,
+        partial_tail: Option<&PartialTailQuery<'_>>,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         match self.primary {
             PrimaryLookup::KvIndexer(_) | PrimaryLookup::Concurrent(_) => {
@@ -218,11 +247,12 @@ impl<'a> LookupPipeline<'a> {
                         lower_tier_options.retain_kv_transfer_chain,
                     )
                     .await?;
-                let lt = query_lower_tiers_with_options(
+                let lt = query_lower_tiers_with_options_and_tail(
                     lower_tier,
                     sequence.as_slice(),
                     &primary_device,
                     lower_tier_options,
+                    partial_tail,
                 );
                 let device = merge_side_or_warn(self.side, primary_device, sequence).await;
 

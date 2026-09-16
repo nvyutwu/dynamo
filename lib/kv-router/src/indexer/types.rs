@@ -316,6 +316,8 @@ impl From<WireLowerTierMatchDetails> for super::lower_tier::LowerTierMatchDetail
         // the wire-inbound path.
         Self {
             hits: w.hits.into_iter().collect(),
+            tail_hits: Default::default(),
+            tail_sub_block_size: 0,
             next_continuations: Default::default(),
             kv_transfer_candidates: None,
             kv_transfer_extensions: None,

@@ -1698,3 +1698,74 @@ fn scoped_clear_preserves_other_tier_namespace_and_unknown_clear_is_noop() {
     );
     assert!(!normalizer.cache_namespaces.contains_key(&(worker, 1)));
 }
+
+fn partial_tail_raw_event(medium: Option<&str>, block_size: usize) -> RawKvEvent {
+    // A 12-token router block; the engine publishes a 3-sub-block tail of
+    // 4-token hashes chained off complete block 900.
+    RawKvEvent::BlockStored {
+        block_hashes: vec![
+            BlockHashValue::Unsigned(901),
+            BlockHashValue::Unsigned(902),
+            BlockHashValue::Unsigned(903),
+        ],
+        parent_block_hash: Some(BlockHashValue::Unsigned(900)),
+        token_ids: (50..62).collect(),
+        block_size,
+        medium: medium.map(str::to_string),
+        lora_name: None,
+        cache_namespace: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+    }
+}
+
+fn convert_partial_tail(
+    raw: RawKvEvent,
+    sub: u32,
+) -> Vec<crate::protocols::KvCacheStoredBlockData> {
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event_with_partial_tail(
+        raw,
+        1,
+        12,
+        WorkerWithDpRank::new(3, 0),
+        &warning_count,
+        None,
+        None,
+        sub,
+    )
+    .unwrap();
+    match placement.event.data {
+        KvCacheEventData::Stored(store) => store.blocks,
+        other => panic!("expected Stored, got {other:?}"),
+    }
+}
+
+#[test]
+fn lower_tier_partial_tail_is_indexed_at_its_own_block_size_when_enabled() {
+    let blocks = convert_partial_tail(partial_tail_raw_event(Some("CPU"), 4), 4);
+    assert_eq!(blocks.len(), 3);
+    let tokens: Vec<u32> = (50..62).collect();
+    let expected = compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default());
+    for (block, (hash, expected)) in blocks.iter().zip([901u64, 902, 903].iter().zip(expected)) {
+        assert_eq!(block.block_hash, ExternalSequenceBlockHash(*hash));
+        assert_eq!(block.tokens_hash, expected);
+    }
+}
+
+#[test]
+fn partial_tail_events_stay_dropped_when_disabled_or_on_the_device_tier() {
+    // Disabled (sub = 0): the pre-existing exact-size rule drops every block.
+    assert!(convert_partial_tail(partial_tail_raw_event(Some("CPU"), 4), 0).is_empty());
+    // Device tier never carries partial tails; keep dropping there.
+    assert!(convert_partial_tail(partial_tail_raw_event(None, 4), 4).is_empty());
+    // A size other than the configured one, or one that does not divide the
+    // router block, is not a tail.
+    assert!(convert_partial_tail(partial_tail_raw_event(Some("CPU"), 4), 3).is_empty());
+    assert!(convert_partial_tail(partial_tail_raw_event(Some("CPU"), 5), 5).is_empty());
+}

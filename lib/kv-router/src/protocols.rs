@@ -1176,6 +1176,20 @@ fn decision_trace_flag_value(value: &str) -> bool {
     )
 }
 
+/// Sub-block size, in tokens, at which engines publish lower-tier partial-tail
+/// offloads (`DYN_KV_PARTIAL_TAIL_BLOCK_SIZE`, the engine's hash unit, e.g.
+/// 128). 0 (default) disables indexing and matching of partial tails. Read
+/// once; the value must divide the router block size to take effect.
+pub fn partial_tail_sub_block_size() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("DYN_KV_PARTIAL_TAIL_BLOCK_SIZE")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Shared opt-in for picker evidence and frontend trace propagation.
 /// Read once per selection; no environment mutation is performed by routing.
 pub fn routing_decision_trace_enabled() -> bool {

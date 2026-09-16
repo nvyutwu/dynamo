@@ -8,7 +8,7 @@ use std::{
 
 use dynamo_kv_router::{
     SharedKvCache,
-    indexer::{KvRouterError, LowerTierQueryOptions},
+    indexer::{KvRouterError, LowerTierQueryOptions, PartialTailQuery},
     protocols::{LocalBlockHash, SharedCacheHits},
 };
 use tracing::Instrument;
@@ -19,6 +19,8 @@ pub(super) struct TieredLookupOptions<'a> {
     pub(super) cache_namespace: Option<&'a str>,
     pub(super) retain_block_hashes: bool,
     pub(super) retain_kv_transfer_chain: bool,
+    /// Walk lower-tier partial tails at the engine's hash granularity.
+    pub(super) partial_tail: Option<PartialTailQuery<'a>>,
 }
 
 pub(super) struct TieredLookupResult {
@@ -72,6 +74,7 @@ pub(super) async fn query_tiered_matches(
                 &block_hashes,
                 options.cache_namespace,
                 lower_tier_options,
+                options.partial_tail.as_ref(),
             )
             .await?;
 
@@ -92,6 +95,7 @@ pub(super) async fn query_tiered_matches(
         block_hashes,
         options.cache_namespace,
         lower_tier_options,
+        options.partial_tail.as_ref(),
     )
     .await?;
 
@@ -104,6 +108,7 @@ pub(super) async fn query_tiered_matches(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_retained(
     indexer: &Indexer,
     shared_cache: Option<&dyn SharedKvCache>,
@@ -112,6 +117,7 @@ async fn query_retained(
     block_hashes: &[LocalBlockHash],
     cache_namespace: Option<&str>,
     lower_tier_options: LowerTierQueryOptions,
+    partial_tail: Option<&PartialTailQuery<'_>>,
 ) -> Result<
     (
         TieredMatchDetails,
@@ -124,14 +130,14 @@ async fn query_retained(
     let Some(shared_cache) = shared_cache else {
         let t = Instant::now();
         let tiered = indexer
-            .find_matches_by_tier_ref_with_options(block_hashes, lower_tier_options)
+            .find_matches_by_tier_ref_with_tail(block_hashes, lower_tier_options, partial_tail)
             .instrument(tracing::info_span!("kv_router.find_matches"))
             .await?;
         return Ok((tiered, None, t.elapsed(), None));
     };
 
     let indexer_fut = indexer
-        .find_matches_by_tier_ref_with_options(block_hashes, lower_tier_options)
+        .find_matches_by_tier_ref_with_tail(block_hashes, lower_tier_options, partial_tail)
         .instrument(tracing::info_span!("kv_router.find_matches"));
     join_indexer_and_shared_cache(
         indexer_fut,
@@ -143,6 +149,7 @@ async fn query_retained(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_owned(
     indexer: &Indexer,
     shared_cache: Option<&dyn SharedKvCache>,
@@ -151,6 +158,7 @@ async fn query_owned(
     block_hashes: Vec<LocalBlockHash>,
     cache_namespace: Option<&str>,
     lower_tier_options: LowerTierQueryOptions,
+    partial_tail: Option<&PartialTailQuery<'_>>,
 ) -> Result<
     (
         TieredMatchDetails,
@@ -163,14 +171,14 @@ async fn query_owned(
     let Some(shared_cache) = shared_cache else {
         let t = Instant::now();
         let tiered = indexer
-            .find_matches_by_tier_with_options(block_hashes, lower_tier_options)
+            .find_matches_by_tier_with_tail(block_hashes, lower_tier_options, partial_tail)
             .instrument(tracing::info_span!("kv_router.find_matches"))
             .await?;
         return Ok((tiered, None, t.elapsed(), None));
     };
 
     let indexer_fut = indexer
-        .find_matches_by_tier_with_options(block_hashes, lower_tier_options)
+        .find_matches_by_tier_with_tail(block_hashes, lower_tier_options, partial_tail)
         .instrument(tracing::info_span!("kv_router.find_matches"));
     join_indexer_and_shared_cache(
         indexer_fut,

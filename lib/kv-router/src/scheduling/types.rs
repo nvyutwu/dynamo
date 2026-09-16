@@ -82,6 +82,10 @@ pub struct TierOverlapBlocks {
     pub device: FxHashMap<WorkerWithDpRank, usize>,
     #[serde(default)]
     pub host_pinned: FxHashMap<WorkerWithDpRank, usize>,
+    /// Tokens of the request's partial tail matched in the host tier after the
+    /// complete blocks counted in `host_pinned` (always < one block).
+    #[serde(default, skip_serializing_if = "FxHashMap::is_empty")]
+    pub host_pinned_tail_tokens: FxHashMap<WorkerWithDpRank, usize>,
     #[serde(default)]
     pub disk: FxHashMap<WorkerWithDpRank, usize>,
 }

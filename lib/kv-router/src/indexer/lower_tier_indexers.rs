@@ -23,7 +23,8 @@ use crate::indexer::{
 };
 use crate::kv_hints::{KvTransferCandidateSource, KvTransferCandidates};
 use crate::protocols::{
-    LocalBlockHash, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent, StorageTier,
+    BlockHashOptions, LocalBlockHash, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent,
+    StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
@@ -207,6 +208,54 @@ pub struct LowerTierQueryOptions {
     pub retain_kv_transfer_chain: bool,
 }
 
+/// The request tokens needed to extend a lower-tier walk into the block after
+/// the last complete match, at the engine's hash granularity.
+///
+/// Engines that offload a prompt's partial tail publish it as a chain of
+/// `sub_block_size`-token blocks hanging off the last complete block, and the
+/// lower-tier index stores that chain with the same edge scheme as complete
+/// blocks. The walk therefore only needs the request's sub-block local hashes
+/// for the block a worker stopped in, computed lazily per block index.
+#[derive(Debug, Clone, Copy)]
+pub struct PartialTailQuery<'a> {
+    pub tokens: &'a [u32],
+    pub block_size: u32,
+    pub sub_block_size: u32,
+    pub hash_options: BlockHashOptions<'a>,
+}
+
+impl PartialTailQuery<'_> {
+    pub fn is_enabled(&self) -> bool {
+        self.sub_block_size > 0
+            && self.block_size.is_multiple_of(self.sub_block_size)
+            && self.sub_block_size < self.block_size
+            // Multimodal placeholder expansion and the Eagle window are defined
+            // per full block; a sub-block split would hash differently from
+            // the engine (convert.rs drops those tails for the same reason).
+            && self.hash_options.block_mm_infos.is_none()
+            && self.hash_options.is_eagle != Some(true)
+    }
+
+    /// Local hashes of the complete sub-blocks inside block `block_idx`, in
+    /// order. Empty when the block is complete (its full hash is walked by the
+    /// caller) or when fewer than one sub-block of tokens follow it.
+    pub fn sub_block_hashes(&self, block_idx: usize) -> Vec<LocalBlockHash> {
+        let start = block_idx * self.block_size as usize;
+        if start >= self.tokens.len() {
+            return Vec::new();
+        }
+        let end = (start + self.block_size as usize).min(self.tokens.len());
+        if end - start >= self.block_size as usize {
+            return Vec::new();
+        }
+        compute_block_hash_for_seq(
+            &self.tokens[start..end],
+            self.sub_block_size,
+            self.hash_options,
+        )
+    }
+}
+
 /// Walk every allocated lower tier in [`lower_tier_query_order`] and build a
 /// per-tier match map seeded from `device_matches`. Per-worker continuations
 /// flow forward: a worker that matched N device blocks starts the host walk
@@ -305,6 +354,22 @@ pub fn query_lower_tiers_with_options(
     )
 }
 
+/// [`query_lower_tiers_with_options`] extended into the request's partial
+/// tail when `tail` is given; see [`PartialTailQuery`].
+pub fn query_lower_tiers_with_options_and_tail(
+    indexers: &LowerTierIndexers,
+    sequence: &[LocalBlockHash],
+    device_matches: &MatchDetails,
+    options: LowerTierQueryOptions,
+    tail: Option<&PartialTailQuery<'_>>,
+) -> HashMap<StorageTier, LowerTierMatchDetails> {
+    if indexers.is_empty() {
+        return HashMap::new();
+    }
+    let snapshot = indexers.routing_snapshot.load_full();
+    query_lower_tiers_with_tail(indexers, sequence, device_matches, options, snapshot, tail)
+}
+
 pub fn query_lower_tiers_with_options_and_projection(
     indexers: &LowerTierIndexers,
     sequence: &[LocalBlockHash],
@@ -330,6 +395,77 @@ pub fn query_lower_tiers_with_options_and_snapshot(
     options: LowerTierQueryOptions,
     snapshot: Arc<ResidencyRoutingSnapshot>,
 ) -> HashMap<StorageTier, LowerTierMatchDetails> {
+    query_lower_tiers_with_tail(indexers, sequence, device_matches, options, snapshot, None)
+}
+
+/// Extend each tier's complete-block match into the request's partial tail.
+///
+/// Workers are grouped by the block they stopped in; each group walks that
+/// block's sub-block hashes from its last matched hash (or from the root when
+/// the request is shorter than one block). Tail hits do not move the
+/// continuation handed to the next tier: a deeper tier still starts from the
+/// complete-block boundary.
+fn walk_partial_tail(
+    indexer: &LowerTierIndexer,
+    tail: &PartialTailQuery<'_>,
+    continuations: &FxHashMap<WorkerWithDpRank, LowerTierContinuation>,
+    snapshot: &ResidencyRoutingSnapshot,
+) -> FxHashMap<WorkerWithDpRank, usize> {
+    let mut tail_hits = FxHashMap::default();
+    let mut by_block: FxHashMap<usize, FxHashMap<WorkerWithDpRank, LowerTierContinuation>> =
+        FxHashMap::default();
+    for (worker, continuation) in continuations {
+        by_block.entry(continuation.start_pos).or_default().insert(
+            *worker,
+            LowerTierContinuation {
+                start_pos: 0,
+                last_matched_hash: continuation.last_matched_hash,
+            },
+        );
+    }
+
+    // A request shorter than one block has no complete-block walk to seed
+    // workers from; its tail hangs off the root and is found via root edges.
+    if (tail.tokens.len() as u32) < tail.block_size {
+        by_block.entry(0).or_default();
+    }
+
+    for (block_idx, mut group) in by_block {
+        let sub_hashes = tail.sub_block_hashes(block_idx);
+        let Some(&first_hash) = sub_hashes.first() else {
+            continue;
+        };
+        if block_idx == 0 {
+            for worker in indexer.root_workers(first_hash, snapshot.projection()) {
+                group
+                    .entry(worker)
+                    .or_insert_with(|| LowerTierContinuation::from_root(0));
+            }
+        }
+        let matches = indexer.query_match_details_with_options_and_snapshot(
+            &sub_hashes,
+            &group,
+            false,
+            snapshot,
+        );
+        for (worker, hits) in matches.hits {
+            if hits > 0 {
+                tail_hits.insert(worker, hits);
+            }
+        }
+    }
+    tail_hits
+}
+
+pub fn query_lower_tiers_with_tail(
+    indexers: &LowerTierIndexers,
+    sequence: &[LocalBlockHash],
+    device_matches: &MatchDetails,
+    options: LowerTierQueryOptions,
+    snapshot: Arc<ResidencyRoutingSnapshot>,
+    tail: Option<&PartialTailQuery<'_>>,
+) -> HashMap<StorageTier, LowerTierMatchDetails> {
+    let tail = tail.filter(|tail| tail.is_enabled());
     let projection = snapshot.projection();
     let mut continuations = LowerTierMatchDetails::default().next_continuations;
     for (worker, matched_blocks) in &device_matches.overlap_scores.scores {
@@ -380,11 +516,21 @@ pub fn query_lower_tiers_with_options_and_snapshot(
                 snapshot.clone(),
             );
         }
+        if let Some(tail) = tail {
+            tier_matches.tail_sub_block_size = tail.sub_block_size;
+            tier_matches.tail_hits = walk_partial_tail(
+                indexer.backend(),
+                tail,
+                &tier_matches.next_continuations,
+                &snapshot,
+            );
+        }
         let matched_workers = tier_matches.hits.values().filter(|&&hits| hits > 0).count();
         tracing::debug!(
             ?storage_tier,
             queried_workers = continuations.len(),
             matched_workers,
+            tail_matched_workers = tier_matches.tail_hits.len(),
             "Queried lower-tier indexer"
         );
         continuations = tier_matches.next_continuations.clone();
@@ -536,6 +682,106 @@ mod tests {
         let sequence = vec![LocalBlockHash(1), LocalBlockHash(2)];
         let result = query_lower_tiers(&indexers, &sequence, &device_matches);
         assert!(result.is_empty());
+    }
+
+    fn tail_query<'a>(tokens: &'a [u32], block_size: u32, sub: u32) -> PartialTailQuery<'a> {
+        PartialTailQuery {
+            tokens,
+            block_size,
+            sub_block_size: sub,
+            hash_options: BlockHashOptions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_tail_walk_extends_complete_block_match_at_sub_block_granularity() {
+        // Block 8, sub-block 4. Worker 7 holds blocks [0,8) and [8,16) plus the
+        // 4-token tail [16,20) chained off block 1, exactly as the engine
+        // publishes a partial-tail offload.
+        let tokens: Vec<u32> = (100..122).collect();
+        let full = compute_block_hash_for_seq(&tokens, 8, BlockHashOptions::default());
+        let sub = compute_block_hash_for_seq(&tokens[16..20], 4, BlockHashOptions::default());
+        assert_eq!((full.len(), sub.len()), (2, 1));
+
+        let indexers = LowerTierIndexers::new(1, 8);
+        let lower_tier = indexers.get_or_create(StorageTier::HostPinned);
+        lower_tier
+            .apply_event(store_event(
+                7,
+                0,
+                0,
+                None,
+                &[full[0].0, full[1].0],
+                &[901, 902],
+            ))
+            .await;
+        lower_tier
+            .apply_event(store_event(7, 0, 1, Some(902), &[sub[0].0], &[903]))
+            .await;
+        let _ = lower_tier.dump_events().await.unwrap();
+
+        let device = MatchDetails::new();
+        let tail = tail_query(&tokens, 8, 4);
+        let result = query_lower_tiers_with_tail(
+            &indexers,
+            &full,
+            &device,
+            LowerTierQueryOptions::default(),
+            indexers.routing_snapshot.load_full(),
+            Some(&tail),
+        );
+        let host = &result[&StorageTier::HostPinned];
+        let worker = WorkerWithDpRank::new(7, 0);
+        assert_eq!(host.hits[&worker], 2);
+        assert_eq!(host.tail_hits[&worker], 1);
+        assert_eq!(host.tail_sub_block_size, 4);
+
+        // Without a tail query the result is unchanged from today.
+        let plain = query_lower_tiers(&indexers, &full, &device);
+        let host = &plain[&StorageTier::HostPinned];
+        assert_eq!(host.hits[&worker], 2);
+        assert!(host.tail_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_tail_walk_finds_a_root_tail_for_a_request_shorter_than_one_block() {
+        let tokens: Vec<u32> = (200..206).collect();
+        let sub = compute_block_hash_for_seq(&tokens[..4], 4, BlockHashOptions::default());
+        let indexers = LowerTierIndexers::new(1, 8);
+        let lower_tier = indexers.get_or_create(StorageTier::HostPinned);
+        lower_tier
+            .apply_event(store_event(9, 0, 0, None, &[sub[0].0], &[801]))
+            .await;
+        let _ = lower_tier.dump_events().await.unwrap();
+
+        // No complete block: the request sequence is empty and no worker is
+        // seeded by the complete-block walk; the tail walk seeds from the root.
+        let tail = tail_query(&tokens, 8, 4);
+        let result = query_lower_tiers_with_tail(
+            &indexers,
+            &[],
+            &MatchDetails::new(),
+            LowerTierQueryOptions::default(),
+            indexers.routing_snapshot.load_full(),
+            Some(&tail),
+        );
+        let host = &result[&StorageTier::HostPinned];
+        let worker = WorkerWithDpRank::new(9, 0);
+        assert_eq!(host.hits.get(&worker).copied().unwrap_or(0), 0);
+        assert_eq!(host.tail_hits[&worker], 1);
+    }
+
+    #[test]
+    fn partial_tail_query_is_disabled_for_incompatible_shapes() {
+        let tokens: Vec<u32> = (0..20).collect();
+        assert!(tail_query(&tokens, 8, 4).is_enabled());
+        assert!(!tail_query(&tokens, 8, 0).is_enabled());
+        assert!(!tail_query(&tokens, 8, 3).is_enabled());
+        assert!(!tail_query(&tokens, 8, 8).is_enabled());
+        // A complete block yields no sub-block hashes; the tail of [16,20) does.
+        assert!(tail_query(&tokens, 8, 4).sub_block_hashes(0).is_empty());
+        assert_eq!(tail_query(&tokens, 8, 4).sub_block_hashes(2).len(), 1);
+        assert!(tail_query(&tokens, 8, 4).sub_block_hashes(3).is_empty());
     }
 
     #[tokio::test]
