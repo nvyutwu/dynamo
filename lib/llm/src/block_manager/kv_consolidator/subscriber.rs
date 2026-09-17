@@ -272,6 +272,14 @@ fn process_event(
             tracker.handle_clear_all();
         }
 
+        // This ingress is G1-only and the medium gate above already dropped every
+        // non-device tier, so a scoped clear that reaches here names the device:
+        // the same reset this tracker already models.
+        RawKvEvent::TierBlocksCleared { .. } => {
+            tracing::debug!("Processing TierBlocksCleared for the device tier");
+            tracker.handle_clear_all();
+        }
+
         RawKvEvent::Ignored => {}
     }
 }

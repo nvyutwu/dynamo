@@ -201,6 +201,13 @@ fn process_event(tracker: &mut Tracker, event: RawKvEvent, engine_source: EventS
             tracker.handle_clear_all();
         }
 
+        // This ingress is G1-only and the medium gate above already dropped every
+        // non-device tier, so a scoped clear that reaches here names the device:
+        // the same reset this tracker already models.
+        RawKvEvent::TierBlocksCleared { .. } => {
+            tracker.handle_clear_all();
+        }
+
         RawKvEvent::Ignored => {}
     }
 }
