@@ -78,6 +78,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
 
                     let storage_tier = placement_event.placement.tier;
                     let residency_domain = placement_event.placement.residency_domain;
+                    let clear_scope = placement_event.clear_scope;
                     tracing::trace!(
                         "Event processor for worker_id {} processing event: {:?}",
                         worker_id,
@@ -109,6 +110,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                                 worker_id,
                                 storage_tier,
                                 residency_domain,
+                                clear_scope,
                                 KvCacheEvent {
                                     event_id: batching_state.next_publish_id,
                                     data: KvCacheEventData::Cleared,
