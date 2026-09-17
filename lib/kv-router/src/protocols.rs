@@ -1641,6 +1641,27 @@ impl RouterEvent {
         }))
     }
 
+    /// Whether this event may touch `tier`'s lower-tier index.
+    ///
+    /// A clear needs this because the dispatcher fans clears out to every
+    /// allocated lower tier, while `LowerTierIndexer::apply_event` resolves a
+    /// clear by residency *domain* and never consults the tier. Without the
+    /// check, a single-tier clear naming the device erases host-tier residency
+    /// the engine did not clear -- the exact over-invalidation that publishing
+    /// `TierBlocksCleared` was meant to stop.
+    pub fn targets_lower_tier(
+        &self,
+        tier: StorageTier,
+    ) -> Result<bool, UnsupportedResidencyDomain> {
+        let Some(_scope) = self.reset_scope()? else {
+            self.resolved_residency_domain()?;
+            return Ok(self.storage_tier == tier);
+        };
+        // An all-tier clear has no physical tier and reaches every index; a
+        // single-tier clear reaches only the tier it names.
+        Ok(!self.clears_single_tier() || self.storage_tier == tier)
+    }
+
     pub fn targets_primary(&self) -> Result<bool, UnsupportedResidencyDomain> {
         if let Some(scope) = self.reset_scope()? {
             if matches!(scope, ResetScope::Domain(ResidencyDomain::CacheOwner)) {

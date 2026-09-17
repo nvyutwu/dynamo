@@ -100,9 +100,17 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                         KvCacheEventData::Cleared => {
                             batching_state.flush(&local_indexer, worker_id, &mut dedup, &mut output).await;
                             let event = placement_event.event;
+                            // A single-tier clear names the one tier it may
+                            // reset; an all-tier clear passes None.
+                            let reset_storage_tier = if clear_scope.is_all_tiers() {
+                                None
+                            } else {
+                                Some(storage_tier)
+                            };
                             dedup.clear_rank_domain(
                                 event.dp_rank,
                                 residency_domain,
+                                reset_storage_tier,
                                 EventDedupPolicy::RefCounted,
                             );
                             let applied = emit(

@@ -638,8 +638,14 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                     KvCacheEventData::Stored(data)
                 }
                 KvCacheEventData::Cleared => {
+                    // Same scoping rule as the event processor.
+                    let reset_tier = if placement_event.clear_scope.is_all_tiers() {
+                        None
+                    } else {
+                        Some(tier)
+                    };
                     self.dedup
-                        .clear_rank_domain(event.dp_rank, domain, dedup_policy);
+                        .clear_rank_domain(event.dp_rank, domain, reset_tier, dedup_policy);
                     KvCacheEventData::Cleared
                 }
             };

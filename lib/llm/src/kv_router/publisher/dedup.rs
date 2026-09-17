@@ -102,18 +102,27 @@ impl EventDedupFilter {
     }
 
     /// Clear refcounts for one DP rank and residency domain across storage tiers.
+    /// Drop refcounts for a rank/domain. `reset_tier` names the single tier a
+    /// scoped clear touches; `None` is an all-tier clear.
+    ///
+    /// A GPU-only prefix-cache reset must not drop the publisher's references
+    /// for host-tier blocks the engine did not clear, or a later eviction of
+    /// one of those blocks decrements a count that is already gone.
     pub(super) fn clear_rank_domain(
         &mut self,
         dp_rank: u32,
         domain: ResidencyDomain,
+        reset_tier: Option<StorageTier>,
         policy: EventDedupPolicy,
     ) {
         if policy == EventDedupPolicy::SetLike {
             return;
         }
         self.per_rank_tier
-            .retain(|(tracked_dp_rank, _, tracked_domain), _| {
-                *tracked_dp_rank != dp_rank || *tracked_domain != domain
+            .retain(|(tracked_dp_rank, tracked_tier, tracked_domain), _| {
+                *tracked_dp_rank != dp_rank
+                    || *tracked_domain != domain
+                    || reset_tier.is_some_and(|tier| *tracked_tier != tier)
             });
     }
 
