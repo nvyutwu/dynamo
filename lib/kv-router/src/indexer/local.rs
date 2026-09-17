@@ -751,8 +751,21 @@ impl LocalKvIndexer {
             if targets_primary {
                 self.indexer.apply_event_and_wait(event.clone()).await?;
             }
-            for indexer in self.all_lower_tier_indexers() {
-                indexer.apply_event_and_wait(event.clone()).await?;
+            if event.clears_single_tier() {
+                // Scoped clear: reset only the tier the publisher named. The device
+                // case is already handled by `targets_primary` above, so a lower tier
+                // resets exactly its own indexer. Fanning out here instead would drop
+                // CPU-offload residency that survives a GPU-only reset, which is the
+                // whole reason the publisher distinguishes the two.
+                if !event.storage_tier.is_gpu() {
+                    self.get_or_create_lower_tier_indexer(event.storage_tier)
+                        .apply_event_and_wait(event.clone())
+                        .await?;
+                }
+            } else {
+                for indexer in self.all_lower_tier_indexers() {
+                    indexer.apply_event_and_wait(event.clone()).await?;
+                }
             }
             Ok(())
         } else if targets_primary {
@@ -873,7 +886,7 @@ mod tests {
         KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation, WorkerKvQueryResponse,
     };
     use crate::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
+        ClearScope, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
         KvCacheStoredBlockData, LocalBlockHash, ResetScope, ResidencyDomain, ResidencyProjection,
         RouterEvent, StorageTier, WorkerWithDpRank,
     };
@@ -996,6 +1009,205 @@ mod tests {
             .get(&WorkerWithDpRank::new(worker_id, dp_rank))
             .copied()
             .unwrap_or(0)
+    }
+
+    fn device_store_event(
+        worker_id: u64,
+        event_id: u64,
+        tokens_hash: u64,
+        block_hash: u64,
+    ) -> RouterEvent {
+        RouterEvent::with_storage_tier(
+            worker_id,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(block_hash),
+                        tokens_hash: LocalBlockHash(tokens_hash),
+                        mm_extra_info: None,
+                    }],
+                }),
+                dp_rank: 0,
+            },
+            StorageTier::Device,
+        )
+    }
+
+    fn clear_event(
+        worker_id: u64,
+        event_id: u64,
+        storage_tier: StorageTier,
+        clear_scope: ClearScope,
+    ) -> RouterEvent {
+        RouterEvent::with_storage_tier(
+            worker_id,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Cleared,
+                dp_rank: 0,
+            },
+            storage_tier,
+        )
+        .with_clear_scope(clear_scope)
+    }
+
+    async fn device_indexed(indexer: &LocalKvIndexer, tokens_hash: u64) -> bool {
+        !indexer
+            .find_matches(vec![LocalBlockHash(tokens_hash)])
+            .await
+            .unwrap()
+            .scores
+            .is_empty()
+    }
+
+    /// A GPU-only prefix-cache reset must empty the device index and leave CPU-offload
+    /// residency alone. The CPU copies physically survive the reset, so dropping them
+    /// would route traffic away from the one worker that can still serve the prefix
+    /// without recomputing it.
+    #[tokio::test]
+    async fn gpu_scoped_clear_retains_host_residency() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+        indexer
+            .apply_event_with_buffer(device_store_event(7, 1, 11, 101))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(lower_tier_store_event(
+                7,
+                0,
+                2,
+                900,
+                11,
+                101,
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+        assert!(device_indexed(&indexer, 11).await);
+        assert_eq!(
+            lower_tier_hits(&indexer, StorageTier::HostPinned, 7, 0, 900, 11),
+            1
+        );
+
+        indexer
+            .apply_event_with_buffer(clear_event(
+                7,
+                3,
+                StorageTier::Device,
+                ClearScope::SingleTier,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        assert!(
+            !device_indexed(&indexer, 11).await,
+            "a GPU-scoped clear must empty the device index"
+        );
+        assert_eq!(
+            lower_tier_hits(&indexer, StorageTier::HostPinned, 7, 0, 900, 11),
+            1,
+            "a GPU-scoped clear must not disturb host-pinned residency"
+        );
+    }
+
+    /// Mirror image: a host-tier clear leaves the device index alone.
+    #[tokio::test]
+    async fn host_scoped_clear_retains_device_residency() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+        indexer
+            .apply_event_with_buffer(device_store_event(7, 1, 11, 101))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(lower_tier_store_event(
+                7,
+                0,
+                2,
+                900,
+                11,
+                101,
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        indexer
+            .apply_event_with_buffer(clear_event(
+                7,
+                3,
+                StorageTier::HostPinned,
+                ClearScope::SingleTier,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        assert!(
+            device_indexed(&indexer, 11).await,
+            "a host-scoped clear must not disturb the device index"
+        );
+        assert_eq!(
+            lower_tier_hits(&indexer, StorageTier::HostPinned, 7, 0, 900, 11),
+            0,
+            "a host-scoped clear must empty the host index"
+        );
+    }
+
+    /// The legacy all-tier clear keeps its original meaning: nothing survives it.
+    #[tokio::test]
+    async fn legacy_all_tier_clear_still_empties_every_tier() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+        indexer
+            .apply_event_with_buffer(device_store_event(7, 1, 11, 101))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(lower_tier_store_event(
+                7,
+                0,
+                2,
+                900,
+                11,
+                101,
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        indexer
+            .apply_event_with_buffer(clear_event(7, 3, StorageTier::Device, ClearScope::AllTiers))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        assert!(!device_indexed(&indexer, 11).await);
+        assert_eq!(
+            lower_tier_hits(&indexer, StorageTier::HostPinned, 7, 0, 900, 11),
+            0,
+            "an all-tier clear must still empty the host index"
+        );
     }
 
     #[tokio::test]

@@ -530,6 +530,7 @@ impl PositionalIndexer {
                 events.push(RouterEvent {
                     worker_id: worker.worker_id,
                     state_source: None,
+                    clear_scope: crate::protocols::ClearScope::AllTiers,
                     storage_tier: crate::protocols::StorageTier::Device,
                     residency_domain: crate::protocols::WireResidencyDomain::explicit(
                         crate::protocols::ResidencyDomain::Worker,

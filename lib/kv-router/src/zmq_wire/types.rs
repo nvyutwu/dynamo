@@ -146,6 +146,17 @@ pub enum RawKvEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ownership: Option<String>,
     },
+    /// Reset exactly one storage tier, leaving every other tier intact.
+    ///
+    /// `medium` is required: a scoped clear with no tier has no meaning, and a
+    /// consumer must never fall back to an all-tier clear to interpret one. The
+    /// publisher emits this for a GPU-only prefix-cache reset while CPU-offload
+    /// copies physically survive.
+    TierBlocksCleared {
+        medium: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ownership: Option<String>,
+    },
     Ignored,
 }
 
@@ -155,6 +166,7 @@ impl RawKvEvent {
             Self::BlockStored { .. } => "stored",
             Self::BlockRemoved { .. } => "removed",
             Self::AllBlocksCleared { .. } => "cleared",
+            Self::TierBlocksCleared { .. } => "tier_cleared",
             Self::Ignored => "ignored",
         }
     }
@@ -171,6 +183,8 @@ impl RawKvEvent {
             Self::BlockStored { medium, .. } | Self::BlockRemoved { medium, .. } => {
                 medium.as_deref()
             }
+            // Required on a scoped clear: it names the one tier being reset.
+            Self::TierBlocksCleared { medium, .. } => Some(medium.as_str()),
             Self::AllBlocksCleared { .. } | Self::Ignored => None,
         }
     }
@@ -180,7 +194,7 @@ impl RawKvEvent {
     pub fn locality(&self) -> Option<Locality> {
         match self {
             Self::BlockStored { locality, .. } | Self::BlockRemoved { locality, .. } => *locality,
-            Self::AllBlocksCleared { .. } | Self::Ignored => None,
+            Self::AllBlocksCleared { .. } | Self::TierBlocksCleared { .. } | Self::Ignored => None,
         }
     }
 
@@ -192,7 +206,8 @@ impl RawKvEvent {
         match self {
             Self::BlockStored { ownership, .. }
             | Self::BlockRemoved { ownership, .. }
-            | Self::AllBlocksCleared { ownership } => ownership.as_deref(),
+            | Self::AllBlocksCleared { ownership }
+            | Self::TierBlocksCleared { ownership, .. } => ownership.as_deref(),
             Self::Ignored => None,
         }
     }
@@ -200,7 +215,10 @@ impl RawKvEvent {
     pub fn block_size(&self) -> Option<usize> {
         match self {
             Self::BlockStored { block_size, .. } => Some(*block_size),
-            Self::BlockRemoved { .. } | Self::AllBlocksCleared { .. } | Self::Ignored => None,
+            Self::BlockRemoved { .. }
+            | Self::AllBlocksCleared { .. }
+            | Self::TierBlocksCleared { .. }
+            | Self::Ignored => None,
         }
     }
 
@@ -222,7 +240,9 @@ impl RawKvEvent {
                 kv_cache_spec_kind: *kv_cache_spec_kind,
                 kv_cache_spec_sliding_window: *kv_cache_spec_sliding_window,
             },
-            Self::AllBlocksCleared { .. } | Self::Ignored => KvCacheEventMetadata::default(),
+            Self::AllBlocksCleared { .. } | Self::TierBlocksCleared { .. } | Self::Ignored => {
+                KvCacheEventMetadata::default()
+            }
         }
     }
 }

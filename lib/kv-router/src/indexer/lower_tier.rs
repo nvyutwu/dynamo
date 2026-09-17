@@ -1659,6 +1659,7 @@ mod tests {
             .apply_event(RouterEvent {
                 worker_id: 7,
                 state_source: None,
+                clear_scope: crate::protocols::ClearScope::AllTiers,
                 storage_tier: StorageTier::Device,
                 residency_domain: WireResidencyDomain::default(),
                 event: crate::protocols::KvCacheEvent {

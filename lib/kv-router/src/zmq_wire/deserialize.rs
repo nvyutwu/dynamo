@@ -162,10 +162,26 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared {
                 ownership: ownership.unwrap_or(None),
             }),
+            Some("TierBlocksCleared") => {
+                // `medium` is mandatory here: without it the clear names no tier, and
+                // widening it to an all-tier clear would drop residency that survives.
+                let medium = normalize_medium(medium.unwrap_or(None))
+                    .ok_or_else(|| de::Error::missing_field("medium"))?;
+                Ok(RawKvEvent::TierBlocksCleared {
+                    medium,
+                    ownership: ownership.unwrap_or(None),
+                })
+            }
             Some("Ignored") => Ok(RawKvEvent::Ignored),
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -272,13 +288,27 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::AllBlocksCleared { ownership })
             }
+            "TierBlocksCleared" => {
+                let medium: Option<String> = seq.next_element()?.unwrap_or(None);
+                let medium =
+                    normalize_medium(medium).ok_or_else(|| de::Error::missing_field("medium"))?;
+                let ownership: Option<String> = seq.next_element()?.unwrap_or(None);
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::TierBlocksCleared { medium, ownership })
+            }
             "Ignored" => {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::Ignored)
             }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "TierBlocksCleared",
+                    "Ignored",
+                ],
             )),
         }
     }
