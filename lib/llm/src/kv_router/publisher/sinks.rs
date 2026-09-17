@@ -9,7 +9,7 @@ use anyhow::Result;
 use dynamo_kv_router::RouterEventSink;
 use dynamo_kv_router::indexer::{KvRouterError, LocalKvIndexer};
 use dynamo_kv_router::protocols::{
-    KvCacheEvent, KvCacheEventData, ResidencyDomain, RouterEvent, StorageTier,
+    ClearScope, KvCacheEvent, KvCacheEventData, ResidencyDomain, RouterEvent, StorageTier,
 };
 use dynamo_runtime::transports::event_plane::EventPublisher;
 
@@ -170,11 +170,17 @@ pub(super) async fn emit(
     worker_id: u64,
     storage_tier: StorageTier,
     residency_domain: ResidencyDomain,
+    clear_scope: ClearScope,
     event: KvCacheEvent,
     output: &mut Vec<RouterEvent>,
 ) -> bool {
+    // A tier-scoped clear must keep its scope here. This rebuilds the RouterEvent
+    // rather than forwarding the PlacementEvent, so anything not threaded through
+    // silently degrades to the legacy all-tier clear and wipes lower tiers that the
+    // publisher never asked to reset.
     let router_event =
-        RouterEvent::with_residency_domain(worker_id, event, storage_tier, residency_domain);
+        RouterEvent::with_residency_domain(worker_id, event, storage_tier, residency_domain)
+            .with_clear_scope(clear_scope);
     let applied = match admit_local_event(local_indexer.as_deref(), &router_event).await {
         Ok(()) => true,
         Err(error) => {

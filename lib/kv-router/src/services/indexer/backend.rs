@@ -74,10 +74,25 @@ impl Indexer {
                         tracing::warn!(%error, "Failed to reset primary residency");
                         reset_error = Some(error);
                     }
-                    for indexer in lower_tier.all() {
-                        if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
+                    // A scoped clear resets only the tier the publisher named; the device
+                    // case is already handled by `targets_primary` above. Fanning out here
+                    // would evict lower-tier residency that survives a single-tier reset --
+                    // for a GPU-only prefix-cache reset, exactly the CPU-offload copies the
+                    // router is supposed to keep routing to.
+                    if event.clears_single_tier() {
+                        if !event.storage_tier.is_gpu()
+                            && let Some(indexer) = lower_tier.get(event.storage_tier)
+                            && let Err(error) = indexer.apply_event_and_wait(event.clone()).await
+                        {
                             tracing::warn!(%error, "Failed to reset lower-tier residency");
                             reset_error.get_or_insert(error);
+                        }
+                    } else {
+                        for indexer in lower_tier.all() {
+                            if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
+                                tracing::warn!(%error, "Failed to reset lower-tier residency");
+                                reset_error.get_or_insert(error);
+                            }
                         }
                     }
                     if let Some(error) = reset_error {
@@ -104,10 +119,25 @@ impl Indexer {
                         tracing::warn!(%error, "Failed to reset primary residency");
                         reset_error = Some(error);
                     }
-                    for indexer in lower_tier.all() {
-                        if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
+                    // A scoped clear resets only the tier the publisher named; the device
+                    // case is already handled by `targets_primary` above. Fanning out here
+                    // would evict lower-tier residency that survives a single-tier reset --
+                    // for a GPU-only prefix-cache reset, exactly the CPU-offload copies the
+                    // router is supposed to keep routing to.
+                    if event.clears_single_tier() {
+                        if !event.storage_tier.is_gpu()
+                            && let Some(indexer) = lower_tier.get(event.storage_tier)
+                            && let Err(error) = indexer.apply_event_and_wait(event.clone()).await
+                        {
                             tracing::warn!(%error, "Failed to reset lower-tier residency");
                             reset_error.get_or_insert(error);
+                        }
+                    } else {
+                        for indexer in lower_tier.all() {
+                            if let Err(error) = indexer.apply_event_and_wait(event.clone()).await {
+                                tracing::warn!(%error, "Failed to reset lower-tier residency");
+                                reset_error.get_or_insert(error);
+                            }
                         }
                     }
                     if let Some(error) = reset_error {

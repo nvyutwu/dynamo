@@ -1517,8 +1517,9 @@ pub struct RouterEvent {
     ///
     /// This is absent on the legacy Worker-only wire. CacheOwner events are
     /// valid only on a versioned, residency-aware source where this field is
-    /// present; they must never be sent to legacy consumers. Keep this field
-    /// last so legacy positional MessagePack remains prefix-compatible.
+    /// present; they must never be sent to legacy consumers. This and
+    /// [`Self::clear_scope`] are both skipped when unset, so a legacy event still
+    /// encodes byte-identically; keep any new field after them for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_source: Option<CacheOwnerId>,
     /// Tier scope for `Cleared` events; ignored for stores and removes.
@@ -1643,6 +1644,12 @@ impl RouterEvent {
     pub fn targets_primary(&self) -> Result<bool, UnsupportedResidencyDomain> {
         if let Some(scope) = self.reset_scope()? {
             if matches!(scope, ResetScope::Domain(ResidencyDomain::CacheOwner)) {
+                // A cache owner holds no device residency, so a device-scoped clear in
+                // that domain names a tier it cannot reset and would clear nothing at
+                // all. Reject it rather than fail silently.
+                if self.clears_single_tier() && self.storage_tier.is_gpu() {
+                    return Err(UnsupportedResidencyDomain);
+                }
                 return Ok(false);
             }
             // An all-tier clear has no physical tier and always reaches the primary
@@ -1950,6 +1957,55 @@ mod tests {
                     blocks: Vec::new(),
                 }),
             )
+        }
+
+        /// The tier scope has to survive PlacementEvent -> RouterEvent. Every consumer
+        /// that rebuilds the RouterEvent by hand instead of calling this drops the scope,
+        /// which silently degrades a GPU-only reset into an all-tier clear and evicts the
+        /// CPU-offload residency the publisher explicitly kept.
+        #[test]
+        fn into_router_event_preserves_the_tier_scope() {
+            let scoped = PlacementEvent::new(
+                Placement::local_worker(7, 0, StorageTier::Device),
+                event(1, KvCacheEventData::Cleared),
+            )
+            .with_clear_scope(ClearScope::SingleTier);
+            let routed = scoped.into_router_event().expect("worker-owned placement");
+            assert_eq!(routed.clear_scope, ClearScope::SingleTier);
+            assert!(routed.clears_single_tier());
+
+            // And the legacy default still means "every tier".
+            let legacy = PlacementEvent::new(
+                Placement::local_worker(7, 0, StorageTier::Device),
+                event(2, KvCacheEventData::Cleared),
+            );
+            let routed = legacy.into_router_event().expect("worker-owned placement");
+            assert_eq!(routed.clear_scope, ClearScope::AllTiers);
+            assert!(!routed.clears_single_tier());
+        }
+
+        /// A cache owner holds no device residency, so this combination could only ever
+        /// clear nothing. It must be rejected rather than silently doing so.
+        #[test]
+        fn cache_owner_device_scoped_clear_is_rejected() {
+            let scoped = RouterEvent::with_residency_domain(
+                7,
+                event(3, KvCacheEventData::Cleared),
+                StorageTier::Device,
+                ResidencyDomain::CacheOwner,
+            )
+            .with_clear_scope(ClearScope::SingleTier);
+            assert!(scoped.targets_primary().is_err());
+
+            // A CacheOwner clear that names a lower tier is legitimate and still resets it.
+            let host = RouterEvent::with_residency_domain(
+                7,
+                event(4, KvCacheEventData::Cleared),
+                StorageTier::HostPinned,
+                ResidencyDomain::CacheOwner,
+            )
+            .with_clear_scope(ClearScope::SingleTier);
+            assert_eq!(host.targets_primary().unwrap(), false);
         }
 
         #[test]

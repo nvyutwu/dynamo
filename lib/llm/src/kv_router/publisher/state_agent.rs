@@ -613,6 +613,7 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                 );
             }
             let tier = placement_event.placement.tier;
+            let clear_scope = placement_event.clear_scope;
             event.data = match event.data {
                 KvCacheEventData::Removed(data) => {
                     let Some(filtered) = self.dedup.filter_remove_in_domain(
@@ -669,7 +670,10 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                     tier,
                     self.identity.cache_owner_id,
                 ),
-            };
+            }
+            // Carry the tier scope across the rebuild; dropping it here degrades a
+            // GPU-only reset into an all-tier clear on every downstream router.
+            .with_clear_scope(clear_scope);
             // NOTE: Stored/Removed intentionally use the legacy lossy contract: queue
             // admission and one best-effort publish, with no completion acknowledgement.
             // Cleared is stronger and completes every affected tier before publication.

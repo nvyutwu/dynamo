@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dynamo_kv_router::indexer::LocalKvIndexer;
-use dynamo_kv_router::protocols::{KvCacheEventData, Placement, PlacementEvent, RouterEvent};
+use dynamo_kv_router::protocols::{
+    ClearScope, KvCacheEventData, Placement, PlacementEvent, RouterEvent,
+};
 
 use super::dedup::{EventDedupFilter, EventDedupPolicy};
 use super::sinks::emit;
@@ -218,7 +220,18 @@ impl BatchingState {
             }
         };
         event.event_id = self.next_publish_id;
-        let _ = emit(local_indexer, worker_id, tier, domain, event, output).await;
+        // Stores and removes only -- `Cleared` is unreachable above -- so the tier
+        // scope is inert here and the legacy default is the correct value.
+        let _ = emit(
+            local_indexer,
+            worker_id,
+            tier,
+            domain,
+            ClearScope::AllTiers,
+            event,
+            output,
+        )
+        .await;
         self.next_publish_id = self
             .next_publish_id
             .checked_add(1)

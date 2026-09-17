@@ -757,10 +757,13 @@ impl LocalKvIndexer {
                 // resets exactly its own indexer. Fanning out here instead would drop
                 // CPU-offload residency that survives a GPU-only reset, which is the
                 // whole reason the publisher distinguishes the two.
-                if !event.storage_tier.is_gpu() {
-                    self.get_or_create_lower_tier_indexer(event.storage_tier)
-                        .apply_event_and_wait(event.clone())
-                        .await?;
+                // Lookup, not get-or-create: a scoped clear for a tier this worker has
+                // never populated has nothing to reset, and allocating an indexer for it
+                // would spawn a thread pool to clear an empty index.
+                if !event.storage_tier.is_gpu()
+                    && let Some(indexer) = self.lower_tier_indexer(event.storage_tier)
+                {
+                    indexer.apply_event_and_wait(event.clone()).await?;
                 }
             } else {
                 for indexer in self.all_lower_tier_indexers() {
@@ -792,6 +795,19 @@ impl LocalKvIndexer {
                 ))
             })
             .clone()
+    }
+
+    /// Lookup without allocation; `None` when this worker never populated the tier.
+    fn lower_tier_indexer(
+        &self,
+        storage_tier: StorageTier,
+    ) -> Option<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
+        debug_assert!(!storage_tier.is_gpu());
+        self.lower_tier_indexers
+            .lock()
+            .unwrap()
+            .get(&storage_tier)
+            .cloned()
     }
 
     fn all_lower_tier_indexers(&self) -> Vec<Arc<ThreadPoolIndexer<LowerTierIndexer>>> {
