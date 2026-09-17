@@ -1091,6 +1091,7 @@ mod tests {
             .await
             .unwrap();
 
+        indexer.flush().await;
         let clear = RouterEvent::with_residency_domain(
             7,
             KvCacheEvent {

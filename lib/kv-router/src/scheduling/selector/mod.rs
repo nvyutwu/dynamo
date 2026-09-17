@@ -218,7 +218,19 @@ impl<'a> MaterializedSelectionInput<'a> {
                     .host_pinned
                     .get(&worker)
                     .copied()
-                    .unwrap_or(0) as f64,
+                    .unwrap_or(0) as f64
+                    + if self.context.block_size > 0 {
+                        self.request
+                            .overlap
+                            .tier_overlap_blocks
+                            .host_pinned_tail_tokens
+                            .get(&worker)
+                            .copied()
+                            .unwrap_or(0) as f64
+                            / self.context.block_size as f64
+                    } else {
+                        0.0
+                    },
                 disk_overlap_blocks: self
                     .request
                     .overlap

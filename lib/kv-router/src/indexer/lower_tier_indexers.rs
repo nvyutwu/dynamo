@@ -237,17 +237,18 @@ impl PartialTailQuery<'_> {
     }
 
     /// Local hashes of the complete sub-blocks inside block `block_idx`, in
-    /// order. Empty when the block is complete (its full hash is walked by the
-    /// caller) or when fewer than one sub-block of tokens follow it.
+    /// order. A cached producer tail may end inside a complete consumer block.
+    /// Empty when fewer than one sub-block of tokens follow the boundary.
     pub fn sub_block_hashes(&self, block_idx: usize) -> Vec<LocalBlockHash> {
-        let start = block_idx * self.block_size as usize;
-        if start >= self.tokens.len() {
+        let Some(start) = block_idx.checked_mul(self.block_size as usize) else {
+            return Vec::new();
+        };
+        if !self.is_enabled() || start >= self.tokens.len() {
             return Vec::new();
         }
-        let end = (start + self.block_size as usize).min(self.tokens.len());
-        if end - start >= self.block_size as usize {
-            return Vec::new();
-        }
+        let end = start
+            .saturating_add(self.block_size as usize)
+            .min(self.tokens.len());
         compute_block_hash_for_seq(
             &self.tokens[start..end],
             self.sub_block_size,
@@ -424,11 +425,9 @@ fn walk_partial_tail(
         );
     }
 
-    // A request shorter than one block has no complete-block walk to seed
-    // workers from; its tail hangs off the root and is found via root edges.
-    if (tail.tokens.len() as u32) < tail.block_size {
-        by_block.entry(0).or_default();
-    }
+    // Root-tail owners have no complete-block match even for a longer query;
+    // their cached producer tail is found through root edges.
+    by_block.entry(0).or_default();
 
     for (block_idx, mut group) in by_block {
         let sub_hashes = tail.sub_block_hashes(block_idx);
@@ -437,9 +436,14 @@ fn walk_partial_tail(
         };
         if block_idx == 0 {
             for worker in indexer.root_workers(first_hash, snapshot.projection()) {
-                group
-                    .entry(worker)
-                    .or_insert_with(|| LowerTierContinuation::from_root(0));
+                if continuations
+                    .get(&worker)
+                    .is_none_or(|state| state.start_pos == 0)
+                {
+                    group
+                        .entry(worker)
+                        .or_insert_with(|| LowerTierContinuation::from_root(0));
+                }
             }
         }
         let matches = indexer.query_match_details_with_options_and_snapshot(
@@ -744,6 +748,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_tail_continues_from_device_without_a_host_parent() {
+        let tokens: Vec<u32> = (100..122).collect();
+        let full = compute_block_hash_for_seq(&tokens, 8, BlockHashOptions::default());
+        let sub = compute_block_hash_for_seq(&tokens[8..12], 4, BlockHashOptions::default());
+        let indexers = LowerTierIndexers::new(1, 8);
+        indexers
+            .get_or_create(StorageTier::HostPinned)
+            .apply_event_and_wait(store_event(7, 0, 1, Some(901), &[sub[0].0], &[902]))
+            .await
+            .unwrap();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let mut device = MatchDetails::new();
+        device.overlap_scores.scores.insert(worker, 1);
+        device
+            .last_matched_hashes
+            .insert(worker, ExternalSequenceBlockHash(901));
+        let tail = tail_query(&tokens, 8, 4);
+        let result = query_lower_tiers_with_options_and_tail(
+            &indexers,
+            &full,
+            &device,
+            LowerTierQueryOptions::default(),
+            Some(&tail),
+        );
+        let host = &result[&StorageTier::HostPinned];
+        assert_eq!(host.hits.get(&worker).copied().unwrap_or(0), 0);
+        assert_eq!(host.tail_hits[&worker], 1);
+    }
+
+    #[tokio::test]
     async fn partial_tail_walk_finds_a_root_tail_for_a_request_shorter_than_one_block() {
         let tokens: Vec<u32> = (200..206).collect();
         let sub = compute_block_hash_for_seq(&tokens[..4], 4, BlockHashOptions::default());
@@ -778,10 +812,16 @@ mod tests {
         assert!(!tail_query(&tokens, 8, 0).is_enabled());
         assert!(!tail_query(&tokens, 8, 3).is_enabled());
         assert!(!tail_query(&tokens, 8, 8).is_enabled());
-        // A complete block yields no sub-block hashes; the tail of [16,20) does.
-        assert!(tail_query(&tokens, 8, 4).sub_block_hashes(0).is_empty());
+        // Both complete consumer blocks and their final partial block can hold cached producer tails.
+        assert_eq!(tail_query(&tokens, 8, 4).sub_block_hashes(0).len(), 2);
         assert_eq!(tail_query(&tokens, 8, 4).sub_block_hashes(2).len(), 1);
         assert!(tail_query(&tokens, 8, 4).sub_block_hashes(3).is_empty());
+        assert!(tail_query(&tokens, 8, 0).sub_block_hashes(0).is_empty());
+        assert!(
+            tail_query(&tokens, 8, 4)
+                .sub_block_hashes(usize::MAX)
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -304,7 +304,7 @@ impl WorkerCacheInput {
         self.device_overlap_blocks
     }
 
-    /// Return host-pinned prefix overlap in KV blocks.
+    /// Return unweighted host-pinned overlap in KV blocks, including partial-tail fractions.
     pub fn host_overlap_blocks(&self) -> f64 {
         self.host_overlap_blocks
     }
@@ -1002,10 +1002,9 @@ mod tests {
                 _context: &WorkerSelectionContext<'_>,
                 input: WorkerInputView<'_>,
             ) -> Result<usize, WorkerSelectionPolicyError> {
-                assert_eq!(
-                    input.cache().expect("cache input")[0].device_overlap_blocks(),
-                    0.0
-                );
+                let cache = &input.cache().expect("cache input")[0];
+                assert_eq!(cache.device_overlap_blocks(), 0.0);
+                assert_eq!(cache.host_overlap_blocks(), 0.75);
                 Ok(0)
             }
         }
@@ -1014,6 +1013,11 @@ mod tests {
         let workers = HashMap::from([(worker.worker_id, TaintedWorkerConfig::default())]);
         let mut request = base_request(16);
         request.overlap.effective_overlap_blocks.insert(worker, 3.5);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned_tail_tokens
+            .insert(worker, 12);
         let policy = WorkerSelectionPolicy::new(
             KvRouterConfig::default(),
             "test",

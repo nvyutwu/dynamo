@@ -235,6 +235,11 @@ impl DefaultScoringContext {
             };
         let has_tier_overlap_blocks = !request.overlap.tier_overlap_blocks.device.is_empty()
             || !request.overlap.tier_overlap_blocks.host_pinned.is_empty()
+            || !request
+                .overlap
+                .tier_overlap_blocks
+                .host_pinned_tail_tokens
+                .is_empty()
             || !request.overlap.tier_overlap_blocks.disk.is_empty();
         Self {
             min_active_prefill_tokens,
@@ -2153,6 +2158,34 @@ mod tests {
             result.worker, worker0,
             "effective overlap should still credit older callers without tier maps"
         );
+    }
+
+    #[test]
+    fn partial_tail_review_host_only_tail_is_not_device_overlap() {
+        let worker = WorkerWithDpRank::from_worker_id(0);
+        let workers = HashMap::from([(worker.worker_id, TaintedWorkerConfig::default())]);
+        let mut request = base_request(5_000);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .insert(worker, 0.40625);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned_tail_tokens
+            .insert(worker, 4_992);
+        let weights = LogitWeights {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            prefill_load_scale: 1.0,
+            shared_cache_multiplier: 1.0,
+        };
+        let input = MaterializedSelectionInput::new(&request, 12_288, weights);
+        let context =
+            DefaultScoringContext::new(&workers, &request, request.eligibility(), weights);
+        let row = default_row(&input, context, worker, None);
+        assert_eq!(row.cache.effective_overlap_blocks, 0.40625);
+        assert_eq!(row.cache.device_overlap_blocks, 0.0);
     }
 
     #[test]

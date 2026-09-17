@@ -224,24 +224,75 @@ pub fn cache_hit_estimates_from_tiered_matches(
         effective_overlap_blocks.insert(*worker, *overlap as f64);
     }
 
-    for (storage_tier, tier_matches) in &tiered_matches.lower_tier {
-        let weight = cache_hit_weight_for_tier(config, *storage_tier);
-        if weight == 0.0 {
-            continue;
+    if block_size > 0
+        && tiered_matches
+            .lower_tier
+            .values()
+            .any(|tier| tier.tail_sub_block_size > 0 && !tier.tail_hits.is_empty())
+    {
+        let mut frontiers: FxHashMap<_, _> = tiered_matches
+            .device
+            .overlap_scores
+            .scores
+            .iter()
+            .map(|(worker, blocks)| {
+                let tokens = (*blocks as usize).saturating_mul(block_size as usize);
+                (*worker, (tokens, tokens))
+            })
+            .collect();
+        for tier in [
+            StorageTier::HostPinned,
+            StorageTier::Disk,
+            StorageTier::External,
+        ] {
+            let Some(matches) = tiered_matches.lower_tier.get(&tier) else {
+                continue;
+            };
+            let weight = cache_hit_weight_for_tier(config, tier);
+            let workers = matches.hits.keys().chain(
+                matches
+                    .tail_hits
+                    .keys()
+                    .filter(|worker| !matches.hits.contains_key(worker)),
+            );
+            for worker in workers {
+                let (complete, credited) = frontiers.entry(*worker).or_insert((0, 0));
+                *complete = complete.saturating_add(
+                    matches
+                        .hits
+                        .get(worker)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_mul(block_size as usize),
+                );
+                // A matched partial tail is a fraction of one block at the same tier
+                // weight; overlapping copies in deeper tiers add only new tokens.
+                let tail_tokens = matches
+                    .tail_hits
+                    .get(worker)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_mul(matches.tail_sub_block_size as usize);
+                let end = complete.saturating_add(tail_tokens);
+                let additional = end.saturating_sub(*credited);
+                *credited = (*credited).max(end);
+                if additional > 0 && weight != 0.0 {
+                    *effective_overlap_blocks.entry(*worker).or_insert(0.0) +=
+                        additional as f64 / block_size as f64 * weight;
+                }
+            }
         }
-        for (worker, hits) in &tier_matches.hits {
-            if *hits == 0 {
+    } else {
+        for (storage_tier, tier_matches) in &tiered_matches.lower_tier {
+            let weight = cache_hit_weight_for_tier(config, *storage_tier);
+            if weight == 0.0 {
                 continue;
             }
-            *effective_overlap_blocks.entry(*worker).or_insert(0.0) += *hits as f64 * weight;
-        }
-        // A matched partial tail is a fraction of one block at the same tier
-        // weight, so cached_tokens reflects what the engine will restore.
-        if tier_matches.tail_sub_block_size > 0 && block_size > 0 {
-            let block_fraction = tier_matches.tail_sub_block_size as f64 / block_size as f64;
-            for (worker, sub_blocks) in &tier_matches.tail_hits {
-                *effective_overlap_blocks.entry(*worker).or_insert(0.0) +=
-                    *sub_blocks as f64 * block_fraction * weight;
+            for (worker, hits) in &tier_matches.hits {
+                if *hits > 0 {
+                    *effective_overlap_blocks.entry(*worker).or_insert(0.0) +=
+                        *hits as f64 * weight;
+                }
             }
         }
     }

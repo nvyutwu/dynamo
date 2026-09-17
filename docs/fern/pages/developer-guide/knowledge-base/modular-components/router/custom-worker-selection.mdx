@@ -374,7 +374,7 @@ If a component needs no optional worker data, return `WorkerInputs::NONE`. Combi
 | Group | Accessor | Meaning |
 |---|---|---|
 | `CACHE` | `device_overlap_blocks()` | Device-resident prefix overlap in blocks |
-| `CACHE` | `host_overlap_blocks()` | Host-pinned prefix overlap in blocks |
+| `CACHE` | `host_overlap_blocks()` | Unweighted host-pinned prefix extension in blocks, including indexed partial-tail token fractions |
 | `CACHE` | `disk_overlap_blocks()` | Disk prefix overlap in blocks |
 | `CACHE` | `shared_beyond_device_blocks()` | Shared-cache hits beyond the device-resident prefix |
 | `LOAD` | `active_prefill_tokens()` | Tokens currently active in the worker's prefill stage |
