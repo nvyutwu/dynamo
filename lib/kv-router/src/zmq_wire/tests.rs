@@ -8,7 +8,7 @@ use rmp_serde::{from_slice, to_vec, to_vec_named};
 use serde::Serialize;
 
 use crate::protocols::{
-    BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
+    BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ClearScope, ExternalSequenceBlockHash,
     KvCacheEventData, PlacementEvent, PlacementOwner, StorageTier, WorkerWithDpRank,
     compute_block_hash_for_seq,
 };
@@ -1523,4 +1523,164 @@ fn test_unrecognized_media_do_not_pollute_cache_namespace_state() {
         panic!("expected BlockStored");
     };
     assert_eq!(cache_namespace.as_deref(), Some("tenant-a"));
+}
+
+/// vLLM publishes a GPU-only prefix-cache reset as `TierBlocksCleared`. Before this
+/// variant existed the tag failed to deserialize, and because a batch decodes as a
+/// whole the entire batch was dropped, so the router never learned HBM was emptied.
+#[test]
+fn test_tier_blocks_cleared_decodes_in_both_encodings() {
+    let positional: RawKvEvent =
+        from_slice(&to_vec(&("TierBlocksCleared", "GPU", Option::<&str>::None)).unwrap())
+            .expect("positional TierBlocksCleared must decode");
+    match positional {
+        RawKvEvent::TierBlocksCleared { medium, ownership } => {
+            assert_eq!(medium, "GPU");
+            assert_eq!(ownership, None);
+        }
+        other => panic!("expected TierBlocksCleared, got {other:?}"),
+    }
+
+    #[derive(Serialize)]
+    struct MapTierCleared {
+        #[serde(rename = "type")]
+        event_type: &'static str,
+        medium: &'static str,
+        ownership: Option<&'static str>,
+    }
+    let named: RawKvEvent = from_slice(
+        &to_vec_named(&MapTierCleared {
+            event_type: "TierBlocksCleared",
+            medium: "CPU",
+            ownership: Some("kvcr"),
+        })
+        .unwrap(),
+    )
+    .expect("named TierBlocksCleared must decode");
+    match named {
+        RawKvEvent::TierBlocksCleared { medium, ownership } => {
+            assert_eq!(medium, "CPU");
+            assert_eq!(ownership.as_deref(), Some("kvcr"));
+        }
+        other => panic!("expected TierBlocksCleared, got {other:?}"),
+    }
+}
+
+/// A scoped clear with no tier has no meaning. Reject it rather than guessing a tier
+/// or widening it into an all-tier clear, which would drop live residency.
+#[test]
+fn test_tier_blocks_cleared_requires_a_medium() {
+    let missing: Result<RawKvEvent, _> =
+        from_slice(&to_vec(&("TierBlocksCleared", Option::<&str>::None)).unwrap());
+    assert!(
+        missing.is_err(),
+        "a scoped clear without a medium must not decode"
+    );
+
+    let empty: Result<RawKvEvent, _> = from_slice(&to_vec(&("TierBlocksCleared", "")).unwrap());
+    assert!(empty.is_err(), "an empty medium must not decode as a tier");
+}
+
+/// The GPU tier maps to the primary tree and is marked single-tier, so the dispatch
+/// resets only the device index and leaves CPU-offload residency indexed.
+#[test]
+fn test_tier_blocks_cleared_converts_to_a_scoped_device_clear() {
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(
+        RawKvEvent::TierBlocksCleared {
+            medium: "GPU".to_string(),
+            ownership: None,
+        },
+        9,
+        2,
+        WorkerWithDpRank::new(3, 0),
+        &warning_count,
+        None,
+        None,
+    )
+    .expect("a GPU-scoped clear must convert");
+
+    assert_eq!(placement.placement.tier, StorageTier::Device);
+    assert_eq!(placement.clear_scope, ClearScope::SingleTier);
+    assert!(matches!(placement.event.data, KvCacheEventData::Cleared));
+
+    let event = placement
+        .into_router_event()
+        .expect("worker-owned placement");
+    assert!(event.clears_single_tier());
+    assert!(
+        event.targets_primary().unwrap(),
+        "a GPU-scoped clear resets the primary tree"
+    );
+}
+
+/// The mirror case: a CPU-scoped clear must not reach the device tree.
+#[test]
+fn test_tier_blocks_cleared_cpu_medium_spares_the_device_tree() {
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let event = convert_event(
+        RawKvEvent::TierBlocksCleared {
+            medium: "CPU".to_string(),
+            ownership: None,
+        },
+        9,
+        2,
+        WorkerWithDpRank::new(3, 0),
+        &warning_count,
+        None,
+        None,
+    )
+    .expect("a CPU-scoped clear must convert")
+    .into_router_event()
+    .expect("worker-owned placement");
+
+    assert_eq!(event.storage_tier, StorageTier::HostPinned);
+    assert!(event.clears_single_tier());
+    assert!(
+        !event.targets_primary().unwrap(),
+        "a CPU-scoped clear must not reset the device tree"
+    );
+}
+
+/// The legacy all-tier clear keeps its meaning and stays off the new code path.
+#[test]
+fn test_all_blocks_cleared_remains_all_tier() {
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let event = convert_event(
+        RawKvEvent::AllBlocksCleared { ownership: None },
+        9,
+        2,
+        WorkerWithDpRank::new(3, 0),
+        &warning_count,
+        None,
+        None,
+    )
+    .expect("a legacy clear must convert")
+    .into_router_event()
+    .expect("worker-owned placement");
+
+    assert!(!event.clears_single_tier());
+    assert!(event.targets_primary().unwrap());
+}
+
+/// An unknown tier fails closed, exactly like store/remove events with a bad medium.
+#[test]
+fn test_tier_blocks_cleared_with_unknown_medium_is_dropped() {
+    let warning_count = Arc::new(AtomicU32::new(0));
+    assert!(
+        convert_event(
+            RawKvEvent::TierBlocksCleared {
+                medium: "SOMETHING_NEW".to_string(),
+                ownership: None,
+            },
+            9,
+            2,
+            WorkerWithDpRank::new(3, 0),
+            &warning_count,
+            None,
+            None,
+        )
+        .is_none(),
+        "an unrecognized tier must be dropped, never widened to an all-tier clear"
+    );
 }

@@ -734,6 +734,34 @@ pub enum ResetScope {
     Domain(ResidencyDomain),
 }
 
+/// Which storage tiers a `Cleared` event resets.
+///
+/// Physical tier and ownership domain are independent, matching the publisher: a
+/// GPU reset must not disturb separately owned host state, and a domain reset is
+/// not tier-specific. This enum carries only the tier axis; [`ResetScope`] carries
+/// the domain axis.
+///
+/// `AllTiers` is the legacy `AllBlocksCleared` meaning and remains the default, so
+/// publishers that never learned about tiers keep their existing semantics.
+/// `SingleTier` is vLLM's `TierBlocksCleared`: reset only the event's own
+/// [`RouterEvent::storage_tier`] and leave every other tier's residency intact.
+/// Widening a single-tier clear to all tiers would drop CPU-offload residency that
+/// physically still exists.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearScope {
+    #[default]
+    AllTiers,
+    SingleTier,
+}
+
+impl ClearScope {
+    /// Legacy all-tier semantics; used to keep the field off the wire by default.
+    pub fn is_all_tiers(&self) -> bool {
+        matches!(self, Self::AllTiers)
+    }
+}
+
 /// Tolerant wire representation for the additive `residency_domain` field.
 ///
 /// `Missing` is the legacy compatibility signal. Unsupported values stay at
@@ -937,11 +965,24 @@ impl Placement {
 pub struct PlacementEvent {
     pub placement: Placement,
     pub event: KvCacheEvent,
+    /// Tier scope for `Cleared` events; ignored for stores and removes.
+    #[serde(default, skip_serializing_if = "ClearScope::is_all_tiers")]
+    pub clear_scope: ClearScope,
 }
 
 impl PlacementEvent {
     pub fn new(placement: Placement, event: KvCacheEvent) -> Self {
-        Self { placement, event }
+        Self {
+            placement,
+            event,
+            clear_scope: ClearScope::AllTiers,
+        }
+    }
+
+    /// Mark a `Cleared` event as resetting only `placement.tier`.
+    pub fn with_clear_scope(mut self, clear_scope: ClearScope) -> Self {
+        self.clear_scope = clear_scope;
+        self
     }
 
     pub fn local_gpu(worker_id: WorkerId, event: KvCacheEvent) -> Self {
@@ -952,12 +993,15 @@ impl PlacementEvent {
         let PlacementOwner::LocalWorker(worker) = self.placement.owner else {
             return None;
         };
-        Some(RouterEvent::with_residency_domain(
-            worker.worker_id,
-            self.event,
-            self.placement.tier,
-            self.placement.residency_domain,
-        ))
+        Some(
+            RouterEvent::with_residency_domain(
+                worker.worker_id,
+                self.event,
+                self.placement.tier,
+                self.placement.residency_domain,
+            )
+            .with_clear_scope(self.clear_scope),
+        )
     }
 }
 
@@ -1474,6 +1518,12 @@ pub struct RouterEvent {
     /// last so legacy positional MessagePack remains prefix-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_source: Option<CacheOwnerId>,
+    /// Tier scope for `Cleared` events; ignored for stores and removes.
+    ///
+    /// Skipped when `AllTiers`, so every legacy event encodes exactly as before
+    /// and this field only appears on the tier-scoped clears that introduced it.
+    #[serde(default, skip_serializing_if = "ClearScope::is_all_tiers")]
+    pub clear_scope: ClearScope,
 }
 
 impl RouterEvent {
@@ -1513,7 +1563,23 @@ impl RouterEvent {
             storage_tier,
             residency_domain: WireResidencyDomain::explicit(residency_domain),
             event,
+            clear_scope: ClearScope::AllTiers,
         }
+    }
+
+    /// Mark a `Cleared` event as resetting only [`Self::storage_tier`].
+    pub fn with_clear_scope(mut self, clear_scope: ClearScope) -> Self {
+        self.clear_scope = clear_scope;
+        self
+    }
+
+    /// True when this event resets exactly one tier and must not touch the others.
+    ///
+    /// Callers that fan a clear out across tiers must consult this first: widening a
+    /// single-tier clear would evict residency the publisher still holds.
+    pub fn clears_single_tier(&self) -> bool {
+        matches!(self.event.data, KvCacheEventData::Cleared)
+            && matches!(self.clear_scope, ClearScope::SingleTier)
     }
 
     /// Create a CacheOwner event with its required stable state source.
@@ -1573,10 +1639,13 @@ impl RouterEvent {
 
     pub fn targets_primary(&self) -> Result<bool, UnsupportedResidencyDomain> {
         if let Some(scope) = self.reset_scope()? {
-            return Ok(!matches!(
-                scope,
-                ResetScope::Domain(ResidencyDomain::CacheOwner)
-            ));
+            if matches!(scope, ResetScope::Domain(ResidencyDomain::CacheOwner)) {
+                return Ok(false);
+            }
+            // An all-tier clear has no physical tier and always reaches the primary
+            // tree. A single-tier clear names the one tier it may touch, so it
+            // reaches the primary tree only when that tier is the device.
+            return Ok(!self.clears_single_tier() || self.storage_tier.is_gpu());
         }
         self.resolved_residency_domain()?;
         Ok(self.storage_tier.is_gpu())

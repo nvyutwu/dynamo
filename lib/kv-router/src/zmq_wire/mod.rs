@@ -348,6 +348,10 @@ impl ZmqEventNormalizer {
                 self.cache_namespaces
                     .retain(|(known_worker, _), _| *known_worker != worker);
             }
+            // A scoped clear leaves the other tiers resident, so their namespace
+            // context is still needed for hashing. Only an all-tier clear empties
+            // the worker.
+            RawKvEvent::TierBlocksCleared { .. } => {}
             RawKvEvent::Ignored => {}
         }
         Ok(())

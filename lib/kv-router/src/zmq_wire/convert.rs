@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::protocols::{
-    BlockExtraInfo, BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
-    KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, Placement, PlacementEvent,
-    StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
+    BlockExtraInfo, BlockHashOptions, ClearScope, ExternalSequenceBlockHash, KvCacheEvent,
+    KvCacheEventData, KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, Placement,
+    PlacementEvent, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::types::{BlockHashValue, Locality, RawKvEvent};
@@ -32,7 +32,17 @@ pub fn convert_event(
             medium, locality, ..
         } => (medium.as_deref(), *locality),
         RawKvEvent::AllBlocksCleared { .. } => (None, None),
+        // A scoped clear carries the one tier it resets; locality is not meaningful.
+        RawKvEvent::TierBlocksCleared { medium, .. } => (Some(medium.as_str()), None),
         RawKvEvent::Ignored => return None,
+    };
+
+    // Captured before `raw` is consumed below. A scoped clear must reset only
+    // `storage_tier`; widening it to every tier would evict CPU-offload residency
+    // that physically survives a GPU-only reset.
+    let clear_scope = match &raw {
+        RawKvEvent::TierBlocksCleared { .. } => ClearScope::SingleTier,
+        _ => ClearScope::AllTiers,
     };
 
     // No consumer exists for a shared/global index yet (dynamo #10457), so
@@ -154,18 +164,23 @@ pub fn convert_event(
                 dp_rank,
             }
         }
-        RawKvEvent::AllBlocksCleared { .. } => KvCacheEvent {
-            event_id,
-            data: KvCacheEventData::Cleared,
-            dp_rank,
-        },
+        RawKvEvent::AllBlocksCleared { .. } | RawKvEvent::TierBlocksCleared { .. } => {
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Cleared,
+                dp_rank,
+            }
+        }
         RawKvEvent::Ignored => unreachable!("ignored events return before conversion"),
     };
 
-    Some(PlacementEvent::new(
-        Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
-        event,
-    ))
+    Some(
+        PlacementEvent::new(
+            Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
+            event,
+        )
+        .with_clear_scope(clear_scope),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
