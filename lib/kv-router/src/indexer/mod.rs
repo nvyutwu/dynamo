@@ -61,6 +61,8 @@ fn warn_on_unit_block_size(indexer_type: &'static str, kv_block_size: u32) {
 }
 mod kv_indexer;
 mod local;
+pub mod logical;
+pub mod logical_registry;
 mod lower_tier;
 mod lower_tier_indexers;
 mod metrics;

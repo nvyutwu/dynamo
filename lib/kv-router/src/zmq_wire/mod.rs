@@ -19,6 +19,7 @@ mod convert;
 mod deserialize;
 mod extra_keys;
 mod filter;
+pub mod logical;
 #[cfg(test)]
 mod tests;
 mod types;

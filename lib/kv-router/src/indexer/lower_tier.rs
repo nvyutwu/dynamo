@@ -501,6 +501,81 @@ pub struct LowerTierIndexer {
     edges: DashMap<TransitionKey, EdgeOwnersEntry, FxBuildHasher>,
 }
 
+/// Synchronous materialization for a coherently locked logical view. Uses the
+/// same edge ownership and reverse index as ordinary lower-tier events; it does
+/// not own contribution references. Prefix and tail roles use separate instances.
+#[derive(Default)]
+pub(super) struct OwnedContinuationIndex {
+    index: LowerTierIndexer,
+    owners: WorkerBlockIndex,
+}
+
+impl OwnedContinuationIndex {
+    pub(super) fn insert(
+        &mut self,
+        owner: ResidencyOwner,
+        parent: Option<ExternalSequenceBlockHash>,
+        local: LocalBlockHash,
+        child: ExternalSequenceBlockHash,
+    ) -> bool {
+        let key = TransitionKey {
+            parent_hash: parent,
+            local_hash: local,
+        };
+        if self
+            .index
+            .edges
+            .get(&key)
+            .is_some_and(|edge| edge.child_hash() != child)
+            || self
+                .owners
+                .get(&IndexedResidencyOwner::from_exact(owner))
+                .is_some_and(|state| {
+                    state.owner != owner || state.blocks.get(&child).is_some_and(|old| *old != key)
+                })
+        {
+            return false;
+        }
+        self.index
+            .store_blocks_impl(
+                &mut self.owners,
+                owner,
+                KvCacheStoreData {
+                    parent_hash: parent,
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: child,
+                        tokens_hash: local,
+                        mm_extra_info: None,
+                    }],
+                },
+            )
+            .is_ok()
+    }
+
+    pub(super) fn remove(&mut self, owner: ResidencyOwner, child: ExternalSequenceBlockHash) {
+        let _ = self
+            .index
+            .remove_blocks_impl(&mut self.owners, owner, &[child]);
+    }
+
+    pub(super) fn child(
+        &self,
+        owner: ResidencyOwner,
+        parent: Option<ExternalSequenceBlockHash>,
+        local: LocalBlockHash,
+    ) -> Option<ExternalSequenceBlockHash> {
+        let key = TransitionKey {
+            parent_hash: parent,
+            local_hash: local,
+        };
+        let edge = self.index.edges.get(&key)?;
+        let state = self.owners.get(&IndexedResidencyOwner::from_exact(owner))?;
+        (state.owner == owner && state.blocks.get(&edge.child_hash()) == Some(&key))
+            .then(|| edge.child_hash())
+    }
+}
+
 impl LowerTierIndexer {
     pub fn new() -> Self {
         Self {
