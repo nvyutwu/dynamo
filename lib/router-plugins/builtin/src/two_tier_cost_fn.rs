@@ -205,11 +205,51 @@ fn provider(
     let parameters: Parameters = parameters.deserialize()?;
     parameters.validate()?;
 
+    // Announce the RESOLVED parameters, not the file contents: every field is optional and
+    // silently keeps an upstream default when omitted, so the YAML says what was asked for and
+    // this says what is actually in force.
+    //
+    // Why this line exists: nothing else in the router names the active worker-selection policy.
+    // `Router policy class configured policy_class="default"` (queue.rs) is the QUEUEING profile
+    // and reads "default" even when this policy is driving every routing decision. That has now
+    // been misread as "two-tier did not load" by two separate investigations, once inside a
+    // published A/B report. Grep for the messages below instead -- they are emitted only when
+    // this policy is genuinely constructed.
+    tracing::info!(
+        policy_type = POLICY_TYPE,
+        cache_threshold = parameters.cache_threshold,
+        balance_abs_threshold = parameters.balance_abs_threshold,
+        balance_rel_threshold = parameters.balance_rel_threshold,
+        host_cache_weight = ?parameters.host_cache_weight,
+        "Two-tier worker-selection policy enabled"
+    );
+
     Ok(Arc::new(
         move |config: &KvRouterConfig, worker_type, _partition| {
             let host_cache_weight = parameters
                 .host_cache_weight
                 .unwrap_or(config.host_cache_hit_weight);
+            // Logged per role, and with the SOURCE of the weight, because the cache tier ranks on
+            //     device_blocks + host_cache_weight * host_blocks
+            // and that weight has two possible origins: this policy's YAML `parameters`, or
+            // DYN_ROUTER_HOST_CACHE_HIT_WEIGHT via KvRouterConfig. The YAML silently wins. It is
+            // also the variable an A/B most often changes, so an experiment that sets the env var
+            // while the YAML pins the field would otherwise compare two identical arms with no
+            // indication anything was ignored.
+            tracing::info!(
+                policy_type = POLICY_TYPE,
+                worker_type = worker_type.as_str(),
+                host_cache_weight,
+                host_cache_weight_source = if parameters.host_cache_weight.is_some() {
+                    "policy_yaml"
+                } else {
+                    "DYN_ROUTER_HOST_CACHE_HIT_WEIGHT"
+                },
+                disk_cache_hit_weight = config.disk_cache_hit_weight,
+                overlap_score_credit = config.overlap_score_credit,
+                prefill_load_scale = config.prefill_load_scale,
+                "Two-tier worker-selection policy instantiated"
+            );
             WorkerSelectionPolicy::new(
                 config.clone(),
                 worker_type.as_str(),
