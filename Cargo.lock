@@ -2457,6 +2457,8 @@ dependencies = [
  "dynamo-kv-router",
  "serde",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
