@@ -146,6 +146,8 @@ pub struct SchedulingResponse {
     /// Best overlap reachable for this request, and whether the selection matched it.
     /// `None` for pinned selections, which the router did not choose.
     pub best_overlap: Option<BestOverlapCandidate>,
+    /// Populated only by opt-in default-router decision tracing.
+    pub decision_trace: Option<crate::protocols::RoutingDecisionTrace>,
 }
 
 /// Internal result that pairs a public scheduling response with its attempt identity.

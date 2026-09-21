@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::LazyLock;
 use std::{cell::Cell, collections::HashMap};
+
+use dynamo_truthy::env_is_truthy;
 
 mod default;
 mod policy;
@@ -15,7 +18,7 @@ pub use policy::{
     WorkerSelectionPolicy,
 };
 
-use default::{pick_default_worker, selection_weights};
+use default::{decision_trace_for_selection, pick_default_worker, selection_weights};
 use policy::{
     CustomWorkerSelectionState, WorkerSelectionPolicyStateRef, collect_custom_candidates,
 };
@@ -27,6 +30,35 @@ use crate::protocols::{
     WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
     cache_reuse_funnel_f2_onward_enabled,
 };
+
+/// Disabled by default: collecting the candidate table is diagnostic-only and
+/// intentionally has zero extra work or trace volume in normal serving.
+static ROUTER_DECISION_TRACE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_ROUTER_DECISION_TRACE_ENABLED"));
+
+pub(crate) fn router_decision_trace_enabled() -> bool {
+    *ROUTER_DECISION_TRACE_ENABLED
+}
+
+pub(crate) fn router_decision_trace_sample_rate() -> f64 {
+    static SAMPLE_RATE: LazyLock<f64> = LazyLock::new(|| {
+        let Some(value) = std::env::var_os("DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE") else {
+            return 1.0;
+        };
+        let value = value.to_string_lossy();
+        match value.parse::<f64>() {
+            Ok(rate) if rate.is_finite() && (0.0..=1.0).contains(&rate) => rate,
+            _ => {
+                tracing::warn!(
+                    value = %value,
+                    "Ignoring invalid DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE; expected 0 through 1"
+                );
+                0.0
+            }
+        }
+    });
+    *SAMPLE_RATE
+}
 
 /// Low-level selector used by routing hosts.
 ///
@@ -319,6 +351,7 @@ fn selection_result(
         max_raw_cached_tokens,
         potential_decode_blocks: request
             .potential_decode_blocks_after_admission(worker, block_size),
+        decision_trace: None,
     }
 }
 
@@ -482,7 +515,20 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         }
         return Err(KvSchedulerError::NoEndpoints);
     };
-    let result = selection_result(request, worker, block_size, input.max_raw_cached_tokens());
+    let mut result = selection_result(request, worker, block_size, input.max_raw_cached_tokens());
+    if router_decision_trace_enabled() && matches!(state, WorkerSelectionPolicyStateRef::Default(_))
+    {
+        result.decision_trace = decision_trace_for_selection(
+            kv_router_config,
+            worker_type,
+            &input,
+            workers,
+            request,
+            eligibility,
+            worker,
+            router_decision_trace_sample_rate(),
+        );
+    }
     log_selection(
         workers,
         request,

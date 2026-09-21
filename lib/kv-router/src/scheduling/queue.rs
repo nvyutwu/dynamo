@@ -1453,6 +1453,7 @@ impl<
                 kv_transfer_candidates: request.kv_transfer_candidates.take(),
                 potential_decode_blocks: selected.selection.potential_decode_blocks,
                 best_overlap: selected.best_overlap,
+                decision_trace: selected.selection.decision_trace,
             },
         })
     }
@@ -1491,6 +1492,7 @@ impl<
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
             potential_decode_blocks: selected.selection.potential_decode_blocks,
             best_overlap: selected.best_overlap,
+            decision_trace: selected.selection.decision_trace,
         };
         let non_max_overlap_selection = selected.non_max_overlap_selection;
 
@@ -1870,6 +1872,7 @@ mod tests {
                 max_raw_cached_tokens: None,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                decision_trace: None,
             })
         }
     }

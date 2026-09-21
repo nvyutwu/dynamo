@@ -43,6 +43,7 @@ pub(super) struct WorkerSelection {
     pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) kv_hint: Option<KvHint>,
+    pub(super) decision_trace: Option<Box<dynamo_kv_router::protocols::RoutingDecisionTrace>>,
 }
 
 pub(super) enum SelectionOutcome {
@@ -144,6 +145,7 @@ where
                     potential_decode_blocks,
                     routing_hashes,
                     kv_hint,
+                    decision_trace,
                 } => Ok(SelectionOutcome::Routed(WorkerSelection {
                     worker,
                     attempt: admitted.attempt,
@@ -156,6 +158,7 @@ where
                     selected_worker_load: None,
                     routing_hashes,
                     kv_hint,
+                    decision_trace,
                 })),
                 FindBestMatchOutcome::QueueRejected { rejection } => {
                     Ok(SelectionOutcome::QueueRejected(rejection))
@@ -172,6 +175,7 @@ where
                     potential_decode_blocks,
                     selected_worker_load,
                     routing_hashes,
+                    decision_trace,
                 } => Ok(SelectionOutcome::Routed(WorkerSelection {
                     worker,
                     attempt: AdmissionAttempt::Untracked,
@@ -184,6 +188,7 @@ where
                     selected_worker_load: Some(selected_worker_load),
                     routing_hashes,
                     kv_hint: None,
+                    decision_trace,
                 })),
                 crate::kv_router::FindBestMatchAdvisoryOutcome::QueueRejected { rejection } => {
                     Ok(SelectionOutcome::QueueRejected(rejection))
