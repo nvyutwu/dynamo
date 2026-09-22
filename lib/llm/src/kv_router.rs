@@ -359,9 +359,16 @@ impl TierTokens {
         snapshot: &dynamo_kv_router::scheduling::SelectedWorkerTierSnapshot,
         block_size: u64,
     ) -> Self {
+        // The snapshot's tier counts are cumulative along the device -> host walk
+        // (`host_pinned_blocks` includes `gpu_blocks`), while the worker reports each tier's own
+        // tokens. Take the host extension so `cpu` compares with the worker's `cpu` events and
+        // `hbm + cpu` equals the raw resident prefix.
+        let gpu_blocks = u64::from(snapshot.gpu_blocks);
+        let host_extension_blocks =
+            u64::from(snapshot.host_pinned_blocks).saturating_sub(gpu_blocks);
         Self {
-            hbm: u64::from(snapshot.gpu_blocks) * block_size,
-            cpu: u64::from(snapshot.host_pinned_blocks) * block_size,
+            hbm: gpu_blocks * block_size,
+            cpu: host_extension_blocks * block_size,
         }
     }
 }
@@ -2440,6 +2447,33 @@ where
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn tier_tokens_take_the_host_extension_from_cumulative_snapshots() {
+        use dynamo_kv_router::scheduling::SelectedWorkerTierSnapshot;
+        let snapshot = |gpu_blocks, host_pinned_blocks| SelectedWorkerTierSnapshot {
+            dp_device_blocks: vec![(0, gpu_blocks)],
+            gpu_blocks,
+            host_pinned_blocks,
+            disk_blocks: host_pinned_blocks,
+        };
+        // Everything resident in HBM: the cumulative host count equals the device count, so
+        // the CPU tier holds nothing extra.
+        assert_eq!(
+            TierTokens::from_snapshot(&snapshot(6, 6), 16),
+            TierTokens { hbm: 96, cpu: 0 }
+        );
+        // Two blocks in HBM plus a four-block host-pinned continuation.
+        assert_eq!(
+            TierTokens::from_snapshot(&snapshot(2, 6), 16),
+            TierTokens { hbm: 32, cpu: 64 }
+        );
+        // A malformed snapshot (host below device) saturates instead of underflowing.
+        assert_eq!(
+            TierTokens::from_snapshot(&snapshot(6, 2), 16),
+            TierTokens { hbm: 96, cpu: 0 }
+        );
+    }
 
     use async_trait::async_trait;
     use dynamo_kv_router::{

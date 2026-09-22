@@ -959,6 +959,137 @@ pub(crate) struct CacheLossTierDetailMetrics {
     incomplete_observations_total: IntCounter,
 }
 
+impl CacheLossTierDetailMetrics {
+    fn observe_tokens(&self, observations: &[CacheLossTierMetricObservation<'_>]) {
+        for observation in observations {
+            self.tokens_total
+                .with_label_values(&[
+                    cache_loss_metric_tier(observation.tier),
+                    observation.event,
+                    observation.accuracy,
+                ])
+                .inc_by(observation.tokens);
+        }
+    }
+}
+
+#[cfg(test)]
+impl CacheLossTierDetailMetrics {
+    /// Standalone counters for tests, registered with nothing.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            tokens_total: IntCounterVec::new(
+                Opts::new("cache_loss_tier_tokens_total", "test"),
+                &["tier", "event", "accuracy"],
+            )
+            .unwrap(),
+            complete_observations_total: IntCounter::new("tier_complete", "test").unwrap(),
+            incomplete_observations_total: IntCounter::new("tier_incomplete", "test").unwrap(),
+        }
+    }
+
+    /// `(complete, incomplete)`.
+    pub(crate) fn observations(&self) -> (u64, u64) {
+        (
+            self.complete_observations_total.get(),
+            self.incomplete_observations_total.get(),
+        )
+    }
+
+    pub(crate) fn tokens(&self, tier: &str, event: &str, accuracy: &str) -> u64 {
+        self.tokens_total
+            .with_label_values(&[tier, event, accuracy])
+            .get()
+    }
+}
+
+#[cfg(test)]
+impl CacheLossWorkerStageMetrics {
+    /// Standalone counters for tests, registered with nothing.
+    pub(crate) fn for_test() -> Self {
+        let counter = |name: &str| IntCounter::new(name, "test").unwrap();
+        Self {
+            funnel_tokens_total: CACHE_LOSS_FUNNEL_STAGES.map(|stage| counter(stage)),
+            complete_observations_total: counter("stage_complete"),
+            incomplete_observations_total: counter("stage_incomplete"),
+        }
+    }
+
+    /// `(complete, incomplete)`.
+    pub(crate) fn observations(&self) -> (u64, u64) {
+        (
+            self.complete_observations_total.get(),
+            self.incomplete_observations_total.get(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl CacheHistoryMetrics {
+    /// Standalone counters and gauges for tests, registered with nothing.
+    pub(crate) fn for_test() -> Self {
+        let counter = |name: &str| IntCounter::new(name, "test").unwrap();
+        let gauge = |name: &str| IntGauge::new(name, "test").unwrap();
+        Self {
+            observation_input_tokens_total: counter("history_input_tokens"),
+            f0_tokens_total: counter("f0"),
+            f1_tokens_total: counter("f1"),
+            complete_observations_total: counter("history_complete"),
+            incomplete_observations_total: counter("history_incomplete"),
+            retained_entries: gauge("retained_entries"),
+            represented_tokens: gauge("represented_tokens"),
+            estimated_retained_bytes: gauge("estimated_retained_bytes"),
+            capacity_entries: gauge("capacity_entries"),
+            capacity_bytes: gauge("capacity_bytes"),
+        }
+    }
+
+    /// `(complete, incomplete)`.
+    pub(crate) fn observations(&self) -> (u64, u64) {
+        (
+            self.complete_observations_total.get(),
+            self.incomplete_observations_total.get(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl RouterRequestMetrics {
+    /// Unregistered metrics with every optional funnel family disabled; tests enable the
+    /// families they exercise by setting the `Option`s.
+    pub(crate) fn for_test() -> Self {
+        fn hist(name: &str) -> prometheus::Histogram {
+            prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(name, name)).unwrap()
+        }
+        fn hist_vec(name: &str) -> prometheus::HistogramVec {
+            prometheus::HistogramVec::new(prometheus::HistogramOpts::new(name, name), &["reason"])
+                .unwrap()
+        }
+        Self {
+            requests_total: prometheus::IntCounter::new("requests_total", "test").unwrap(),
+            time_to_first_token_seconds: hist("ttft_seconds"),
+            inter_token_latency_seconds: hist("itl_seconds"),
+            input_sequence_tokens: hist("isl_tokens"),
+            output_sequence_tokens: hist("osl_tokens"),
+            kv_hit_rate: hist("kv_hit_rate"),
+            kv_transfer_estimated_latency_seconds: hist("kv_transfer_seconds"),
+            shared_cache_hit_rate: hist("shared_cache_hit_rate"),
+            shared_cache_beyond_blocks: hist("shared_cache_beyond_blocks"),
+            non_max_overlap_selections_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("non_max_overlap_selections_total", "test"),
+                &["reason"],
+            )
+            .unwrap(),
+            overlap_blocks_lost: hist_vec("overlap_blocks_lost"),
+            cache_loss_worker_stages: None,
+            decision_counters_prefill: RoutingDecisionCounters::for_test(),
+            decision_counters_decode: RoutingDecisionCounters::for_test(),
+            cache_loss_tier_details: None,
+            cache_history: None,
+        }
+    }
+}
+
 pub(crate) struct CacheLossTierMetricObservation<'a> {
     pub tier: &'a str,
     pub event: &'a str,
@@ -1152,34 +1283,36 @@ impl RouterRequestMetrics {
                     .expect("failed to create router_input_f2_total");
                 non_max_overlap_selections_total.with_label_values(&[WORKER_TYPE_PREFILL]);
                 overlap_blocks_lost.with_label_values(&[WORKER_TYPE_PREFILL]);
-                // One funnel vec and one observations vec serve both the F2-F5 worker stages
-                // and the F0/F1 cache history: registering the same name twice would panic,
-                // and the stages belong on one series family anyway.
-                let cache_loss_funnel_vecs = (cache_reuse_funnel_f2_onward_enabled()
+                // One funnel-tokens vec serves both the F2-F5 worker stages and the F0/F1 cache
+                // history: registering the same name twice would panic, and the stages belong on
+                // one series family. The per-request observation results do NOT share a family:
+                // F0/F1 complete at route time while F4/F5 need the worker's outcome, so one
+                // `{result}` family would report both "complete" and "incomplete" for the same
+                // request.
+                let cache_loss_funnel_tokens_vec = (cache_reuse_funnel_f2_onward_enabled()
                     || cache_history::enabled())
                 .then(|| {
-                    let funnel_tokens = metrics
+                    metrics
                         .create_intcountervec(
-                            &router_metric("cache_loss_funnel_tokens_total"),
+                            &router_metric(frontend_service::CACHE_LOSS_FUNNEL_TOKENS_TOTAL),
                             "Tokens observed at each cache-loss stage f0-f5; later stages may exceed earlier stages",
                             &["stage"],
                             extra_labels,
                         )
-                        .expect("failed to create router_cache_loss_funnel_tokens_total");
+                        .expect("failed to create router_cache_loss_funnel_tokens_total")
+                });
+                let cache_loss_worker_stages = cache_reuse_funnel_f2_onward_enabled().then(|| {
+                    let funnel_tokens = cache_loss_funnel_tokens_vec
+                        .clone()
+                        .expect("funnel vec exists when the aggregate funnel is enabled");
                     let observations = metrics
                         .create_intcountervec(
-                            &router_metric("cache_loss_observations_total"),
-                            "Cache-loss funnel observations by result",
+                            &router_metric(frontend_service::CACHE_LOSS_OBSERVATIONS_TOTAL),
+                            "Cache-loss funnel (F2-F5) observations by result",
                             &["result"],
                             extra_labels,
                         )
                         .expect("failed to create router_cache_loss_observations_total");
-                    (funnel_tokens, observations)
-                });
-                let cache_loss_worker_stages = cache_reuse_funnel_f2_onward_enabled().then(|| {
-                    let (funnel_tokens, observations) = cache_loss_funnel_vecs
-                        .clone()
-                        .expect("funnel vecs exist when the aggregate funnel is enabled");
                     CacheLossWorkerStageMetrics {
                         funnel_tokens_total: CACHE_LOSS_FUNNEL_STAGES
                             .map(|stage| funnel_tokens.with_label_values(&[stage])),
@@ -1239,9 +1372,17 @@ impl RouterRequestMetrics {
                         .expect(
                             "failed to create router_cache_loss_observation_input_tokens_total",
                         );
-                    let (funnel_tokens_total, observations_total) = cache_loss_funnel_vecs
+                    let funnel_tokens_total = cache_loss_funnel_tokens_vec
                         .clone()
-                        .expect("funnel vecs exist when cache history is enabled");
+                        .expect("funnel vec exists when cache history is enabled");
+                    let observations_total = metrics
+                        .create_intcountervec(
+                            &router_metric(frontend_service::CACHE_LOSS_HISTORY_OBSERVATIONS_TOTAL),
+                            "Cache-history (F0/F1) observations by result",
+                            &["result"],
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_history_observations_total");
                     for stage in ["f0", "f1"] {
                         funnel_tokens_total.with_label_values(&[stage]);
                     }
@@ -1384,6 +1525,8 @@ impl RouterRequestMetrics {
         }
     }
 
+    /// Worker-side tier events (`lookup`/`found`/`used`) for one finished request. This is the
+    /// per-request observation, so it also counts one `complete` result.
     pub(crate) fn observe_cache_loss_tiers(
         &self,
         observations: &[CacheLossTierMetricObservation<'_>],
@@ -1391,17 +1534,21 @@ impl RouterRequestMetrics {
         let Some(metrics) = &self.cache_loss_tier_details else {
             return;
         };
-        for observation in observations {
-            metrics
-                .tokens_total
-                .with_label_values(&[
-                    cache_loss_metric_tier(observation.tier),
-                    observation.event,
-                    observation.accuracy,
-                ])
-                .inc_by(observation.tokens);
-        }
+        metrics.observe_tokens(observations);
         metrics.complete_observations_total.inc();
+    }
+
+    /// Router-side tier estimates (`router_best`/`router_selected`) recorded at selection time.
+    /// They only add tokens: the request's `complete`/`incomplete` result is decided once, when
+    /// the worker outcome arrives (or fails to), in `observe_cache_loss_tiers` /
+    /// `observe_cache_loss_tier_incomplete`.
+    pub(crate) fn observe_router_cache_loss_tiers(
+        &self,
+        observations: &[CacheLossTierMetricObservation<'_>],
+    ) {
+        if let Some(metrics) = &self.cache_loss_tier_details {
+            metrics.observe_tokens(observations);
+        }
     }
 
     pub(crate) fn observe_cache_loss_tier_incomplete(&self) {
@@ -1675,6 +1822,62 @@ mod tests {
         let mut buffer = Vec::new();
         encoder.encode(&registry.gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+
+    #[test]
+    fn router_tier_estimates_add_tokens_without_counting_an_observation() {
+        let mut metrics = RouterRequestMetrics::for_test();
+        let tiers = CacheLossTierDetailMetrics::for_test();
+        metrics.cache_loss_tier_details = Some(tiers.clone());
+        let observation = |tier, event, tokens| CacheLossTierMetricObservation {
+            tier,
+            event,
+            accuracy: "exact",
+            tokens,
+        };
+
+        // Selection time: F2/F3 by tier. Tokens land, the per-request result stays open.
+        metrics.observe_router_cache_loss_tiers(&[
+            observation("gpu", "router_best", 96),
+            observation("cpu", "router_best", 32),
+            observation("gpu", "router_selected", 96),
+            observation("cpu", "router_selected", 0),
+        ]);
+        assert_eq!(tiers.tokens("gpu", "router_best", "exact"), 96);
+        assert_eq!(tiers.tokens("cpu", "router_best", "exact"), 32);
+        assert_eq!(tiers.tokens("gpu", "router_selected", "exact"), 96);
+        assert_eq!(tiers.observations(), (0, 0));
+
+        // The worker outcome decides the result exactly once per request.
+        metrics.observe_cache_loss_tiers(&[
+            observation("gpu", "found", 96),
+            observation("gpu", "used", 96),
+        ]);
+        assert_eq!(tiers.tokens("gpu", "used", "exact"), 96);
+        assert_eq!(tiers.observations(), (1, 0));
+        metrics.observe_cache_loss_tier_incomplete();
+        assert_eq!(tiers.observations(), (1, 1));
+    }
+
+    #[test]
+    fn cache_history_results_do_not_share_the_worker_stage_family() {
+        let mut metrics = RouterRequestMetrics::for_test();
+        let stages = CacheLossWorkerStageMetrics::for_test();
+        let history = CacheHistoryMetrics::for_test();
+        metrics.cache_loss_worker_stages = Some(stages.clone());
+        metrics.cache_history = Some(history.clone());
+
+        // F0/F1 complete at route time...
+        metrics.observe_cache_history_complete(96, 32);
+        assert_eq!(history.observations(), (1, 0));
+        assert_eq!(stages.observations(), (0, 0));
+        // ...while the F2-F5 result waits for the worker and may still be incomplete.
+        metrics.observe_cache_loss_incomplete();
+        assert_eq!(history.observations(), (1, 0));
+        assert_eq!(stages.observations(), (0, 1));
+        metrics.observe_cache_history_incomplete();
+        assert_eq!(history.observations(), (1, 1));
+        assert_eq!(stages.observations(), (0, 1));
     }
 
     #[test]

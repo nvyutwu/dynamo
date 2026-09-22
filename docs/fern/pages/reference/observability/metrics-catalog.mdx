@@ -308,7 +308,7 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 <ParamField path="dynamo_component_router_input_f2_total" type="counter">
   Input tokens already cached on the eligible instance with the most KV cache overlap, counted whether or not the router selected that instance. `f2 / f0` is therefore the prefix cache hit rate the router could have reached, not the one it did reach — compare it against `dynamo_component_router_kv_hit_rate` to see how much of the ceiling routing gives away. Labeled by `worker_type`.
 
-  <Note>The numbering skips `f1` on purpose. The router and the indexer cannot evaluate `f1`, so no such counter is emitted here. Do not reuse the name for something else.</Note>
+  <Note>The numbering skips `f1` on purpose: the router and the indexer cannot evaluate `f1` per decision. The opt-in cache history (`DYN_ROUTER_CACHE_REUSE_HISTORY`) publishes F0/F1 on the stage-labeled funnel counter instead (see below).</Note>
 </ParamField>
 
 <ParamField path="dynamo_component_router_non_max_overlap_selections_total" type="counter">
@@ -326,6 +326,10 @@ The optional cache-reuse funnel records token totals per routing attempt. It reu
 F2 and F3 report raw contiguous prefix overlap in token units across device, host-pinned, and disk or external tiers. They do not apply the router's configurable cache-tier weights; those weights affect worker selection only.
 
 F2 and F3 are recorded at selection time. F4 and F5 require a complete worker outcome with a matching prompt length and a successfully completed stream. Missing or invalid outcomes increment `cache_loss_observations_total{result="incomplete"}` and contribute no tokens to F4/F5. F4 is GPU hits plus CPU/external lookup tokens; F5 is GPU hits plus successful CPU/external hits. Values are uncapped.
+
+With `DYN_ROUTER_CACHE_REUSE_HISTORY=true` the router also publishes `f0` (prompt tokens) and `f1` (tokens whose canonical block hashes this frontend has seen before) on the same funnel counter. Those two stages are complete at selection time, so their per-request result is counted on its own family, `cache_loss_history_observations_total{result}`, not on `cache_loss_observations_total`, which remains the F2-F5 (worker outcome) result.
+
+With `DYN_CACHE_REUSE_FUNNEL_TIER_DETAIL_ENABLED=true` the router publishes `cache_loss_tier_tokens_total{tier,event,accuracy}`. Events `router_best` and `router_selected` are the router's F2/F3 estimates split by tier at selection time; `lookup`, `found`, and `used` are the worker's own per-tier report. Tier values are per tier, not cumulative: `gpu` is the HBM-resident prefix and `cpu` is the host-pinned continuation beyond it, so `gpu + cpu` for one event equals the aggregate stage. `cache_loss_tier_observations_total{result}` counts one result per request, decided by the worker outcome; the router-side events add tokens only.
 
 F0 uses `request.token_ids.len()`, while prefix matching can use multimodal routing tokens. For multimodal requests these token counts need not match; stage differences are not necessarily cache losses.
 

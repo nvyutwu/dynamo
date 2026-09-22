@@ -142,6 +142,8 @@ class frontend_service:
     CACHE_LOSS_FUNNEL_TOKENS_TOTAL = "cache_loss_funnel_tokens_total"
     # Cache-reuse observations by completion status
     CACHE_LOSS_OBSERVATIONS_TOTAL = "cache_loss_observations_total"
+    # Cache-history (F0/F1) observations by completion status
+    CACHE_LOSS_HISTORY_OBSERVATIONS_TOTAL = "cache_loss_history_observations_total"
     # Distinct canonical block hashes retained by cache history
     CACHE_LOSS_HISTORY_UNIQUE_HASHES = "cache_loss_history_unique_hashes"
     # Tokens represented by distinct cache-history entries

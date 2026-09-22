@@ -239,6 +239,9 @@ pub mod frontend_service {
     /// Cache-reuse observations by completion status
     pub const CACHE_LOSS_OBSERVATIONS_TOTAL: &str = "cache_loss_observations_total";
 
+    /// Cache-history (F0/F1) observations by completion status
+    pub const CACHE_LOSS_HISTORY_OBSERVATIONS_TOTAL: &str = "cache_loss_history_observations_total";
+
     /// Distinct canonical block hashes retained by cache history
     pub const CACHE_LOSS_HISTORY_UNIQUE_HASHES: &str = "cache_loss_history_unique_hashes";
 
