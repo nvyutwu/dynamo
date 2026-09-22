@@ -90,6 +90,7 @@ pub(crate) fn emit_request_end(
         replay: Some(replay),
         finish_reason_metadata: None,
         routing_decision: tracker.routing_decision_trace(),
+        cache_loss: tracker.cache_loss_trace(),
     };
     sanitize_request(&mut request);
 

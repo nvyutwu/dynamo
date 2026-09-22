@@ -121,6 +121,35 @@ pub struct RequestTraceMetrics {
     /// deployments with `DYN_ROUTER_DECISION_TRACE_ENABLED=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_decision: Option<RoutingDecisionTrace>,
+    /// Per-request cache-reuse funnel split by KV storage tier. Present when the cache-reuse
+    /// metrics or tier-detail flag is on and the request went through the KV router.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_loss: Option<RequestCacheLossTrace>,
+}
+
+/// Prompt tokens split by KV storage tier: `hbm` is the device-resident prefix, `cpu` the
+/// host-pinned (CPU offload) continuation beyond it. The two never overlap.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestCacheTierTokens {
+    pub hbm: u64,
+    pub cpu: u64,
+}
+
+/// Per-request cache-reuse stages. Router-side stages are what the router believed at
+/// decision time; engine-side stages are what the worker reported after execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestCacheLossTrace {
+    pub prompt_tokens: u64,
+    /// F2: raw resident prefix on the best eligible worker, by tier.
+    pub best_eligible: RequestCacheTierTokens,
+    /// F3: raw resident prefix on the worker the router selected, by tier.
+    pub selected: RequestCacheTierTokens,
+    /// F4: tokens the engine found (`hbm` = GPU hit, `cpu` = looked up in host cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found: Option<RequestCacheTierTokens>,
+    /// F5: tokens the engine reused (`hbm` = GPU hit, `cpu` = host cache hit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<RequestCacheTierTokens>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -350,6 +379,7 @@ mod tests {
                 }),
                 finish_reason_metadata: None,
                 routing_decision: None,
+                cache_loss: None,
             }),
             tool: None,
             payload: None,
@@ -443,6 +473,7 @@ mod tests {
                         decode_overlap_formula: false,
                     }],
                 }),
+                cache_loss: None,
             }),
             tool: None,
             payload: None,
@@ -595,5 +626,28 @@ mod tests {
 
         assert!(metadata.is_empty());
         assert!(metadata.choices.is_empty());
+    }
+
+    #[test]
+    fn request_trace_serializes_cache_loss_by_tier() {
+        let mut trace = RequestCacheLossTrace {
+            prompt_tokens: 128,
+            best_eligible: RequestCacheTierTokens { hbm: 64, cpu: 32 },
+            selected: RequestCacheTierTokens { hbm: 64, cpu: 0 },
+            found: None,
+            used: None,
+        };
+        let json = serde_json::to_value(&trace).unwrap();
+        assert_eq!(json["best_eligible"]["cpu"], 32);
+        assert_eq!(json["selected"]["hbm"], 64);
+        assert!(
+            json.get("found").is_none(),
+            "engine stages are absent until reported"
+        );
+        trace.found = Some(RequestCacheTierTokens { hbm: 64, cpu: 16 });
+        trace.used = Some(RequestCacheTierTokens { hbm: 64, cpu: 8 });
+        let json = serde_json::to_value(&trace).unwrap();
+        assert_eq!(json["found"]["cpu"], 16);
+        assert_eq!(json["used"]["cpu"], 8);
     }
 }

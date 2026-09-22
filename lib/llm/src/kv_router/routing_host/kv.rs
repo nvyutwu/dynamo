@@ -427,6 +427,8 @@ where
                             prompt_tokens: routing_parts.token_ids.len() as u64,
                             best_router_tokens: max_raw_cached_tokens as u64,
                             selected_router_tokens: selected_raw_cached_tokens as u64,
+                            best_router_tiers: selection.best_router_tiers,
+                            selected_router_tiers: selection.selected_router_tiers,
                         },
                         aggregate_enabled,
                         tier_detail_enabled,

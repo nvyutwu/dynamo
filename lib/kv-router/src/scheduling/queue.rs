@@ -69,9 +69,54 @@ struct QueuedRequest {
 struct SelectedWorkerForRequest {
     selection: WorkerSelectionResult,
     selected_worker_tiers: SelectedWorkerTierSnapshot,
+    best_eligible_worker_tiers: SelectedWorkerTierSnapshot,
     selected_worker_load: AdvisoryWorkerLoad,
     non_max_overlap_selection: Option<NonMaxOverlapSelection>,
     best_overlap: Option<BestOverlapCandidate>,
+}
+
+/// Raw per-tier overlap on the eligible worker holding the most resident blocks for this
+/// request (HBM prefix plus its host-pinned continuation), for cache-loss telemetry.
+///
+/// Deliberately the raw count and not the weighted selection score: the funnel compares it
+/// against the worker's own raw hit counts, so the units must match. A pinned selection
+/// reports the pinned worker. Ties resolve to the lower worker id. An empty snapshot means no
+/// eligible worker had any overlap.
+fn best_eligible_worker_tiers<C: WorkerConfigLike>(
+    workers: &HashMap<WorkerId, C>,
+    request: &SchedulingRequest,
+    eligibility: RoutingEligibility<'_>,
+) -> SelectedWorkerTierSnapshot {
+    let tiers_for = |worker: WorkerWithDpRank| {
+        workers
+            .get(&worker.worker_id)
+            .map(|config| request.overlap.selected_worker_tiers(worker, config))
+    };
+    if let Some(worker) = eligibility.pinned_worker() {
+        return tiers_for(worker).unwrap_or_default();
+    }
+    let tier_overlap = &request.overlap.tier_overlap_blocks;
+    let mut best: Option<(WorkerWithDpRank, usize)> = None;
+    for worker in tier_overlap
+        .device
+        .keys()
+        .chain(tier_overlap.host_pinned.keys())
+        .copied()
+    {
+        if eligibility.validate_worker_rank(workers, worker).is_err() {
+            continue;
+        }
+        let resident = tier_overlap.device.get(&worker).copied().unwrap_or(0)
+            + tier_overlap.host_pinned.get(&worker).copied().unwrap_or(0);
+        let is_better = best.is_none_or(|(current, current_resident)| {
+            resident > current_resident || (resident == current_resident && worker < current)
+        });
+        if is_better {
+            best = Some((worker, resident));
+        }
+    }
+    best.and_then(|(worker, _)| tiers_for(worker))
+        .unwrap_or_default()
 }
 
 /// Best effective KV overlap reachable for `request` across the eligible workers.
@@ -1406,6 +1451,8 @@ impl<
                     let selected_worker_tiers = request
                         .overlap
                         .selected_worker_tiers(selection.worker, config);
+                    let best_eligible_worker_tiers =
+                        best_eligible_worker_tiers(&workers, request, eligibility);
                     let worker_load = request.worker_load_for(selection.worker);
                     let selected_worker_load = AdvisoryWorkerLoad {
                         active_prefill_tokens: worker_load.active_prefill_tokens,
@@ -1421,6 +1468,7 @@ impl<
                     SelectedWorkerForRequest {
                         selection,
                         selected_worker_tiers,
+                        best_eligible_worker_tiers,
                         selected_worker_load,
                         non_max_overlap_selection,
                         best_overlap,
@@ -1449,6 +1497,7 @@ impl<
                     request.raw_cached_tokens_for(selected.selection.worker, self.block_size)
                 }),
                 selected_worker_tiers: selected.selected_worker_tiers,
+                best_eligible_worker_tiers: selected.best_eligible_worker_tiers,
                 target_cached_prefix_blocks,
                 kv_transfer_candidates: request.kv_transfer_candidates.take(),
                 potential_decode_blocks: selected.selection.potential_decode_blocks,
@@ -1488,6 +1537,7 @@ impl<
                 .max_raw_cached_tokens
                 .map(|_| request.raw_cached_tokens_for(selected.selection.worker, self.block_size)),
             selected_worker_tiers: selected.selected_worker_tiers,
+            best_eligible_worker_tiers: selected.best_eligible_worker_tiers,
             target_cached_prefix_blocks,
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
             potential_decode_blocks: selected.selection.potential_decode_blocks,

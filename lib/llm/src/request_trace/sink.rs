@@ -337,6 +337,7 @@ mod tests {
                 }),
                 finish_reason_metadata: None,
                 routing_decision: None,
+                cache_loss: None,
             }),
             tool: None,
             payload: None,

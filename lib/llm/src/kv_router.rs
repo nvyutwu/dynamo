@@ -343,6 +343,28 @@ impl fmt::Display for KvEventSourceRequirement {
     }
 }
 
+/// Router-visible prefix overlap on one worker, split by KV storage tier and expressed in tokens.
+///
+/// `hbm` is the device-resident prefix; `cpu` the host-pinned (CPU offload) continuation beyond
+/// it. The two never overlap, so `hbm + cpu` is the worker's raw resident prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TierTokens {
+    pub hbm: u64,
+    pub cpu: u64,
+}
+
+impl TierTokens {
+    pub fn from_snapshot(
+        snapshot: &dynamo_kv_router::scheduling::SelectedWorkerTierSnapshot,
+        block_size: u64,
+    ) -> Self {
+        Self {
+            hbm: u64::from(snapshot.gpu_blocks) * block_size,
+            cpu: u64::from(snapshot.host_pinned_blocks) * block_size,
+        }
+    }
+}
+
 pub enum FindBestMatchOutcome {
     Routed {
         worker: WorkerWithDpRank,
@@ -351,6 +373,10 @@ pub enum FindBestMatchOutcome {
         cached_tokens: usize,
         selected_raw_cached_tokens: Option<usize>,
         max_raw_cached_tokens: Option<usize>,
+        /// Selected worker's raw overlap by tier (cache-loss telemetry).
+        selected_router_tiers: TierTokens,
+        /// Best eligible worker's raw overlap by tier (cache-loss telemetry).
+        best_router_tiers: TierTokens,
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
@@ -373,6 +399,8 @@ pub enum FindBestMatchAdvisoryOutcome {
         cached_tokens: usize,
         selected_raw_cached_tokens: Option<usize>,
         max_raw_cached_tokens: Option<usize>,
+        selected_router_tiers: TierTokens,
+        best_router_tiers: TierTokens,
         potential_decode_blocks: u64,
         selected_worker_load: scheduling::AdvisoryWorkerLoad,
         routing_hashes: Option<RoutingDecisionHashes>,
@@ -1796,6 +1824,11 @@ where
         );
 
         let selected_raw_cached_tokens = response.selected_raw_cached_tokens;
+        let block_size = u64::from(self.block_size());
+        let selected_router_tiers =
+            TierTokens::from_snapshot(&response.selected_worker_tiers, block_size);
+        let best_router_tiers =
+            TierTokens::from_snapshot(&response.best_eligible_worker_tiers, block_size);
 
         match admission {
             FindBestMatchAdmission::WithAdmission { .. } => Ok(
@@ -1807,6 +1840,8 @@ where
                         cached_tokens: response.cached_tokens,
                         selected_raw_cached_tokens,
                         max_raw_cached_tokens: response.max_raw_cached_tokens,
+                        selected_router_tiers,
+                        best_router_tiers,
                         potential_decode_blocks: response.potential_decode_blocks as u64,
                         routing_hashes,
                         kv_hint,
@@ -1823,6 +1858,8 @@ where
                     cached_tokens: response.cached_tokens,
                     selected_raw_cached_tokens,
                     max_raw_cached_tokens: response.max_raw_cached_tokens,
+                    selected_router_tiers,
+                    best_router_tiers,
                     potential_decode_blocks: response.potential_decode_blocks as u64,
                     selected_worker_load: selected_worker_load
                         .expect("without-admission selection returns advisory load"),

@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+
+use crate::request_trace::{RequestCacheLossTrace, RequestCacheTierTokens};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use utoipa::ToSchema;
@@ -255,6 +257,10 @@ pub struct RequestTracker {
 
     /// Candidate scores selected by the frontend's KV router.
     routing_decision_trace: OnceLock<RoutingDecisionTrace>,
+
+    /// Per-request cache-reuse funnel split by KV tier: router estimate at selection, worker
+    /// outcome at completion. Opt-in through the cache-reuse metrics flags.
+    cache_loss: Mutex<Option<RequestCacheLossTrace>>,
 }
 
 /// Data a standalone router (running the `PushRouter` bindings in its own process)
@@ -316,6 +322,7 @@ impl RequestTracker {
             external_query_token_ids: OnceLock::new(),
             prompt_token_ids: OnceLock::new(),
             routing_decision_trace: OnceLock::new(),
+            cache_loss: Mutex::new(None),
         }
     }
 
@@ -592,6 +599,29 @@ impl RequestTracker {
 
     pub fn routing_decision_trace(&self) -> Option<RoutingDecisionTrace> {
         self.routing_decision_trace.get().cloned()
+    }
+
+    /// Record the router-side cache-reuse stages (F2/F3 by tier) decided at worker selection.
+    pub fn record_cache_loss_route(&self, route: RequestCacheLossTrace) {
+        *self.cache_loss.lock() = Some(route);
+    }
+
+    /// Record the engine-side stages (F4 found, F5 used, by tier) once the worker reports them.
+    /// A no-op when no route was recorded, so the trace never carries an outcome without its
+    /// router half.
+    pub fn record_cache_loss_outcome(
+        &self,
+        found: RequestCacheTierTokens,
+        used: RequestCacheTierTokens,
+    ) {
+        if let Some(trace) = self.cache_loss.lock().as_mut() {
+            trace.found = Some(found);
+            trace.used = Some(used);
+        }
+    }
+
+    pub fn cache_loss_trace(&self) -> Option<RequestCacheLossTrace> {
+        self.cache_loss.lock().clone()
     }
 
     /// Get the router scheduler queue depth recorded at routing time.
@@ -1288,5 +1318,41 @@ mod tests {
             json2.contains("kv_transfer_estimated_latency_ms"),
             "Set field should appear in JSON, got: {json2}"
         );
+    }
+
+    #[test]
+    fn cache_loss_trace_keeps_router_stages_and_adds_engine_stages_on_outcome() {
+        let tracker = RequestTracker::new();
+        assert!(tracker.cache_loss_trace().is_none());
+        // An outcome without a route is dropped: the trace never carries F4/F5 without F2/F3.
+        tracker.record_cache_loss_outcome(
+            RequestCacheTierTokens { hbm: 1, cpu: 1 },
+            RequestCacheTierTokens { hbm: 1, cpu: 1 },
+        );
+        assert!(tracker.cache_loss_trace().is_none());
+        tracker.record_cache_loss_route(RequestCacheLossTrace {
+            prompt_tokens: 128,
+            best_eligible: RequestCacheTierTokens { hbm: 64, cpu: 32 },
+            selected: RequestCacheTierTokens { hbm: 64, cpu: 0 },
+            found: None,
+            used: None,
+        });
+        let route_only = tracker.cache_loss_trace().unwrap();
+        assert_eq!(
+            route_only.best_eligible,
+            RequestCacheTierTokens { hbm: 64, cpu: 32 }
+        );
+        assert_eq!(route_only.found, None);
+        tracker.record_cache_loss_outcome(
+            RequestCacheTierTokens { hbm: 64, cpu: 16 },
+            RequestCacheTierTokens { hbm: 64, cpu: 8 },
+        );
+        let trace = tracker.cache_loss_trace().unwrap();
+        assert_eq!(trace.selected, RequestCacheTierTokens { hbm: 64, cpu: 0 });
+        assert_eq!(
+            trace.found,
+            Some(RequestCacheTierTokens { hbm: 64, cpu: 16 })
+        );
+        assert_eq!(trace.used, Some(RequestCacheTierTokens { hbm: 64, cpu: 8 }));
     }
 }

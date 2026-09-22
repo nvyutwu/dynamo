@@ -15,6 +15,7 @@ use dynamo_kv_router::{
 };
 use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
 
+use crate::kv_router::TierTokens;
 use crate::{
     kv_router::{
         FindBestMatchAdmission, FindBestMatchInnerOutcome, FindBestMatchOutcome,
@@ -39,6 +40,8 @@ pub(super) struct WorkerSelection {
     /// Greatest raw router-visible overlap among eligible workers, in tokens,
     /// when worker-stage telemetry is enabled.
     pub(super) max_raw_cached_tokens: Option<usize>,
+    pub(super) selected_router_tiers: TierTokens,
+    pub(super) best_router_tiers: TierTokens,
     pub(super) potential_decode_blocks: u64,
     pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
@@ -142,6 +145,8 @@ where
                     cached_tokens,
                     selected_raw_cached_tokens,
                     max_raw_cached_tokens,
+                    selected_router_tiers,
+                    best_router_tiers,
                     potential_decode_blocks,
                     routing_hashes,
                     kv_hint,
@@ -154,6 +159,8 @@ where
                     cached_tokens,
                     selected_raw_cached_tokens,
                     max_raw_cached_tokens,
+                    selected_router_tiers,
+                    best_router_tiers,
                     potential_decode_blocks,
                     selected_worker_load: None,
                     routing_hashes,
@@ -172,6 +179,8 @@ where
                     cached_tokens,
                     selected_raw_cached_tokens,
                     max_raw_cached_tokens,
+                    selected_router_tiers,
+                    best_router_tiers,
                     potential_decode_blocks,
                     selected_worker_load,
                     routing_hashes,
@@ -184,6 +193,8 @@ where
                     cached_tokens,
                     selected_raw_cached_tokens,
                     max_raw_cached_tokens,
+                    selected_router_tiers,
+                    best_router_tiers,
                     potential_decode_blocks,
                     selected_worker_load: Some(selected_worker_load),
                     routing_hashes,

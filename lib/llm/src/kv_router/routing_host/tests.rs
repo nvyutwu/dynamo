@@ -30,6 +30,7 @@ use dynamo_runtime::{
 use tokio::sync::watch;
 
 use super::*;
+use crate::kv_router::TierTokens;
 use crate::{
     http::service::metrics::Metrics,
     kv_router::{
@@ -704,6 +705,8 @@ async fn terminal_item_does_not_skip_transport_eof() {
                 prompt_tokens: 1,
                 best_router_tokens: 0,
                 selected_router_tokens: 0,
+                best_router_tiers: TierTokens::default(),
+                selected_router_tiers: TierTokens::default(),
             },
             true,
             false,

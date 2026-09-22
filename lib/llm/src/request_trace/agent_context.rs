@@ -230,6 +230,7 @@ pub(crate) fn request_metrics(
         replay: None,
         finish_reason_metadata: None,
         routing_decision: tracker.and_then(RequestTracker::routing_decision_trace),
+        cache_loss: tracker.and_then(RequestTracker::cache_loss_trace),
     }
 }
 

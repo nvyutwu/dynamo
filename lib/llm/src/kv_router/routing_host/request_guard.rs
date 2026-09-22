@@ -6,6 +6,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::kv_router::TierTokens;
+use crate::request_trace::{RequestCacheLossTrace, RequestCacheTierTokens};
 use crate::{
     kv_router::{
         KvRouter,
@@ -123,6 +125,78 @@ pub(super) struct RouteObservation {
     pub(super) prompt_tokens: u64,
     pub(super) best_router_tokens: u64,
     pub(super) selected_router_tokens: u64,
+    /// F2 split by tier: raw HBM prefix and host-pinned continuation on the best eligible worker.
+    pub(super) best_router_tiers: TierTokens,
+    /// F3 split by tier: the same on the worker that was selected.
+    pub(super) selected_router_tiers: TierTokens,
+}
+
+/// Router-side tier events in the tier-detail metric. `found`/`used` are the worker's; these
+/// two are the router's estimate before the request ran.
+const ROUTER_TIER_EVENT_BEST: &str = "router_best";
+const ROUTER_TIER_EVENT_SELECTED: &str = "router_selected";
+
+impl RouteObservation {
+    /// F2/F3 by tier as observations for `router_cache_loss_tier_tokens_total`, using the same
+    /// tier names the worker reports (`gpu` for HBM, `cpu` for host-pinned) so one query
+    /// covers both sides of the funnel.
+    pub(super) fn router_tier_observations(&self) -> [CacheLossTierMetricObservation<'static>; 4] {
+        let observation = |tier, event, tokens| CacheLossTierMetricObservation {
+            tier,
+            event,
+            accuracy: "exact",
+            tokens,
+        };
+        [
+            observation("gpu", ROUTER_TIER_EVENT_BEST, self.best_router_tiers.hbm),
+            observation("cpu", ROUTER_TIER_EVENT_BEST, self.best_router_tiers.cpu),
+            observation(
+                "gpu",
+                ROUTER_TIER_EVENT_SELECTED,
+                self.selected_router_tiers.hbm,
+            ),
+            observation(
+                "cpu",
+                ROUTER_TIER_EVENT_SELECTED,
+                self.selected_router_tiers.cpu,
+            ),
+        ]
+    }
+
+    /// The router-side half of the per-request `cache_loss` trace object.
+    pub(super) fn into_trace(self) -> RequestCacheLossTrace {
+        RequestCacheLossTrace {
+            prompt_tokens: self.prompt_tokens,
+            best_eligible: tier_tokens_to_trace(self.best_router_tiers),
+            selected: tier_tokens_to_trace(self.selected_router_tiers),
+            found: None,
+            used: None,
+        }
+    }
+}
+
+fn tier_tokens_to_trace(tiers: TierTokens) -> RequestCacheTierTokens {
+    RequestCacheTierTokens {
+        hbm: tiers.hbm,
+        cpu: tiers.cpu,
+    }
+}
+
+/// Sum the worker's validated per-tier observations for one event into the trace's HBM/CPU
+/// split. Tiers other than `gpu`/`cpu` are dropped here; the metric keeps them under `other`.
+fn worker_tier_tokens(
+    observations: &[ValidatedCacheLossTierObservation],
+    event: &str,
+) -> RequestCacheTierTokens {
+    let mut tokens = RequestCacheTierTokens::default();
+    for observation in observations.iter().filter(|o| o.event == event) {
+        match observation.tier.as_str() {
+            "gpu" => tokens.hbm = tokens.hbm.saturating_add(observation.tokens),
+            "cpu" => tokens.cpu = tokens.cpu.saturating_add(observation.tokens),
+            _ => {}
+        }
+    }
+    tokens
 }
 
 #[derive(Clone, Copy)]
@@ -815,11 +889,20 @@ where
         if attempt_id.is_some() {
             request_metrics.requests_started_total().inc();
         }
-        if let Some(cache_loss) = cache_loss.filter(|tracking| tracking.aggregate_enabled) {
-            request_metrics.observe_cache_loss_route(
-                cache_loss.route.best_router_tokens,
-                cache_loss.route.selected_router_tokens,
-            );
+        if let Some(tracking) = cache_loss {
+            if tracking.aggregate_enabled {
+                request_metrics.observe_cache_loss_route(
+                    tracking.route.best_router_tokens,
+                    tracking.route.selected_router_tokens,
+                );
+            }
+            if tracking.tier_detail_enabled {
+                request_metrics
+                    .observe_cache_loss_tiers(&tracking.route.router_tier_observations());
+            }
+            if let Some(tracker) = &request.tracker {
+                tracker.record_cache_loss_route(tracking.route.into_trace());
+            }
         }
         let approximate_lru = cleanup.approximate_lru.clone();
         let output_hashes = approximate_lru
@@ -1067,6 +1150,12 @@ where
                         .request_metrics()
                         .observe_cache_loss_worker(stages);
                 }
+                if let (Some(tracker), Some(tiers)) = (&self.observability.tracker, &tiers) {
+                    tracker.record_cache_loss_outcome(
+                        worker_tier_tokens(tiers, "found"),
+                        worker_tier_tokens(tiers, "used"),
+                    );
+                }
                 if tracking.tier_detail_enabled {
                     if let Some(tiers) = tiers {
                         let observations = tiers
@@ -1125,6 +1214,8 @@ mod cache_loss_tests {
             prompt_tokens: 100,
             best_router_tokens: 75,
             selected_router_tokens: 60,
+            best_router_tiers: TierTokens { hbm: 55, cpu: 20 },
+            selected_router_tiers: TierTokens { hbm: 60, cpu: 0 },
         }
     }
 
@@ -1288,6 +1379,74 @@ mod cache_loss_tests {
         ];
 
         assert!(valid_cache_loss_tier_observations(85, &tiers).is_none());
+    }
+
+    #[test]
+    fn router_tier_observations_split_f2_f3_by_tier() {
+        let observations = route().router_tier_observations();
+        let get = |tier: &str, event: &str| {
+            observations
+                .iter()
+                .find(|o| o.tier == tier && o.event == event)
+                .map(|o| o.tokens)
+                .unwrap()
+        };
+        assert_eq!(get("gpu", "router_best"), 55);
+        assert_eq!(get("cpu", "router_best"), 20);
+        assert_eq!(get("gpu", "router_selected"), 60);
+        assert_eq!(get("cpu", "router_selected"), 0);
+        assert!(observations.iter().all(|o| o.accuracy == "exact"));
+    }
+
+    #[test]
+    fn route_trace_carries_the_router_half_only() {
+        let trace = route().into_trace();
+        assert_eq!(trace.prompt_tokens, 100);
+        assert_eq!(
+            trace.best_eligible,
+            RequestCacheTierTokens { hbm: 55, cpu: 20 }
+        );
+        assert_eq!(trace.selected, RequestCacheTierTokens { hbm: 60, cpu: 0 });
+        assert_eq!(trace.found, None);
+        assert_eq!(trace.used, None);
+    }
+
+    #[test]
+    fn worker_tier_tokens_sum_gpu_and_cpu_per_event_and_ignore_other_tiers() {
+        let observations = vec![
+            ValidatedCacheLossTierObservation {
+                tier: "gpu".into(),
+                event: "found",
+                accuracy: "exact",
+                tokens: 70,
+            },
+            ValidatedCacheLossTierObservation {
+                tier: "cpu".into(),
+                event: "found",
+                accuracy: "exact",
+                tokens: 15,
+            },
+            ValidatedCacheLossTierObservation {
+                tier: "cpu".into(),
+                event: "used",
+                accuracy: "exact",
+                tokens: 12,
+            },
+            ValidatedCacheLossTierObservation {
+                tier: "remote_ssd".into(),
+                event: "found",
+                accuracy: "exact",
+                tokens: 5,
+            },
+        ];
+        assert_eq!(
+            worker_tier_tokens(&observations, "found"),
+            RequestCacheTierTokens { hbm: 70, cpu: 15 }
+        );
+        assert_eq!(
+            worker_tier_tokens(&observations, "used"),
+            RequestCacheTierTokens { hbm: 0, cpu: 12 }
+        );
     }
 }
 

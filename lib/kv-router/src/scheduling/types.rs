@@ -140,6 +140,10 @@ pub struct SchedulingResponse {
     /// Raw prefix overlap for the selected worker and DP rank, in tokens.
     pub selected_raw_cached_tokens: Option<usize>,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    /// Raw per-tier overlap on the eligible worker with the most resident blocks (HBM prefix
+    /// plus host-pinned continuation), from the same exact inputs as `selected_worker_tiers`.
+    /// Cache-loss telemetry only; a pinned selection reports the pinned worker.
+    pub best_eligible_worker_tiers: SelectedWorkerTierSnapshot,
     pub target_cached_prefix_blocks: u32,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub potential_decode_blocks: usize,
