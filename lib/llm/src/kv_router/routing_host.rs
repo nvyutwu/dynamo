@@ -32,7 +32,10 @@ use tracing::Instrument;
 
 use crate::{
     kv_router::{
-        KvRouter, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector,
+        KvRouter,
+        cache_history::{self, CacheHistory},
+        metrics::RouterRequestMetrics,
+        scheduler::DefaultWorkerSelector,
         to_worker_selection_session_context,
     },
     local_model::runtime_config::ModelRuntimeConfig,
@@ -62,7 +65,7 @@ use cancellation::{CleanupBudget, DispatchCancellation, StagedKv, await_with_cle
 use kv_selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 use occupancy::HostedOccupancy;
 pub(crate) use request_guard::prompt_private_blocks;
-use request_guard::{KvRequestCleanup, LoraLoadGuard, RequestGuard};
+use request_guard::{CacheHistoryTracking, KvRequestCleanup, LoraLoadGuard, RequestGuard};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
@@ -253,6 +256,7 @@ where
     request_metrics: Arc<RouterRequestMetrics>,
     cache_reuse_funnel_f2_onward_enabled: bool,
     cache_reuse_funnel_tier_detail_enabled: bool,
+    cache_history: Option<Arc<CacheHistory>>,
     affinity: Option<AffinityCoordinator>,
     session_affinity_mode: SessionAffinityMode,
     hosted_occupancy: Option<HostedOccupancy>,
@@ -427,6 +431,11 @@ where
             RouterRequestMetrics::from_component(kv_router.client().endpoint.component());
         let cache_reuse_funnel_f2_onward_enabled = cache_reuse_funnel_f2_onward_enabled();
         let cache_reuse_funnel_tier_detail_enabled = cache_reuse_funnel_tier_detail_enabled();
+        let cache_history =
+            cache_history::enabled().then(|| CacheHistory::from_env(kv_router.block_size()));
+        if let Some(history) = &cache_history {
+            request_metrics.set_cache_history_capacity(history.stats());
+        }
 
         RoutingHost {
             inner,
@@ -434,6 +443,7 @@ where
             request_metrics,
             cache_reuse_funnel_f2_onward_enabled,
             cache_reuse_funnel_tier_detail_enabled,
+            cache_history,
             affinity,
             session_affinity_mode,
             hosted_occupancy: None,
@@ -524,6 +534,7 @@ where
             request_metrics,
             cache_reuse_funnel_f2_onward_enabled: false,
             cache_reuse_funnel_tier_detail_enabled: false,
+            cache_history: None,
             affinity,
             session_affinity_mode,
             hosted_occupancy,

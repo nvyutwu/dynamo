@@ -437,6 +437,19 @@ where
         } else {
             None
         };
+        let history_prompt_hashes = self.cache_history.as_ref().and_then(|_| {
+            if chooser.indexer().records_routing_decisions() {
+                selection
+                    .routing_hashes
+                    .as_ref()
+                    .map(|hashes| hashes.sequence_hashes.clone())
+            } else {
+                selection
+                    .routing_hashes
+                    .take()
+                    .map(|hashes| hashes.sequence_hashes)
+            }
+        });
         let mut guard = match cleanup {
             Some(cleanup) => RequestGuard::new_kv_with_cleanup(
                 self.request_metrics.clone(),
@@ -454,6 +467,20 @@ where
                 cache_loss_tracking,
             ),
         };
+        if let (Some(history), Some(prompt_hashes)) =
+            (self.cache_history.as_ref(), history_prompt_hashes)
+        {
+            guard.track_cache_history(
+                CacheHistoryTracking::new(
+                    Arc::clone(history),
+                    prompt_hashes,
+                    routing_parts.token_ids.len() as u64,
+                ),
+                request,
+                chooser.block_size(),
+                chooser.is_eagle(),
+            );
+        }
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && chooser.indexer().records_routing_decisions() {

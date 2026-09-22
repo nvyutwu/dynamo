@@ -11,6 +11,7 @@ use crate::request_trace::{RequestCacheLossTrace, RequestCacheTierTokens};
 use crate::{
     kv_router::{
         KvRouter,
+        cache_history::CacheHistory,
         indexer::ApproximateRequestLease,
         metrics::{CacheLossTierMetricObservation, RouterRequestMetrics},
         prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
@@ -220,6 +221,31 @@ impl CacheLossTracking {
     }
 }
 
+pub(super) struct CacheHistoryTracking {
+    history: Arc<CacheHistory>,
+    prompt_hashes: Vec<u64>,
+    output_hashes: Vec<u64>,
+    prompt_tokens: u64,
+    previously_seen_tokens: u64,
+}
+
+impl CacheHistoryTracking {
+    pub(super) fn new(
+        history: Arc<CacheHistory>,
+        prompt_hashes: Vec<u64>,
+        prompt_tokens: u64,
+    ) -> Self {
+        let previously_seen_tokens = history.previously_computed_tokens(&prompt_hashes);
+        Self {
+            history,
+            prompt_hashes,
+            output_hashes: Vec::new(),
+            prompt_tokens,
+            previously_seen_tokens,
+        }
+    }
+}
+
 /// F4 (looked up) and F5 (used) as the worker reported them. A worker that reports generic
 /// `worker_lookup_tokens` / `worker_used_tokens` totals wins; otherwise the stages are the
 /// GPU hit plus the CPU lookup / hit split.
@@ -331,6 +357,35 @@ fn finalize_cache_loss_state(
             }
         }),
     )
+}
+
+struct CacheHistoryFinalization {
+    prompt_tokens: u64,
+    previously_seen_tokens: u64,
+    retained: Option<crate::kv_router::cache_history::CacheHistoryStats>,
+}
+
+fn finalize_cache_history(
+    tracking: &mut Option<CacheHistoryTracking>,
+    record_completed: bool,
+) -> Option<CacheHistoryFinalization> {
+    let tracking = tracking.take()?;
+    let retained = record_completed
+        .then(|| {
+            tracking.history.record_completed(
+                tracking
+                    .prompt_hashes
+                    .iter()
+                    .copied()
+                    .chain(tracking.output_hashes.iter().copied()),
+            )
+        })
+        .flatten();
+    Some(CacheHistoryFinalization {
+        prompt_tokens: tracking.prompt_tokens,
+        previously_seen_tokens: tracking.previously_seen_tokens,
+        retained,
+    })
 }
 
 pub(crate) fn prompt_private_blocks(
@@ -836,6 +891,7 @@ where
     observability: RequestObservability,
     output_blocks: OutputBlockTracker,
     approximate_lru: Option<ApproximateRequestLease>,
+    approximate_lru_active: bool,
     output_hashes: Option<CanonicalOutputTracker>,
     record_itl_at_completion: bool,
     prefill_marked: bool,
@@ -843,6 +899,7 @@ where
     cache_loss: Option<CacheLossTracking>,
     cache_loss_worker_outcome: Option<CacheLossWorkerOutcome>,
     cache_loss_recorded: bool,
+    cache_history: Option<CacheHistoryTracking>,
     _lora_load: Option<LoraLoadGuard>,
 }
 
@@ -918,6 +975,7 @@ where
                 expected_output_tokens,
             ),
             approximate_lru,
+            approximate_lru_active: false,
             output_hashes,
             record_itl_at_completion: false,
             prefill_marked: false,
@@ -925,6 +983,7 @@ where
             cache_loss,
             cache_loss_worker_outcome: None,
             cache_loss_recorded: false,
+            cache_history: None,
             _lora_load: None,
         }
     }
@@ -950,6 +1009,7 @@ where
             // when the request completes rather than observing every streamed token.
             output_blocks: OutputBlockTracker::new(false, request.token_ids.len(), 1, None),
             approximate_lru: None,
+            approximate_lru_active: false,
             output_hashes: None,
             record_itl_at_completion: true,
             prefill_marked: false,
@@ -957,6 +1017,7 @@ where
             cache_loss: None,
             cache_loss_worker_outcome: None,
             cache_loss_recorded: false,
+            cache_history: None,
             _lora_load: lora_load,
         }
     }
@@ -991,6 +1052,24 @@ where
         self.approximate_lru.is_some()
     }
 
+    pub(super) fn track_cache_history(
+        &mut self,
+        tracking: CacheHistoryTracking,
+        request: &PreprocessedRequest,
+        block_size: u32,
+        is_eagle: bool,
+    ) {
+        self.observability
+            .request_metrics()
+            .observe_cache_history_input(tracking.prompt_tokens);
+        let parent_hash = tracking.prompt_hashes.last().copied();
+        let output_hashes = self
+            .output_hashes
+            .get_or_insert_with(|| CanonicalOutputTracker::new(request, block_size, is_eagle));
+        output_hashes.set_prompt_parent(parent_hash);
+        self.cache_history = Some(tracking);
+    }
+
     pub(super) async fn acquire_approximate_lru(
         &mut self,
         hashes: RoutingDecisionHashes,
@@ -1004,8 +1083,11 @@ where
             return Ok(());
         };
         let mode = lease.acquire(hashes, private_blocks).await?;
+        self.approximate_lru_active = mode == ApproximateAcquireMode::Lru;
         if mode != ApproximateAcquireMode::Lru {
-            self.output_hashes = None;
+            if self.cache_history.is_none() {
+                self.output_hashes = None;
+            }
             return Ok(());
         }
         if let Some(output_hashes) = self.output_hashes.as_mut() {
@@ -1047,29 +1129,41 @@ where
             }
         }
 
-        if self
+        let track_approximate = self
             .cleanup
             .lifecycle()
             .is_some_and(RequestAttemptLease::is_active)
-            && let (Some(data), Some(output_hashes), Some(lease)) = (
-                item.data.as_ref(),
-                self.output_hashes.as_mut(),
-                self.approximate_lru.as_ref(),
-            )
-            && let Some(materialized) =
-                output_hashes.observe(data.index.unwrap_or(0), &data.token_ids)
-            && let Err(error) = lease.materialize(
-                materialized.parent_hash,
-                materialized.blocks,
-                materialized.start_position,
-                materialized.private_blocks,
-            )
-        {
-            tracing::warn!(
-                request_id = self.cleanup.context_id().unwrap_or("stateless"),
-                %error,
-                "Failed to materialize approximate LRU output blocks"
-            );
+            && self.approximate_lru_active
+            && self.approximate_lru.is_some();
+        let materialized = (track_approximate || self.cache_history.is_some())
+            .then(|| {
+                let data = item.data.as_ref()?;
+                self.output_hashes
+                    .as_mut()?
+                    .observe(data.index.unwrap_or(0), &data.token_ids)
+            })
+            .flatten();
+        if let Some(materialized) = materialized {
+            if let Some(history) = self.cache_history.as_mut() {
+                history
+                    .output_hashes
+                    .extend(materialized.blocks.iter().map(|block| block.sequence_hash));
+            }
+            if track_approximate
+                && let Some(lease) = self.approximate_lru.as_ref()
+                && let Err(error) = lease.materialize(
+                    materialized.parent_hash,
+                    materialized.blocks,
+                    materialized.start_position,
+                    materialized.private_blocks,
+                )
+            {
+                tracing::warn!(
+                    request_id = self.cleanup.context_id().unwrap_or("stateless"),
+                    %error,
+                    "Failed to materialize approximate LRU output blocks"
+                );
+            }
         }
         self.observability.observe_tokens(new_tokens);
         self.observe_cache_loss_worker_outcome(item);
@@ -1099,6 +1193,7 @@ where
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
         self.finish_cache_loss(true);
+        self.finish_cache_history(true);
         self.observability
             .record_metrics(self.record_itl_at_completion);
         self.cleanup.finish().await;
@@ -1106,6 +1201,7 @@ where
 
     pub(super) async fn abort(&mut self) {
         self.finish_cache_loss(false);
+        self.finish_cache_history(false);
         self.cleanup.finish().await;
     }
 
@@ -1191,6 +1287,30 @@ where
             }
         }
     }
+
+    fn finish_cache_history(&mut self, record_completed: bool) {
+        let Some(finalization) = finalize_cache_history(&mut self.cache_history, record_completed)
+        else {
+            return;
+        };
+        if record_completed {
+            self.observability
+                .request_metrics()
+                .observe_cache_history_complete(
+                    finalization.prompt_tokens,
+                    finalization.previously_seen_tokens,
+                );
+        } else {
+            self.observability
+                .request_metrics()
+                .observe_cache_history_incomplete();
+        }
+        if let Some(stats) = finalization.retained {
+            self.observability
+                .request_metrics()
+                .set_cache_history_retained(stats);
+        }
+    }
 }
 
 impl<Sel> Drop for RequestGuard<Sel>
@@ -1199,6 +1319,7 @@ where
 {
     fn drop(&mut self) {
         self.finish_cache_loss(false);
+        self.finish_cache_history(false);
         self.observability
             .record_metrics(self.record_itl_at_completion);
         // RequestCleanup drops immediately afterward and performs resource cleanup.
@@ -1451,6 +1572,37 @@ mod cache_loss_tests {
 }
 
 #[cfg(test)]
+mod cache_history_tests {
+    use super::*;
+
+    #[test]
+    fn completed_request_observes_once_and_records_membership() {
+        let history = Arc::new(CacheHistory::with_capacity(4, 8));
+        let mut tracking = Some(CacheHistoryTracking::new(history.clone(), vec![10], 8));
+
+        let first = finalize_cache_history(&mut tracking, true).unwrap();
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.previously_seen_tokens, 0);
+        assert!(first.retained.is_some());
+        assert_eq!(history.previously_computed_tokens(&[10]), 8);
+        assert!(finalize_cache_history(&mut tracking, true).is_none());
+    }
+
+    #[test]
+    fn aborted_request_observes_once_without_recording_membership() {
+        let history = Arc::new(CacheHistory::with_capacity(4, 8));
+        let mut tracking = Some(CacheHistoryTracking::new(history.clone(), vec![10], 8));
+
+        let first = finalize_cache_history(&mut tracking, false).unwrap();
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.previously_seen_tokens, 0);
+        assert!(first.retained.is_none());
+        assert_eq!(history.previously_computed_tokens(&[10]), 0);
+        assert!(finalize_cache_history(&mut tracking, false).is_none());
+    }
+}
+
+#[cfg(test)]
 mod output_hash_tests {
     use super::*;
     use dynamo_kv_router::protocols::{BlockMmObjectInfo, compute_seq_hash_for_block};
@@ -1638,6 +1790,7 @@ mod prefill_start_tests {
             decision_counters_prefill: RoutingDecisionCounters::for_test(),
             decision_counters_decode: RoutingDecisionCounters::for_test(),
             cache_loss_tier_details: None,
+            cache_history: None,
         })
     }
 
