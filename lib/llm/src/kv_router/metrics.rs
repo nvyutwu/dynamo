@@ -66,7 +66,8 @@ use crate::http::service::metrics::generate_log_buckets;
 use crate::protocols::common::timing::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
 use dynamo_kv_router::scheduling::BestOverlapCandidate;
 use dynamo_kv_router::{
-    indexer::ApproximateLruStats, protocols::cache_reuse_funnel_f2_onward_enabled,
+    indexer::ApproximateLruStats,
+    protocols::{cache_reuse_funnel_f2_onward_enabled, cache_reuse_funnel_tier_detail_enabled},
 };
 
 pub(crate) const ROUTER_WORKER_ID_LABEL: &str = "router_worker_id";
@@ -861,6 +862,7 @@ pub struct RouterRequestMetrics {
     pub(crate) cache_loss_worker_stages: Option<CacheLossWorkerStageMetrics>,
     pub decision_counters_prefill: RoutingDecisionCounters,
     pub decision_counters_decode: RoutingDecisionCounters,
+    pub(crate) cache_loss_tier_details: Option<CacheLossTierDetailMetrics>,
 }
 
 #[cfg_attr(test, derive(Clone))]
@@ -945,6 +947,27 @@ impl RoutingDecisionCounters {
             self.input_f0_total.get(),
             self.input_f2_total.get(),
         )
+    }
+}
+
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct CacheLossTierDetailMetrics {
+    tokens_total: IntCounterVec,
+    complete_observations_total: IntCounter,
+    incomplete_observations_total: IntCounter,
+}
+
+pub(crate) struct CacheLossTierMetricObservation<'a> {
+    pub tier: &'a str,
+    pub event: &'a str,
+    pub accuracy: &'a str,
+    pub tokens: u64,
+}
+
+fn cache_loss_metric_tier(tier: &str) -> &str {
+    match tier {
+        "gpu" | "cpu" | "peer" | "remote" | "disk" => tier,
+        _ => "other",
     }
 }
 
@@ -1154,6 +1177,31 @@ impl RouterRequestMetrics {
                 };
                 let decision_counters_prefill = resolve(WORKER_TYPE_PREFILL);
                 let decision_counters_decode = resolve(WORKER_TYPE_DECODE);
+                let cache_loss_tier_details = cache_reuse_funnel_tier_detail_enabled().then(|| {
+                    let tokens_total = metrics
+                        .create_intcountervec(
+                            &router_metric("cache_loss_tier_tokens_total"),
+                            "Worker-observed cache tokens by tier, event, and measurement accuracy",
+                            &["tier", "event", "accuracy"],
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_tier_tokens_total");
+                    let observations = metrics
+                        .create_intcountervec(
+                            &router_metric("cache_loss_tier_observations_total"),
+                            "Tier-resolved cache observations by result",
+                            &["result"],
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_tier_observations_total");
+                    CacheLossTierDetailMetrics {
+                        tokens_total,
+                        complete_observations_total: observations
+                            .with_label_values(&["complete"]),
+                        incomplete_observations_total: observations
+                            .with_label_values(&["incomplete"]),
+                    }
+                });
                 Arc::new(Self {
                     requests_total,
                     time_to_first_token_seconds,
@@ -1169,6 +1217,7 @@ impl RouterRequestMetrics {
                     cache_loss_worker_stages,
                     decision_counters_prefill,
                     decision_counters_decode,
+                    cache_loss_tier_details,
                 })
             })
             .clone()
@@ -1223,6 +1272,32 @@ impl RouterRequestMetrics {
             &self.decision_counters_prefill
         } else {
             &self.decision_counters_decode
+        }
+    }
+
+    pub(crate) fn observe_cache_loss_tiers(
+        &self,
+        observations: &[CacheLossTierMetricObservation<'_>],
+    ) {
+        let Some(metrics) = &self.cache_loss_tier_details else {
+            return;
+        };
+        for observation in observations {
+            metrics
+                .tokens_total
+                .with_label_values(&[
+                    cache_loss_metric_tier(observation.tier),
+                    observation.event,
+                    observation.accuracy,
+                ])
+                .inc_by(observation.tokens);
+        }
+        metrics.complete_observations_total.inc();
+    }
+
+    pub(crate) fn observe_cache_loss_tier_incomplete(&self) {
+        if let Some(metrics) = &self.cache_loss_tier_details {
+            metrics.incomplete_observations_total.inc();
         }
     }
 }
@@ -1468,6 +1543,13 @@ mod tests {
         let mut buffer = Vec::new();
         encoder.encode(&registry.gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+
+    #[test]
+    fn cache_loss_metric_tier_bounds_label_cardinality() {
+        assert_eq!(cache_loss_metric_tier("gpu"), "gpu");
+        assert_eq!(cache_loss_metric_tier("peer"), "peer");
+        assert_eq!(cache_loss_metric_tier("remote_ssd"), "other");
     }
 
     #[test]

@@ -28,6 +28,11 @@ pub const CACHE_REUSE_METRICS_ENABLED_ENV: &str = "DYN_ROUTER_CACHE_REUSE_METRIC
 
 static CACHE_REUSE_METRICS_ENABLED: LazyLock<bool> =
     LazyLock::new(|| dynamo_truthy::env_is_truthy(CACHE_REUSE_METRICS_ENABLED_ENV));
+pub const CACHE_REUSE_FUNNEL_TIER_DETAIL_ENABLED_ENV: &str =
+    "DYN_CACHE_REUSE_FUNNEL_TIER_DETAIL_ENABLED";
+
+static CACHE_REUSE_FUNNEL_TIER_DETAIL_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| dynamo_truthy::env_is_truthy(CACHE_REUSE_FUNNEL_TIER_DETAIL_ENABLED_ENV));
 
 /// Returns the process-level worker-stage telemetry setting.
 ///
@@ -35,6 +40,10 @@ static CACHE_REUSE_METRICS_ENABLED: LazyLock<bool> =
 /// boolean branch and performs no allocation or metadata collection.
 pub fn cache_reuse_funnel_f2_onward_enabled() -> bool {
     *CACHE_REUSE_METRICS_ENABLED
+}
+
+pub fn cache_reuse_funnel_tier_detail_enabled() -> bool {
+    *CACHE_REUSE_FUNNEL_TIER_DETAIL_ENABLED
 }
 
 /// Seed for XXH3 hashing, consistent with indexer.rs

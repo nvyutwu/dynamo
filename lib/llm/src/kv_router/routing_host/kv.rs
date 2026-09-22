@@ -415,16 +415,22 @@ where
         let chooser = self.kv_router();
         let block_size = chooser.block_size() as usize;
         let selected_worker = selection.worker;
-        let cache_loss_tracking = if !is_query_only && self.cache_reuse_funnel_f2_onward_enabled {
+        let aggregate_enabled = self.cache_reuse_funnel_f2_onward_enabled;
+        let tier_detail_enabled = self.cache_reuse_funnel_tier_detail_enabled;
+        let cache_loss_tracking = if !is_query_only && (aggregate_enabled || tier_detail_enabled) {
             selection
                 .max_raw_cached_tokens
                 .zip(selection.selected_raw_cached_tokens)
                 .map(|(max_raw_cached_tokens, selected_raw_cached_tokens)| {
-                    CacheLossTracking::new(RouteObservation {
-                        prompt_tokens: routing_parts.token_ids.len() as u64,
-                        best_router_tokens: max_raw_cached_tokens as u64,
-                        selected_router_tokens: selected_raw_cached_tokens as u64,
-                    })
+                    CacheLossTracking::new(
+                        RouteObservation {
+                            prompt_tokens: routing_parts.token_ids.len() as u64,
+                            best_router_tokens: max_raw_cached_tokens as u64,
+                            selected_router_tokens: selected_raw_cached_tokens as u64,
+                        },
+                        aggregate_enabled,
+                        tier_detail_enabled,
+                    )
                 })
         } else {
             None

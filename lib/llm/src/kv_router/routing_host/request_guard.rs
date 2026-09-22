@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     kv_router::{
         KvRouter,
         indexer::ApproximateRequestLease,
-        metrics::RouterRequestMetrics,
+        metrics::{CacheLossTierMetricObservation, RouterRequestMetrics},
         prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
         request_lease::RequestAttemptLease,
         scheduler::{DefaultWorkerSelector, SchedulerBookingDescriptor},
@@ -85,6 +88,34 @@ struct CacheLossWorkerOutcome {
     cpu_hit_tokens: u64,
     #[serde(default)]
     cpu_lookup_tokens: u64,
+    #[serde(default)]
+    worker_lookup_tokens: Option<u64>,
+    #[serde(default)]
+    worker_used_tokens: Option<u64>,
+    #[serde(default)]
+    tiers: Vec<CacheLossTierOutcome>,
+}
+
+#[derive(serde::Deserialize)]
+struct CacheLossTierOutcome {
+    tier: String,
+    #[serde(default)]
+    events: Vec<CacheLossTierEventOutcome>,
+}
+
+#[derive(serde::Deserialize)]
+struct CacheLossTierEventOutcome {
+    event: String,
+    tokens: u64,
+    accuracy: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ValidatedCacheLossTierObservation {
+    tier: String,
+    event: &'static str,
+    accuracy: &'static str,
+    tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,23 +125,44 @@ pub(super) struct RouteObservation {
     pub(super) selected_router_tokens: u64,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct CacheLossTracking {
     route: RouteObservation,
+    aggregate_enabled: bool,
+    tier_detail_enabled: bool,
 }
 
 impl CacheLossTracking {
-    pub(super) fn new(route: RouteObservation) -> Self {
-        Self { route }
+    pub(super) fn new(
+        route: RouteObservation,
+        aggregate_enabled: bool,
+        tier_detail_enabled: bool,
+    ) -> Self {
+        Self {
+            route,
+            aggregate_enabled,
+            tier_detail_enabled,
+        }
     }
 }
 
+/// F4 (looked up) and F5 (used) as the worker reported them. A worker that reports generic
+/// `worker_lookup_tokens` / `worker_used_tokens` totals wins; otherwise the stages are the
+/// GPU hit plus the CPU lookup / hit split.
 fn cache_loss_worker_stage(outcome: &CacheLossWorkerOutcome) -> Option<[u64; 2]> {
-    Some([
-        outcome
-            .gpu_hit_tokens
-            .checked_add(outcome.cpu_lookup_tokens)?,
-        outcome.gpu_hit_tokens.checked_add(outcome.cpu_hit_tokens)?,
-    ])
+    let f4 = outcome.worker_lookup_tokens.map_or_else(
+        || {
+            outcome
+                .gpu_hit_tokens
+                .checked_add(outcome.cpu_lookup_tokens)
+        },
+        Some,
+    )?;
+    let f5 = outcome.worker_used_tokens.map_or_else(
+        || outcome.gpu_hit_tokens.checked_add(outcome.cpu_hit_tokens),
+        Some,
+    )?;
+    Some([f4, f5])
 }
 
 fn valid_cache_loss_worker_outcome(
@@ -121,9 +173,63 @@ fn valid_cache_loss_worker_outcome(
     (outcome.complete && outcome.prompt_tokens == route.prompt_tokens).then_some(outcome)
 }
 
+fn valid_cache_loss_tier_observations(
+    expected_used_tokens: u64,
+    tiers: &[CacheLossTierOutcome],
+) -> Option<Vec<ValidatedCacheLossTierObservation>> {
+    if tiers.is_empty() || tiers.len() > 8 {
+        return None;
+    }
+    let mut tier_names = HashSet::with_capacity(tiers.len());
+    let mut observations = Vec::new();
+    let mut used_tokens = 0_u64;
+    for tier in tiers {
+        if tier.tier.is_empty()
+            || tier.tier.len() > 32
+            || !tier.tier.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+            })
+            || !tier_names.insert(tier.tier.as_str())
+            || tier.events.len() > 8
+        {
+            return None;
+        }
+        let mut events = HashSet::with_capacity(tier.events.len());
+        for observation in &tier.events {
+            let event = match observation.event.as_str() {
+                "lookup" => "lookup",
+                "found" => "found",
+                "used" => "used",
+                _ => continue,
+            };
+            if !events.insert(event) {
+                return None;
+            }
+            let accuracy = match observation.accuracy.as_str() {
+                "exact" => "exact",
+                "lower_bound" => "lower_bound",
+                _ => return None,
+            };
+            if event == "used" {
+                used_tokens = used_tokens.checked_add(observation.tokens)?;
+            }
+            observations.push(ValidatedCacheLossTierObservation {
+                tier: tier.tier.clone(),
+                event,
+                accuracy,
+                tokens: observation.tokens,
+            });
+        }
+    }
+    (!observations.is_empty() && used_tokens == expected_used_tokens).then_some(observations)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum CacheLossFinalization {
-    Complete([u64; 2]),
+    Complete {
+        stages: [u64; 2],
+        tiers: Option<Vec<ValidatedCacheLossTierObservation>>,
+    },
     Incomplete,
 }
 
@@ -143,10 +249,14 @@ fn finalize_cache_loss_state(
     let Some(outcome) = worker_outcome.take() else {
         return Some(CacheLossFinalization::Incomplete);
     };
-    Some(cache_loss_worker_stage(&outcome).map_or(
-        CacheLossFinalization::Incomplete,
-        CacheLossFinalization::Complete,
-    ))
+    Some(
+        cache_loss_worker_stage(&outcome).map_or(CacheLossFinalization::Incomplete, |stages| {
+            CacheLossFinalization::Complete {
+                stages,
+                tiers: valid_cache_loss_tier_observations(stages[1], &outcome.tiers),
+            }
+        }),
+    )
 }
 
 pub(crate) fn prompt_private_blocks(
@@ -656,7 +766,7 @@ where
     record_itl_at_completion: bool,
     prefill_marked: bool,
     migration_state: Option<MigrationState>,
-    cache_loss: Option<RouteObservation>,
+    cache_loss: Option<CacheLossTracking>,
     cache_loss_worker_outcome: Option<CacheLossWorkerOutcome>,
     cache_loss_recorded: bool,
     _lora_load: Option<LoraLoadGuard>,
@@ -699,16 +809,16 @@ where
         let attempt_id = cleanup
             .lifecycle()
             .map(|lifecycle| lifecycle.booking().attempt_id);
-        let cache_loss = cache_loss_tracking.as_ref().map(|tracking| tracking.route);
+        let cache_loss = cache_loss_tracking;
         let track_output_blocks =
             attempt_id.is_some() && chooser.kv_router_config().router_track_output_blocks;
         if attempt_id.is_some() {
             request_metrics.requests_started_total().inc();
         }
-        if let Some(cache_loss) = cache_loss {
+        if let Some(cache_loss) = cache_loss.filter(|tracking| tracking.aggregate_enabled) {
             request_metrics.observe_cache_loss_route(
-                cache_loss.best_router_tokens,
-                cache_loss.selected_router_tokens,
+                cache_loss.route.best_router_tokens,
+                cache_loss.route.selected_router_tokens,
             );
         }
         let approximate_lru = cleanup.approximate_lru.clone();
@@ -920,7 +1030,7 @@ where
         if self.cache_loss_recorded || self.cache_loss_worker_outcome.is_some() {
             return;
         }
-        let Some(route) = self.cache_loss else {
+        let Some(tracking) = self.cache_loss else {
             return;
         };
         let Some(value) = item
@@ -931,7 +1041,7 @@ where
         else {
             return;
         };
-        let Some(outcome) = valid_cache_loss_worker_outcome(route, value) else {
+        let Some(outcome) = valid_cache_loss_worker_outcome(tracking.route, value) else {
             return;
         };
 
@@ -940,22 +1050,56 @@ where
 
     fn finish_cache_loss(&mut self, complete: bool) {
         let Some(finalization) = finalize_cache_loss_state(
-            self.cache_loss,
+            self.cache_loss.map(|tracking| tracking.route),
             &mut self.cache_loss_worker_outcome,
             &mut self.cache_loss_recorded,
             complete,
         ) else {
             return;
         };
+        let Some(tracking) = self.cache_loss else {
+            return;
+        };
         match finalization {
-            CacheLossFinalization::Complete(lookup_tokens) => self
-                .observability
-                .request_metrics()
-                .observe_cache_loss_worker(lookup_tokens),
-            CacheLossFinalization::Incomplete => self
-                .observability
-                .request_metrics()
-                .observe_cache_loss_incomplete(),
+            CacheLossFinalization::Complete { stages, tiers } => {
+                if tracking.aggregate_enabled {
+                    self.observability
+                        .request_metrics()
+                        .observe_cache_loss_worker(stages);
+                }
+                if tracking.tier_detail_enabled {
+                    if let Some(tiers) = tiers {
+                        let observations = tiers
+                            .iter()
+                            .map(|observation| CacheLossTierMetricObservation {
+                                tier: &observation.tier,
+                                event: observation.event,
+                                accuracy: observation.accuracy,
+                                tokens: observation.tokens,
+                            })
+                            .collect::<Vec<_>>();
+                        self.observability
+                            .request_metrics()
+                            .observe_cache_loss_tiers(&observations);
+                    } else {
+                        self.observability
+                            .request_metrics()
+                            .observe_cache_loss_tier_incomplete();
+                    }
+                }
+            }
+            CacheLossFinalization::Incomplete => {
+                if tracking.aggregate_enabled {
+                    self.observability
+                        .request_metrics()
+                        .observe_cache_loss_incomplete();
+                }
+                if tracking.tier_detail_enabled {
+                    self.observability
+                        .request_metrics()
+                        .observe_cache_loss_tier_incomplete();
+                }
+            }
         }
     }
 }
@@ -991,6 +1135,9 @@ mod cache_loss_tests {
             gpu_hit_tokens: 70,
             cpu_hit_tokens: 15,
             cpu_lookup_tokens: 20,
+            worker_lookup_tokens: None,
+            worker_used_tokens: None,
+            tiers: Vec::new(),
         }
     }
 
@@ -1002,6 +1149,15 @@ mod cache_loss_tests {
     }
 
     #[test]
+    fn generic_worker_totals_preserve_the_aggregate_funnel() {
+        let mut outcome = outcome();
+        outcome.worker_lookup_tokens = Some(95);
+        outcome.worker_used_tokens = Some(90);
+
+        assert_eq!(cache_loss_worker_stage(&outcome), Some([95, 90]));
+    }
+
+    #[test]
     fn stages_preserve_values_above_prior_stages_and_prompt_length() {
         let outcome = CacheLossWorkerOutcome {
             complete: true,
@@ -1009,6 +1165,9 @@ mod cache_loss_tests {
             gpu_hit_tokens: 120,
             cpu_hit_tokens: 15,
             cpu_lookup_tokens: 20,
+            worker_lookup_tokens: None,
+            worker_used_tokens: None,
+            tiers: Vec::new(),
         };
 
         assert_eq!(cache_loss_worker_stage(&outcome), Some([140, 135]));
@@ -1022,6 +1181,9 @@ mod cache_loss_tests {
             gpu_hit_tokens: u64::MAX,
             cpu_hit_tokens: 1,
             cpu_lookup_tokens: 1,
+            worker_lookup_tokens: None,
+            worker_used_tokens: None,
+            tiers: Vec::new(),
         };
 
         assert_eq!(cache_loss_worker_stage(&outcome), None);
@@ -1034,7 +1196,10 @@ mod cache_loss_tests {
 
         assert_eq!(
             finalize_cache_loss_state(Some(route()), &mut worker_outcome, &mut recorded, true),
-            Some(CacheLossFinalization::Complete([90, 85]))
+            Some(CacheLossFinalization::Complete {
+                stages: [90, 85],
+                tiers: None,
+            })
         );
         assert_eq!(
             finalize_cache_loss_state(Some(route()), &mut worker_outcome, &mut recorded, true),
@@ -1058,26 +1223,71 @@ mod cache_loss_tests {
     }
 
     #[test]
-    fn invalid_worker_outcome_does_not_block_a_later_valid_branch() {
-        let route = route();
+    fn invalid_worker_outcome_is_rejected() {
         assert!(
-            valid_cache_loss_worker_outcome(route, &serde_json::json!({"complete": false}),)
+            valid_cache_loss_worker_outcome(route(), &serde_json::json!({"complete": false}),)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn tier_observations_preserve_extensible_tiers_and_accuracy() {
         let value = serde_json::json!({
             "complete": true,
             "prompt_tokens": 100,
             "gpu_hit_tokens": 70,
             "cpu_hit_tokens": 15,
             "cpu_lookup_tokens": 20,
+            "tiers": [
+                {"tier": "gpu", "events": [
+                    {"event": "found", "tokens": 70, "accuracy": "exact"},
+                    {"event": "used", "tokens": 70, "accuracy": "exact"}
+                ]},
+                {"tier": "cpu", "events": [
+                    {"event": "lookup", "tokens": 20, "accuracy": "lower_bound"},
+                    {"event": "found", "tokens": 15, "accuracy": "exact"},
+                    {"event": "used", "tokens": 15, "accuracy": "exact"}
+                ]},
+                {"tier": "remote_ssd", "events": [
+                    {"event": "lookup", "tokens": 5, "accuracy": "exact"},
+                    {"event": "prefetched", "tokens": 5, "accuracy": "exact"}
+                ]}
+            ]
         });
-        let mut worker_outcome = valid_cache_loss_worker_outcome(route, &value);
-        let mut recorded = false;
+        let outcome = valid_cache_loss_worker_outcome(route(), &value).unwrap();
+        let observations = valid_cache_loss_tier_observations(85, &outcome.tiers).unwrap();
 
-        assert_eq!(
-            finalize_cache_loss_state(Some(route), &mut worker_outcome, &mut recorded, true),
-            Some(CacheLossFinalization::Complete([90, 85]))
-        );
+        assert_eq!(observations.len(), 6);
+        assert!(observations.contains(&ValidatedCacheLossTierObservation {
+            tier: "remote_ssd".to_string(),
+            event: "lookup",
+            accuracy: "exact",
+            tokens: 5,
+        }));
+    }
+
+    #[test]
+    fn tier_observations_reject_duplicate_used_token_attribution() {
+        let tiers = vec![
+            CacheLossTierOutcome {
+                tier: "gpu".to_string(),
+                events: vec![CacheLossTierEventOutcome {
+                    event: "used".to_string(),
+                    tokens: 70,
+                    accuracy: "exact".to_string(),
+                }],
+            },
+            CacheLossTierOutcome {
+                tier: "cpu".to_string(),
+                events: vec![CacheLossTierEventOutcome {
+                    event: "used".to_string(),
+                    tokens: 40,
+                    accuracy: "exact".to_string(),
+                }],
+            },
+        ];
+
+        assert!(valid_cache_loss_tier_observations(85, &tiers).is_none());
     }
 }
 
@@ -1268,6 +1478,7 @@ mod prefill_start_tests {
             cache_loss_worker_stages: None,
             decision_counters_prefill: RoutingDecisionCounters::for_test(),
             decision_counters_decode: RoutingDecisionCounters::for_test(),
+            cache_loss_tier_details: None,
         })
     }
 
