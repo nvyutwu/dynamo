@@ -76,9 +76,10 @@ pub use scheduling::{
     WorkerSelectionInputTrigger, WorkerSelectionPolicyError,
 };
 pub use selector::{
-    DefaultWorkerSelector, ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerFilter,
-    WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer,
-    WorkerSelectionContext, WorkerSelectionInput, WorkerSelectionPolicy, WorkerSelector,
+    DefaultWorkerSelector, PickExplanation, ScoredWorkerCandidate, WorkerCacheInput,
+    WorkerCandidate, WorkerFilter, WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker,
+    WorkerScorer, WorkerSelectionContext, WorkerSelectionInput, WorkerSelectionPolicy,
+    WorkerSelector,
 };
 pub use tracking_hash::{TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope};
 pub use worker_type::WorkerType;

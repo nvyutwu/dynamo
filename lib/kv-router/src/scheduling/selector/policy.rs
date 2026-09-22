@@ -140,6 +140,28 @@ pub trait WorkerFilter: Send {
 }
 
 /// Selects one row after all filters and scorers run.
+/// What a custom picker chose and why, for the opt-in routing-decision trace.
+///
+/// The default policy's trace reproduces its own cost formula per candidate. A plugin ranks
+/// workers by its own rule, so it explains itself here instead: which policy this is, which
+/// branch it took, the parameters that were in force, and -- when it ranks overlap differently
+/// from the raw `effective_overlap_blocks` -- its own per-row overlap score plus the row it
+/// considers the max-overlap (oracle) worker. Everything is optional; the host fills whatever
+/// is missing from the policy-independent candidate inputs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PickExplanation {
+    /// Policy identifier, e.g. the registered policy type.
+    pub policy: String,
+    /// Which branch of the policy produced the pick.
+    pub reason: String,
+    /// Row (in the picker's input order) the policy regards as holding the most reusable cache.
+    pub max_overlap_row: Option<usize>,
+    /// The policy's own overlap ranking per input row, in blocks. Empty = use the raw inputs.
+    pub row_overlap: Vec<f64>,
+    /// Resolved parameters and derived quantities, as (name, value) pairs.
+    pub parameters: Vec<(String, f64)>,
+}
+
 pub trait WorkerPicker: Send {
     /// Declare the optional worker-signal columns needed by this picker.
     fn required_worker_inputs(&self) -> WorkerInputs {
@@ -153,6 +175,20 @@ pub trait WorkerPicker: Send {
         context: &WorkerSelectionContext<'_>,
         input: WorkerInputView<'_>,
     ) -> Result<usize, WorkerSelectionPolicyError>;
+
+    /// Explain a pick for the opt-in routing-decision trace.
+    ///
+    /// Called only for sampled requests, right after `pick` returned `row` for this same
+    /// `input`. Return `None` to leave the trace with the generic candidate inputs and a
+    /// `custom_picker` reason.
+    fn explain_pick(
+        &self,
+        _context: &WorkerSelectionContext<'_>,
+        _input: WorkerInputView<'_>,
+        _row: usize,
+    ) -> Option<PickExplanation> {
+        None
+    }
 }
 
 impl WorkerSelectionContext<'_> {

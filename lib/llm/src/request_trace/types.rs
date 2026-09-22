@@ -415,6 +415,7 @@ mod tests {
                     shared_cache_multiplier: 0.0,
                     decode_active_request_weight: 0.0,
                     router_temperature: 0.0,
+                    policy_parameters: Vec::new(),
                     candidates: vec![crate::protocols::common::timing::RoutingDecisionCandidate {
                         worker_id: 42,
                         dp_rank: 0,

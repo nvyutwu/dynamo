@@ -13,12 +13,14 @@ pub use default::DefaultWorkerSelector;
 
 use default::{DefaultWorkerPicker, DefaultWorkerScorer};
 pub use policy::{
-    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerFilter, WorkerInputView,
-    WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer, WorkerSelectionContext,
-    WorkerSelectionPolicy,
+    PickExplanation, ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerFilter,
+    WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer,
+    WorkerSelectionContext, WorkerSelectionPolicy,
 };
 
-use default::{decision_trace_for_selection, pick_default_worker, selection_weights};
+use default::{
+    decision_trace_for_selection, pick_default_worker, sampled_request, selection_weights,
+};
 use policy::{
     CustomWorkerSelectionState, WorkerSelectionPolicyStateRef, collect_custom_candidates,
 };
@@ -27,8 +29,8 @@ use super::config::KvRouterConfig;
 use super::filter::{RoutingEligibility, WorkerEligibilityError};
 use super::types::{KvSchedulerError, SchedulingRequest, WorkerSelectionPolicyError};
 use crate::protocols::{
-    WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
-    cache_reuse_funnel_f2_onward_enabled,
+    RoutingDecisionCandidate, RoutingDecisionParameter, RoutingDecisionTrace, WorkerConfigLike,
+    WorkerId, WorkerSelectionResult, WorkerWithDpRank, cache_reuse_funnel_f2_onward_enabled,
 };
 
 /// Disabled by default: collecting the candidate table is diagnostic-only and
@@ -58,6 +60,135 @@ pub(crate) fn router_decision_trace_sample_rate() -> f64 {
         }
     });
     *SAMPLE_RATE
+}
+
+/// Decision trace for a custom (plugin) worker-selection policy.
+///
+/// The default policy's trace reproduces its own cost formula per candidate. A plugin ranks
+/// workers by its own rule, so this records the policy-independent inputs every candidate was
+/// scored on (device / host / disk overlap, load, the plugin's total cost) and lets the picker
+/// explain itself through [`WorkerPicker::explain_pick`]: policy id, branch taken, resolved
+/// parameters, and optionally its own per-row overlap ranking and oracle row. Default-formula
+/// cost fields that have no meaning for a plugin are zero.
+fn decision_trace_for_custom_selection(
+    kv_router_config: &KvRouterConfig,
+    worker_type: &'static str,
+    input: &MaterializedSelectionInput<'_>,
+    picker: &dyn WorkerPicker,
+    view: WorkerInputView<'_>,
+    row: usize,
+    sample_rate: f64,
+) -> Option<RoutingDecisionTrace> {
+    if !sampled_request(input.context.request_id, sample_rate) {
+        return None;
+    }
+    let explanation = picker.explain_pick(&input.context, view, row);
+    let scored = view.candidates();
+    let cache = view.cache();
+    let load = view.load();
+    let ranked_overlap = explanation
+        .as_ref()
+        .filter(|e| e.row_overlap.len() == scored.len())
+        .map(|e| e.row_overlap.as_slice());
+    let mut candidates: Vec<RoutingDecisionCandidate> = scored
+        .iter()
+        .enumerate()
+        .map(|(i, candidate)| {
+            let cache_i = cache.and_then(|c| c.get(i));
+            let load_i = load.and_then(|l| l.get(i));
+            RoutingDecisionCandidate {
+                worker_id: candidate.worker.worker_id,
+                dp_rank: candidate.worker.dp_rank,
+                eligible: true,
+                selected: i == row,
+                max_overlap: false,
+                total_cost_blocks: candidate.cost,
+                effective_overlap_blocks: ranked_overlap
+                    .map(|r| r[i])
+                    .or_else(|| cache_i.map(|c| c.effective_overlap_blocks))
+                    .unwrap_or(0.0),
+                device_overlap_blocks: cache_i.map_or(0.0, |c| c.device_overlap_blocks),
+                host_overlap_blocks: cache_i.map_or(0.0, |c| c.host_overlap_blocks),
+                disk_overlap_blocks: cache_i.map_or(0.0, |c| c.disk_overlap_blocks),
+                shared_beyond_device_blocks: cache_i.map_or(0, |c| c.shared_beyond_device_blocks),
+                raw_prefill_blocks: load_i.map_or(0.0, |l| l.raw_prefill_blocks),
+                active_prefill_tokens: load_i.map_or(0, |l| l.active_prefill_tokens),
+                prefill_cost_blocks: 0.0,
+                decode_cost_blocks: load_i.map_or(0.0, |l| l.decode_cost_blocks),
+                active_requests: load_i.map_or(0, |l| l.active_requests),
+                active_request_cost_blocks: 0.0,
+                overlap_credit_blocks: 0.0,
+                overlap_credit_decay: 1.0,
+                effective_overlap_score_credit: 0.0,
+                adjusted_prefill_blocks: 0.0,
+                base_score_blocks: candidate.cost,
+                preferred_taint_multiplier: candidate.preferred_taint_multiplier,
+                decode_overlap_formula: false,
+            }
+        })
+        .collect();
+    let selected = scored.get(row)?.worker;
+    let selected_overlap = candidates[row].effective_overlap_blocks;
+    let max_row = explanation
+        .as_ref()
+        .and_then(|e| e.max_overlap_row)
+        .filter(|r| *r < candidates.len())
+        .or_else(|| {
+            (0..candidates.len()).max_by(|a, b| {
+                candidates[*a]
+                    .effective_overlap_blocks
+                    .total_cmp(&candidates[*b].effective_overlap_blocks)
+            })
+        })?;
+    let max_overlap_worker = scored[max_row].worker;
+    let max_overlap_blocks = candidates[max_row].effective_overlap_blocks;
+    candidates[max_row].max_overlap = true;
+    candidates.sort_unstable_by_key(|candidate| (candidate.worker_id, candidate.dp_rank));
+    let weights = input.context.weights;
+    let (policy, selection_reason, policy_parameters) = match explanation {
+        Some(e) => (
+            e.policy,
+            e.reason,
+            e.parameters
+                .into_iter()
+                .map(|(name, value)| RoutingDecisionParameter { name, value })
+                .collect(),
+        ),
+        None => (
+            "custom".to_string(),
+            "custom_picker".to_string(),
+            Vec::new(),
+        ),
+    };
+    Some(RoutingDecisionTrace {
+        schema: "dynamo.router.decision.v1".to_string(),
+        worker_type: worker_type.to_owned(),
+        policy,
+        selection_reason,
+        candidate_scope: "eligible_workers_only".to_string(),
+        block_size: input.context.block_size,
+        request_blocks: input.context.request_blocks,
+        track_prefill_tokens: input.context.track_prefill_tokens,
+        selected_worker_id: selected.worker_id,
+        selected_dp_rank: selected.dp_rank,
+        max_overlap_worker_id: max_overlap_worker.worker_id,
+        max_overlap_dp_rank: max_overlap_worker.dp_rank,
+        avoidable_prefill_token_equivalents: (max_overlap_blocks - selected_overlap)
+            * input.context.block_size as f64,
+        overlap_score_credit: weights.overlap_score_credit,
+        overlap_score_credit_decay: weights.overlap_score_credit_decay,
+        prefill_load_scale: weights.prefill_load_scale,
+        host_cache_hit_weight: kv_router_config.host_cache_hit_weight,
+        disk_cache_hit_weight: kv_router_config.disk_cache_hit_weight,
+        shared_cache_multiplier: weights.shared_cache_multiplier,
+        decode_active_request_weight: kv_router_config.decode_active_request_weight,
+        router_temperature: input
+            .context
+            .router_temperature_override
+            .unwrap_or(kv_router_config.router_temperature),
+        policy_parameters,
+        candidates,
+    })
 }
 
 /// Low-level selector used by routing hosts.
@@ -450,6 +581,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
 
     let weights = selection_weights(kv_router_config, request);
     let input = MaterializedSelectionInput::new(request, block_size, weights);
+    let mut custom_trace: Option<RoutingDecisionTrace> = None;
     let selected = match state {
         WorkerSelectionPolicyStateRef::Default(picker) => {
             let scorer = DefaultWorkerScorer {
@@ -501,6 +633,17 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                     }
                     .into());
                 };
+                if router_decision_trace_enabled() && eligibility.pinned_worker().is_none() {
+                    custom_trace = decision_trace_for_custom_selection(
+                        kv_router_config,
+                        worker_type,
+                        &input,
+                        picker.as_ref(),
+                        picker_input,
+                        row,
+                        router_decision_trace_sample_rate(),
+                    );
+                }
                 Some((candidate.worker, candidate.cost))
             }
         }
@@ -528,6 +671,8 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
             worker,
             router_decision_trace_sample_rate(),
         );
+    } else if let Some(trace) = custom_trace.take() {
+        result.decision_trace = Some(trace);
     }
     log_selection(
         workers,

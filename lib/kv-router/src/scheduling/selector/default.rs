@@ -405,7 +405,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
     }
 }
 
-fn sampled_request(request_id: &str, sample_rate: f64) -> bool {
+pub(super) fn sampled_request(request_id: &str, sample_rate: f64) -> bool {
     if sample_rate <= 0.0 {
         return false;
     }
@@ -554,6 +554,7 @@ pub(super) fn decision_trace_for_selection<C: WorkerConfigLike>(
         shared_cache_multiplier: weights.shared_cache_multiplier,
         decode_active_request_weight: kv_router_config.decode_active_request_weight,
         router_temperature: temperature,
+        policy_parameters: Vec::new(),
         candidates,
     })
 }

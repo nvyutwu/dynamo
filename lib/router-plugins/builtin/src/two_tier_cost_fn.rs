@@ -42,8 +42,9 @@ use dynamo_kv_router::services::selection::{
     WorkerSelectionPolicyRegistryError,
 };
 use dynamo_kv_router::{
-    KvRouterConfig, WorkerCacheInput, WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker,
-    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError,
+    KvRouterConfig, PickExplanation, WorkerCacheInput, WorkerInputView, WorkerInputs,
+    WorkerLoadInput, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicy,
+    WorkerSelectionPolicyError,
 };
 
 /// Policy type selected by `worker_selection.instances[].type`.
@@ -123,6 +124,79 @@ fn effective_overlap(cache: &WorkerCacheInput, host_cache_weight: f64) -> f64 {
     cache.device_overlap_blocks() + host_cache_weight * cache.host_overlap_blocks()
 }
 
+/// Branch names reported in the routing-decision trace. Stable strings; dashboards key on them.
+const REASON_LOAD_IMBALANCE: &str = "load_imbalance_least_loaded";
+const REASON_CACHE_TIER: &str = "cache_tier_least_loaded_among_max_overlap";
+const REASON_NO_CACHE_WINNER: &str = "least_loaded_no_cache_winner";
+
+/// One two-tier decision, with the quantities that determined it.
+struct Decision {
+    row: usize,
+    reason: &'static str,
+    /// Row holding the largest two-tier effective overlap (device + host_cache_weight * host).
+    max_overlap_row: usize,
+    max_overlap: f64,
+    cache_ratio: f64,
+    min_load: usize,
+    max_load: usize,
+    /// Two-tier effective overlap per input row, in blocks.
+    row_overlap: Vec<f64>,
+}
+
+fn decide(
+    parameters: &Parameters,
+    cache: &[WorkerCacheInput],
+    load: &[WorkerLoadInput],
+    request_blocks: u64,
+    host_cache_weight: f64,
+) -> Option<Decision> {
+    if cache.is_empty() || cache.len() != load.len() {
+        return None;
+    }
+
+    let row_overlap: Vec<f64> = cache
+        .iter()
+        .map(|item| effective_overlap(item, host_cache_weight))
+        .collect();
+    let max_overlap_row =
+        (0..row_overlap.len()).max_by(|a, b| row_overlap[*a].total_cmp(&row_overlap[*b]))?;
+    let max_overlap = row_overlap[max_overlap_row];
+    let cache_ratio = if request_blocks == 0 {
+        0.0
+    } else {
+        max_overlap / request_blocks as f64
+    };
+    let min_load = load.iter().map(|item| item.active_requests()).min()?;
+    let max_load = load.iter().map(|item| item.active_requests()).max()?;
+    let decision = |row, reason| Decision {
+        row,
+        reason,
+        max_overlap_row,
+        max_overlap,
+        cache_ratio,
+        min_load,
+        max_load,
+        row_overlap: row_overlap.clone(),
+    };
+
+    if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
+        && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
+    {
+        return least_loaded(load, 0..load.len()).map(|row| decision(row, REASON_LOAD_IMBALANCE));
+    }
+    if cache_ratio > parameters.cache_threshold {
+        return least_loaded(
+            load,
+            row_overlap
+                .iter()
+                .enumerate()
+                .filter_map(|(row, overlap)| (*overlap == max_overlap).then_some(row)),
+        )
+        .map(|row| decision(row, REASON_CACHE_TIER));
+    }
+    least_loaded(load, 0..load.len()).map(|row| decision(row, REASON_NO_CACHE_WINNER))
+}
+
 fn select_row(
     parameters: &Parameters,
     cache: &[WorkerCacheInput],
@@ -130,39 +204,7 @@ fn select_row(
     request_blocks: u64,
     host_cache_weight: f64,
 ) -> Option<usize> {
-    if cache.is_empty() || cache.len() != load.len() {
-        return None;
-    }
-
-    let min_load = load.iter().map(|item| item.active_requests()).min()?;
-    let max_load = load.iter().map(|item| item.active_requests()).max()?;
-    if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
-        && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
-    {
-        return least_loaded(load, 0..load.len());
-    }
-
-    let max_overlap = cache
-        .iter()
-        .map(|item| effective_overlap(item, host_cache_weight))
-        .max_by(f64::total_cmp)?;
-    let cache_ratio = if request_blocks == 0 {
-        0.0
-    } else {
-        max_overlap / request_blocks as f64
-    };
-    if cache_ratio > parameters.cache_threshold {
-        return least_loaded(
-            load,
-            cache.iter().enumerate().filter_map(|(row, item)| {
-                // Recomputed identically to `max_overlap`, so the equality is exact, not a
-                // tolerance comparison on independently derived floats.
-                (effective_overlap(item, host_cache_weight) == max_overlap).then_some(row)
-            }),
-        );
-    }
-
-    least_loaded(load, 0..load.len())
+    decide(parameters, cache, load, request_blocks, host_cache_weight).map(|d| d.row)
 }
 
 struct TwoTierCostFnPicker {
@@ -195,7 +237,53 @@ impl WorkerPicker for TwoTierCostFnPicker {
             context.request_blocks(),
             self.host_cache_weight,
         )
-            .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+        .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+    }
+
+    /// The routing-decision trace for this policy: which branch fired, the thresholds in force,
+    /// the two-tier overlap ranking per candidate and the row it treats as the cache oracle.
+    fn explain_pick(
+        &self,
+        context: &WorkerSelectionContext<'_>,
+        input: WorkerInputView<'_>,
+        row: usize,
+    ) -> Option<PickExplanation> {
+        let decision = decide(
+            &self.parameters,
+            input.cache()?,
+            input.load()?,
+            context.request_blocks(),
+            self.host_cache_weight,
+        )?;
+        // `pick` and `explain_pick` see the same input, so the branch must agree with the row
+        // that was actually chosen. If it does not, say so rather than report a fiction.
+        let reason = if decision.row == row {
+            decision.reason.to_string()
+        } else {
+            format!("{}_row_mismatch", decision.reason)
+        };
+        Some(PickExplanation {
+            policy: POLICY_TYPE.to_string(),
+            reason,
+            max_overlap_row: Some(decision.max_overlap_row),
+            row_overlap: decision.row_overlap,
+            parameters: vec![
+                ("cache_threshold".into(), self.parameters.cache_threshold),
+                (
+                    "balance_abs_threshold".into(),
+                    self.parameters.balance_abs_threshold as f64,
+                ),
+                (
+                    "balance_rel_threshold".into(),
+                    self.parameters.balance_rel_threshold,
+                ),
+                ("host_cache_weight".into(), self.host_cache_weight),
+                ("cache_ratio".into(), decision.cache_ratio),
+                ("max_effective_overlap_blocks".into(), decision.max_overlap),
+                ("min_active_requests".into(), decision.min_load as f64),
+                ("max_active_requests".into(), decision.max_load as f64),
+            ],
+        })
     }
 }
 
@@ -424,7 +512,10 @@ mod tests {
         // B holds nothing on device but eight of ten blocks in CPU offload. At the inherited
         // weight of 0.75 that is an effective 6.0 blocks, a ratio of 0.6 above the 0.5 threshold,
         // so B wins despite carrying more load. Before this change B scored 0 and A took it.
-        assert_eq!(select_tiers(Parameters::default(), [(A, 0, 0, 0), (B, 0, 8, 4)]), worker(B));
+        assert_eq!(
+            select_tiers(Parameters::default(), [(A, 0, 0, 0), (B, 0, 8, 4)]),
+            worker(B)
+        );
     }
 
     #[test]
@@ -436,7 +527,10 @@ mod tests {
             host_cache_weight: Some(0.0),
             ..Parameters::default()
         };
-        assert_eq!(select_tiers(device_only, [(A, 0, 0, 0), (B, 0, 8, 4)]), worker(A));
+        assert_eq!(
+            select_tiers(device_only, [(A, 0, 0, 0), (B, 0, 8, 4)]),
+            worker(A)
+        );
     }
 
     #[test]
@@ -444,7 +538,10 @@ mod tests {
         // Equal block counts, different tiers: A's six device blocks score 6.0 against B's six
         // host blocks at 4.5, so A wins even though B is idle and A carries four requests. A CPU
         // hit must never be treated as interchangeable with a device hit.
-        assert_eq!(select_tiers(Parameters::default(), [(A, 6, 0, 4), (B, 0, 6, 0)]), worker(A));
+        assert_eq!(
+            select_tiers(Parameters::default(), [(A, 6, 0, 4), (B, 0, 6, 0)]),
+            worker(A)
+        );
     }
 
     #[test]
