@@ -239,6 +239,12 @@ pub mod frontend_service {
     /// Cache-reuse observations by completion status
     pub const CACHE_LOSS_OBSERVATIONS_TOTAL: &str = "cache_loss_observations_total";
 
+    /// Input tokens of requests whose worker cache-reuse report completed (the f4/f5 denominator)
+    pub const CACHE_LOSS_WORKER_PROMPT_TOKENS_TOTAL: &str = "cache_loss_worker_prompt_tokens_total";
+
+    /// Incomplete cache-reuse observations by reason
+    pub const CACHE_LOSS_INCOMPLETE_TOTAL: &str = "cache_loss_incomplete_total";
+
     /// Cache-history (F0/F1) observations by completion status
     pub const CACHE_LOSS_HISTORY_OBSERVATIONS_TOTAL: &str = "cache_loss_history_observations_total";
 

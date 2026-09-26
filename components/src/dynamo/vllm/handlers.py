@@ -3216,12 +3216,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             external_lookups = external_hits
             external_lookup_accuracy = "lower_bound"
         values = (local_hits, external_hits, external_used, external_lookups)
-        if (
-            prompt_tokens is None
-            or any(not isinstance(value, int) or value < 0 for value in values)
-            or external_used > external_hits
-        ):
-            return {"complete": False}
+        # Each incomplete report names its reason so the router can attribute the
+        # requests that never reach the worker stages of the funnel.
+        if prompt_tokens is None:
+            return {"complete": False, "reason": "prompt_token_ids_missing"}
+        if any(not isinstance(value, int) for value in values):
+            return {"complete": False, "reason": "cache_counts_missing"}
+        if any(value < 0 for value in values):
+            return {"complete": False, "reason": "negative_cache_count"}
+        if external_used > external_hits:
+            return {"complete": False, "reason": "external_used_exceeds_hits"}
         return {
             "complete": True,
             "prompt_tokens": len(prompt_tokens),

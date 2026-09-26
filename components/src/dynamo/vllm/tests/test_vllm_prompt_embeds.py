@@ -296,7 +296,39 @@ class TestUsageStatistics:
         mock_output.num_external_lookup_tokens = 0
 
         assert BaseWorkerHandler._cache_loss_engine_data(mock_output) == {
-            "complete": False
+            "complete": False,
+            "reason": "cache_counts_missing",
+        }
+
+    def test_cache_loss_engine_data_names_each_incomplete_reason(self):
+        missing_prompt = Mock()
+        missing_prompt.prompt_token_ids = None
+        missing_prompt.num_cached_tokens = 3
+        assert BaseWorkerHandler._cache_loss_engine_data(missing_prompt) == {
+            "complete": False,
+            "reason": "prompt_token_ids_missing",
+        }
+
+        negative = Mock()
+        negative.prompt_token_ids = [1, 2, 3]
+        negative.num_cached_tokens = -1
+        negative.num_local_cached_tokens = None
+        negative.num_external_cached_tokens = 0
+        negative.num_external_lookup_tokens = 0
+        assert BaseWorkerHandler._cache_loss_engine_data(negative) == {
+            "complete": False,
+            "reason": "negative_cache_count",
+        }
+
+        overshoot = Mock()
+        overshoot.prompt_token_ids = [1, 2, 3, 4, 5]
+        overshoot.num_cached_tokens = 5
+        overshoot.num_local_cached_tokens = 2
+        overshoot.num_external_cached_tokens = 1
+        overshoot.num_external_lookup_tokens = 1
+        assert BaseWorkerHandler._cache_loss_engine_data(overshoot) == {
+            "complete": False,
+            "reason": "external_used_exceeds_hits",
         }
 
     def test_cache_loss_engine_data_uses_aggregate_cache_fallback(self):

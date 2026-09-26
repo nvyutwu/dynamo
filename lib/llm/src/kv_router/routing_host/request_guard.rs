@@ -13,7 +13,10 @@ use crate::{
         KvRouter,
         cache_history::CacheHistory,
         indexer::ApproximateRequestLease,
-        metrics::{CacheLossTierMetricObservation, RouterRequestMetrics},
+        metrics::{
+            CacheLossTierMetricObservation, RouterRequestMetrics,
+            cache_loss_incomplete_reason as incomplete_reason,
+        },
         prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
         request_lease::RequestAttemptLease,
         scheduler::{DefaultWorkerSelector, SchedulerBookingDescriptor},
@@ -97,6 +100,9 @@ struct CacheLossWorkerOutcome {
     worker_used_tokens: Option<u64>,
     #[serde(default)]
     tiers: Vec<CacheLossTierOutcome>,
+    /// Set by the worker when `complete` is false; mapped onto a bounded reason vocabulary.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -265,12 +271,31 @@ fn cache_loss_worker_stage(outcome: &CacheLossWorkerOutcome) -> Option<[u64; 2]>
     Some([f4, f5])
 }
 
+/// Accept a worker report, or name why it cannot feed the worker stages.
 fn valid_cache_loss_worker_outcome(
     route: RouteObservation,
     value: &serde_json::Value,
-) -> Option<CacheLossWorkerOutcome> {
-    let outcome = <CacheLossWorkerOutcome as serde::Deserialize>::deserialize(value).ok()?;
-    (outcome.complete && outcome.prompt_tokens == route.prompt_tokens).then_some(outcome)
+) -> Result<CacheLossWorkerOutcome, &'static str> {
+    let outcome = <CacheLossWorkerOutcome as serde::Deserialize>::deserialize(value)
+        .map_err(|_| incomplete_reason::REPORT_MALFORMED)?;
+    if !outcome.complete {
+        return Err(worker_incomplete_reason(outcome.reason.as_deref()));
+    }
+    if outcome.prompt_tokens != route.prompt_tokens {
+        return Err(incomplete_reason::PROMPT_TOKENS_MISMATCH);
+    }
+    Ok(outcome)
+}
+
+/// The worker's own reason for an incomplete report, bounded to known values.
+fn worker_incomplete_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("prompt_token_ids_missing") => incomplete_reason::WORKER_PROMPT_TOKEN_IDS_MISSING,
+        Some("cache_counts_missing") => incomplete_reason::WORKER_CACHE_COUNTS_MISSING,
+        Some("negative_cache_count") => incomplete_reason::WORKER_NEGATIVE_CACHE_COUNT,
+        Some("external_used_exceeds_hits") => incomplete_reason::WORKER_EXTERNAL_USED_EXCEEDS_HITS,
+        _ => incomplete_reason::WORKER_INCOMPLETE,
+    }
 }
 
 fn valid_cache_loss_tier_observations(
@@ -330,12 +355,15 @@ enum CacheLossFinalization {
         stages: [u64; 2],
         tiers: Option<Vec<ValidatedCacheLossTierObservation>>,
     },
-    Incomplete,
+    Incomplete {
+        reason: &'static str,
+    },
 }
 
 fn finalize_cache_loss_state(
     route: Option<RouteObservation>,
     worker_outcome: &mut Option<CacheLossWorkerOutcome>,
+    rejected_report: Option<&'static str>,
     recorded: &mut bool,
     stream_completed: bool,
 ) -> Option<CacheLossFinalization> {
@@ -344,19 +372,24 @@ fn finalize_cache_loss_state(
     }
     *recorded = true;
     if !stream_completed {
-        return Some(CacheLossFinalization::Incomplete);
+        return Some(CacheLossFinalization::Incomplete {
+            reason: incomplete_reason::STREAM_ABORTED,
+        });
     }
     let Some(outcome) = worker_outcome.take() else {
-        return Some(CacheLossFinalization::Incomplete);
+        return Some(CacheLossFinalization::Incomplete {
+            reason: rejected_report.unwrap_or(incomplete_reason::REPORT_MISSING),
+        });
     };
-    Some(
-        cache_loss_worker_stage(&outcome).map_or(CacheLossFinalization::Incomplete, |stages| {
-            CacheLossFinalization::Complete {
-                stages,
-                tiers: valid_cache_loss_tier_observations(stages[1], &outcome.tiers),
-            }
-        }),
-    )
+    Some(cache_loss_worker_stage(&outcome).map_or(
+        CacheLossFinalization::Incomplete {
+            reason: incomplete_reason::STAGE_OVERFLOW,
+        },
+        |stages| CacheLossFinalization::Complete {
+            stages,
+            tiers: valid_cache_loss_tier_observations(stages[1], &outcome.tiers),
+        },
+    ))
 }
 
 struct CacheHistoryFinalization {
@@ -898,6 +931,7 @@ where
     migration_state: Option<MigrationState>,
     cache_loss: Option<CacheLossTracking>,
     cache_loss_worker_outcome: Option<CacheLossWorkerOutcome>,
+    cache_loss_rejected_report: Option<&'static str>,
     cache_loss_recorded: bool,
     cache_history: Option<CacheHistoryTracking>,
     _lora_load: Option<LoraLoadGuard>,
@@ -982,6 +1016,7 @@ where
             migration_state: request.migration_state.clone(),
             cache_loss,
             cache_loss_worker_outcome: None,
+            cache_loss_rejected_report: None,
             cache_loss_recorded: false,
             cache_history: None,
             _lora_load: None,
@@ -1016,6 +1051,7 @@ where
             migration_state: request.migration_state.clone(),
             cache_loss: None,
             cache_loss_worker_outcome: None,
+            cache_loss_rejected_report: None,
             cache_loss_recorded: false,
             cache_history: None,
             _lora_load: lora_load,
@@ -1220,17 +1256,17 @@ where
         else {
             return;
         };
-        let Some(outcome) = valid_cache_loss_worker_outcome(tracking.route, value) else {
-            return;
-        };
-
-        self.cache_loss_worker_outcome = Some(outcome);
+        match valid_cache_loss_worker_outcome(tracking.route, value) {
+            Ok(outcome) => self.cache_loss_worker_outcome = Some(outcome),
+            Err(reason) => self.cache_loss_rejected_report = Some(reason),
+        }
     }
 
     fn finish_cache_loss(&mut self, complete: bool) {
         let Some(finalization) = finalize_cache_loss_state(
             self.cache_loss.map(|tracking| tracking.route),
             &mut self.cache_loss_worker_outcome,
+            self.cache_loss_rejected_report,
             &mut self.cache_loss_recorded,
             complete,
         ) else {
@@ -1244,7 +1280,7 @@ where
                 if tracking.aggregate_enabled {
                     self.observability
                         .request_metrics()
-                        .observe_cache_loss_worker(stages);
+                        .observe_cache_loss_worker(tracking.route.prompt_tokens, stages);
                 }
                 if let (Some(tracker), Some(tiers)) = (&self.observability.tracker, &tiers) {
                     tracker.record_cache_loss_outcome(
@@ -1273,11 +1309,11 @@ where
                     }
                 }
             }
-            CacheLossFinalization::Incomplete => {
+            CacheLossFinalization::Incomplete { reason } => {
                 if tracking.aggregate_enabled {
                     self.observability
                         .request_metrics()
-                        .observe_cache_loss_incomplete();
+                        .observe_cache_loss_incomplete(reason);
                 }
                 if tracking.tier_detail_enabled {
                     self.observability
@@ -1350,6 +1386,7 @@ mod cache_loss_tests {
             worker_lookup_tokens: None,
             worker_used_tokens: None,
             tiers: Vec::new(),
+            reason: None,
         }
     }
 
@@ -1380,6 +1417,7 @@ mod cache_loss_tests {
             worker_lookup_tokens: None,
             worker_used_tokens: None,
             tiers: Vec::new(),
+            reason: None,
         };
 
         assert_eq!(cache_loss_worker_stage(&outcome), Some([140, 135]));
@@ -1396,6 +1434,7 @@ mod cache_loss_tests {
             worker_lookup_tokens: None,
             worker_used_tokens: None,
             tiers: Vec::new(),
+            reason: None,
         };
 
         assert_eq!(cache_loss_worker_stage(&outcome), None);
@@ -1407,14 +1446,26 @@ mod cache_loss_tests {
         let mut recorded = false;
 
         assert_eq!(
-            finalize_cache_loss_state(Some(route()), &mut worker_outcome, &mut recorded, true),
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut worker_outcome,
+                None,
+                &mut recorded,
+                true
+            ),
             Some(CacheLossFinalization::Complete {
                 stages: [90, 85],
                 tiers: None,
             })
         );
         assert_eq!(
-            finalize_cache_loss_state(Some(route()), &mut worker_outcome, &mut recorded, true),
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut worker_outcome,
+                None,
+                &mut recorded,
+                true
+            ),
             None
         );
     }
@@ -1425,20 +1476,137 @@ mod cache_loss_tests {
         let mut recorded = false;
 
         assert_eq!(
-            finalize_cache_loss_state(Some(route()), &mut worker_outcome, &mut recorded, false),
-            Some(CacheLossFinalization::Incomplete)
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut worker_outcome,
+                None,
+                &mut recorded,
+                false
+            ),
+            Some(CacheLossFinalization::Incomplete {
+                reason: incomplete_reason::STREAM_ABORTED,
+            })
         );
         assert_eq!(
-            finalize_cache_loss_state(Some(route()), &mut worker_outcome, &mut recorded, false),
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut worker_outcome,
+                None,
+                &mut recorded,
+                false
+            ),
             None
         );
     }
 
     #[test]
     fn invalid_worker_outcome_is_rejected() {
+        assert_eq!(
+            valid_cache_loss_worker_outcome(route(), &serde_json::json!({"complete": false})).err(),
+            Some(incomplete_reason::WORKER_INCOMPLETE)
+        );
+    }
+
+    #[test]
+    fn worker_report_rejections_name_their_reason() {
+        let reject =
+            |value: serde_json::Value| valid_cache_loss_worker_outcome(route(), &value).err();
+        assert_eq!(
+            reject(serde_json::json!({"complete": false, "reason": "external_used_exceeds_hits"})),
+            Some(incomplete_reason::WORKER_EXTERNAL_USED_EXCEEDS_HITS)
+        );
+        assert_eq!(
+            reject(serde_json::json!({"complete": false, "reason": "prompt_token_ids_missing"})),
+            Some(incomplete_reason::WORKER_PROMPT_TOKEN_IDS_MISSING)
+        );
+        assert_eq!(
+            reject(serde_json::json!({"complete": false, "reason": "something_new"})),
+            Some(incomplete_reason::WORKER_INCOMPLETE)
+        );
+        assert_eq!(
+            reject(serde_json::json!({"complete": true, "prompt_tokens": 99})),
+            Some(incomplete_reason::PROMPT_TOKENS_MISMATCH)
+        );
+        assert_eq!(
+            reject(serde_json::json!("not an object")),
+            Some(incomplete_reason::REPORT_MALFORMED)
+        );
         assert!(
-            valid_cache_loss_worker_outcome(route(), &serde_json::json!({"complete": false}),)
-                .is_none()
+            valid_cache_loss_worker_outcome(
+                route(),
+                &serde_json::json!({"complete": true, "prompt_tokens": 100})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn missing_and_rejected_reports_are_attributed_at_finalization() {
+        let mut recorded = false;
+        assert_eq!(
+            finalize_cache_loss_state(Some(route()), &mut None, None, &mut recorded, true),
+            Some(CacheLossFinalization::Incomplete {
+                reason: incomplete_reason::REPORT_MISSING,
+            })
+        );
+
+        let mut recorded = false;
+        assert_eq!(
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut None,
+                Some(incomplete_reason::PROMPT_TOKENS_MISMATCH),
+                &mut recorded,
+                true,
+            ),
+            Some(CacheLossFinalization::Incomplete {
+                reason: incomplete_reason::PROMPT_TOKENS_MISMATCH,
+            })
+        );
+
+        let mut worker_outcome = Some(outcome());
+        let mut recorded = false;
+        assert_eq!(
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut worker_outcome,
+                Some(incomplete_reason::PROMPT_TOKENS_MISMATCH),
+                &mut recorded,
+                true,
+            ),
+            Some(CacheLossFinalization::Complete {
+                stages: [90, 85],
+                tiers: None,
+            }),
+            "a later valid report wins over an earlier rejection"
+        );
+    }
+
+    #[test]
+    fn overflowing_stages_are_attributed() {
+        let mut worker_outcome = Some(CacheLossWorkerOutcome {
+            complete: true,
+            prompt_tokens: 100,
+            gpu_hit_tokens: u64::MAX,
+            cpu_hit_tokens: 1,
+            cpu_lookup_tokens: 1,
+            worker_lookup_tokens: None,
+            worker_used_tokens: None,
+            tiers: Vec::new(),
+            reason: None,
+        });
+        let mut recorded = false;
+        assert_eq!(
+            finalize_cache_loss_state(
+                Some(route()),
+                &mut worker_outcome,
+                None,
+                &mut recorded,
+                true
+            ),
+            Some(CacheLossFinalization::Incomplete {
+                reason: incomplete_reason::STAGE_OVERFLOW,
+            })
         );
     }
 

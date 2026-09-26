@@ -870,8 +870,10 @@ pub struct RouterRequestMetrics {
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct CacheLossWorkerStageMetrics {
     funnel_tokens_total: [IntCounter; CACHE_LOSS_FUNNEL_STAGES.len()],
+    prompt_tokens_total: IntCounter,
     complete_observations_total: IntCounter,
     incomplete_observations_total: IntCounter,
+    incomplete_total: IntCounterVec,
 }
 
 /// The four routing-decision counters for one worker type, resolved at registration.
@@ -980,7 +982,7 @@ impl CacheLossTierDetailMetrics {
         Self {
             tokens_total: IntCounterVec::new(
                 Opts::new("cache_loss_tier_tokens_total", "test"),
-                &["tier", "event", "accuracy"],
+                &["cache_tier", "event", "accuracy"],
             )
             .unwrap(),
             complete_observations_total: IntCounter::new("tier_complete", "test").unwrap(),
@@ -1010,8 +1012,14 @@ impl CacheLossWorkerStageMetrics {
         let counter = |name: &str| IntCounter::new(name, "test").unwrap();
         Self {
             funnel_tokens_total: CACHE_LOSS_FUNNEL_STAGES.map(|stage| counter(stage)),
+            prompt_tokens_total: counter("stage_prompt_tokens"),
             complete_observations_total: counter("stage_complete"),
             incomplete_observations_total: counter("stage_incomplete"),
+            incomplete_total: IntCounterVec::new(
+                Opts::new("stage_incomplete_by_reason", "test"),
+                &["reason"],
+            )
+            .unwrap(),
         }
     }
 
@@ -1021,6 +1029,18 @@ impl CacheLossWorkerStageMetrics {
             self.complete_observations_total.get(),
             self.incomplete_observations_total.get(),
         )
+    }
+
+    pub(crate) fn stage_tokens(&self, index: usize) -> u64 {
+        self.funnel_tokens_total[index].get()
+    }
+
+    pub(crate) fn prompt_tokens(&self) -> u64 {
+        self.prompt_tokens_total.get()
+    }
+
+    pub(crate) fn incomplete_reason(&self, reason: &str) -> u64 {
+        self.incomplete_total.with_label_values(&[reason]).get()
     }
 }
 
@@ -1095,6 +1115,33 @@ pub(crate) struct CacheLossTierMetricObservation<'a> {
     pub event: &'a str,
     pub accuracy: &'a str,
     pub tokens: u64,
+}
+
+/// Why an F2-F5 observation ended without worker stages. Every value is pre-registered so the
+/// per-reason series exist at zero; `worker_*` values echo the worker's own report reason.
+pub(crate) mod cache_loss_incomplete_reason {
+    pub const STREAM_ABORTED: &str = "stream_aborted";
+    pub const REPORT_MISSING: &str = "report_missing";
+    pub const REPORT_MALFORMED: &str = "report_malformed";
+    pub const PROMPT_TOKENS_MISMATCH: &str = "prompt_tokens_mismatch";
+    pub const STAGE_OVERFLOW: &str = "stage_overflow";
+    pub const WORKER_INCOMPLETE: &str = "worker_incomplete";
+    pub const WORKER_PROMPT_TOKEN_IDS_MISSING: &str = "worker_prompt_token_ids_missing";
+    pub const WORKER_CACHE_COUNTS_MISSING: &str = "worker_cache_counts_missing";
+    pub const WORKER_NEGATIVE_CACHE_COUNT: &str = "worker_negative_cache_count";
+    pub const WORKER_EXTERNAL_USED_EXCEEDS_HITS: &str = "worker_external_used_exceeds_hits";
+    pub const ALL: [&str; 10] = [
+        STREAM_ABORTED,
+        REPORT_MISSING,
+        REPORT_MALFORMED,
+        PROMPT_TOKENS_MISMATCH,
+        STAGE_OVERFLOW,
+        WORKER_INCOMPLETE,
+        WORKER_PROMPT_TOKEN_IDS_MISSING,
+        WORKER_CACHE_COUNTS_MISSING,
+        WORKER_NEGATIVE_CACHE_COUNT,
+        WORKER_EXTERNAL_USED_EXCEEDS_HITS,
+    ];
 }
 
 fn cache_loss_metric_tier(tier: &str) -> &str {
@@ -1313,13 +1360,33 @@ impl RouterRequestMetrics {
                             extra_labels,
                         )
                         .expect("failed to create router_cache_loss_observations_total");
+                    let prompt_tokens_total = metrics
+                        .create_intcounter(
+                            &router_metric(frontend_service::CACHE_LOSS_WORKER_PROMPT_TOKENS_TOTAL),
+                            "Input tokens of requests whose worker cache-reuse report completed; the f4/f5 denominator",
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_worker_prompt_tokens_total");
+                    let incomplete_total = metrics
+                        .create_intcountervec(
+                            &router_metric(frontend_service::CACHE_LOSS_INCOMPLETE_TOTAL),
+                            "Incomplete cache-reuse observations (F2-F5) by reason",
+                            &["reason"],
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_incomplete_total");
+                    for reason in cache_loss_incomplete_reason::ALL {
+                        incomplete_total.with_label_values(&[reason]);
+                    }
                     CacheLossWorkerStageMetrics {
                         funnel_tokens_total: CACHE_LOSS_FUNNEL_STAGES
                             .map(|stage| funnel_tokens.with_label_values(&[stage])),
+                        prompt_tokens_total,
                         complete_observations_total: observations
                             .with_label_values(&["complete"]),
                         incomplete_observations_total: observations
                             .with_label_values(&["incomplete"]),
+                        incomplete_total,
                     }
                 });
                 // Resolving both worker types here is also what makes each series export at
@@ -1342,7 +1409,7 @@ impl RouterRequestMetrics {
                         .create_intcountervec(
                             &router_metric("cache_loss_tier_tokens_total"),
                             "Worker-observed cache tokens by tier, event, and measurement accuracy",
-                            &["tier", "event", "accuracy"],
+                            &["cache_tier", "event", "accuracy"],
                             extra_labels,
                         )
                         .expect("failed to create router_cache_loss_tier_tokens_total");
@@ -1466,18 +1533,26 @@ impl RouterRequestMetrics {
         metrics.funnel_tokens_total[1].inc_by(selected_tokens);
     }
 
-    pub fn observe_cache_loss_worker(&self, [lookup_tokens, hit_tokens]: [u64; 2]) {
+    /// Record the worker stages of one completed observation together with the request's
+    /// input tokens, so f4/f5 have a denominator drawn from the same requests.
+    pub fn observe_cache_loss_worker(
+        &self,
+        prompt_tokens: u64,
+        [lookup_tokens, hit_tokens]: [u64; 2],
+    ) {
         let Some(metrics) = &self.cache_loss_worker_stages else {
             return;
         };
         metrics.funnel_tokens_total[2].inc_by(lookup_tokens);
         metrics.funnel_tokens_total[3].inc_by(hit_tokens);
+        metrics.prompt_tokens_total.inc_by(prompt_tokens);
         metrics.complete_observations_total.inc();
     }
 
-    pub fn observe_cache_loss_incomplete(&self) {
+    pub fn observe_cache_loss_incomplete(&self, reason: &str) {
         if let Some(metrics) = &self.cache_loss_worker_stages {
             metrics.incomplete_observations_total.inc();
+            metrics.incomplete_total.with_label_values(&[reason]).inc();
         }
     }
 
@@ -1825,6 +1900,44 @@ mod tests {
     }
 
     #[test]
+    fn worker_stages_carry_their_own_denominator_and_incomplete_reasons() {
+        let mut metrics = RouterRequestMetrics::for_test();
+        let stages = CacheLossWorkerStageMetrics::for_test();
+        metrics.cache_loss_worker_stages = Some(stages.clone());
+
+        // Route time lands f2/f3 for every request; nothing else moves.
+        metrics.observe_cache_loss_route(75, 60);
+        assert_eq!((stages.stage_tokens(0), stages.stage_tokens(1)), (75, 60));
+        assert_eq!(stages.prompt_tokens(), 0);
+        assert_eq!(stages.observations(), (0, 0));
+
+        // A complete worker report lands f4/f5 and the same request's input tokens.
+        metrics.observe_cache_loss_worker(100, [90, 85]);
+        assert_eq!((stages.stage_tokens(2), stages.stage_tokens(3)), (90, 85));
+        assert_eq!(stages.prompt_tokens(), 100);
+        assert_eq!(stages.observations(), (1, 0));
+
+        // Incomplete observations never touch the denominator and are counted by reason.
+        metrics.observe_cache_loss_incomplete(cache_loss_incomplete_reason::PROMPT_TOKENS_MISMATCH);
+        metrics.observe_cache_loss_incomplete(cache_loss_incomplete_reason::STREAM_ABORTED);
+        assert_eq!(stages.prompt_tokens(), 100);
+        assert_eq!(stages.observations(), (1, 2));
+        assert_eq!(
+            stages.incomplete_reason(cache_loss_incomplete_reason::PROMPT_TOKENS_MISMATCH),
+            1
+        );
+        assert_eq!(
+            stages.incomplete_reason(cache_loss_incomplete_reason::STREAM_ABORTED),
+            1
+        );
+        assert_eq!(
+            stages.incomplete_reason(cache_loss_incomplete_reason::REPORT_MISSING),
+            0
+        );
+        assert_eq!(cache_loss_incomplete_reason::ALL.len(), 10);
+    }
+
+    #[test]
     fn router_tier_estimates_add_tokens_without_counting_an_observation() {
         let mut metrics = RouterRequestMetrics::for_test();
         let tiers = CacheLossTierDetailMetrics::for_test();
@@ -1872,7 +1985,7 @@ mod tests {
         assert_eq!(history.observations(), (1, 0));
         assert_eq!(stages.observations(), (0, 0));
         // ...while the F2-F5 result waits for the worker and may still be incomplete.
-        metrics.observe_cache_loss_incomplete();
+        metrics.observe_cache_loss_incomplete(cache_loss_incomplete_reason::STREAM_ABORTED);
         assert_eq!(history.observations(), (1, 0));
         assert_eq!(stages.observations(), (0, 1));
         metrics.observe_cache_history_incomplete();
