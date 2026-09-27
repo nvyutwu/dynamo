@@ -142,8 +142,13 @@ intermediate Mooncake file.
 ## Supported Replay Requests
 
 Context-free replay rows must represent one model request. Dynamo skips requests with `n > 1`,
-`best_of > 1`, prompt embeddings, multimodal inputs, or no usable tracker and KV cache block size.
+`best_of > 1`, prompt embeddings, or no usable tracker and KV cache block size.
 Session context does not bypass these checks.
+
+Requests with multimodal inputs are still traced, but their `request_end` row omits the `replay`
+section: the frontend's token ids do not include the image tokens the engine prefills, so no
+replay hashes could represent them. Every other field (timings, worker, `routing_decision`,
+`cache_loss`) is recorded. Replay consumers must skip rows without `replay`.
 
 DynoSim accepts `dynamo.request.trace.v1` JSONL and JSONL.GZ directly, derives the trace block size,
 and rejects mixed session-aware and context-free trace sets.

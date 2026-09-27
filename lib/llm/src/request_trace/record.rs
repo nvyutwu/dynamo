@@ -53,7 +53,7 @@ fn event_time_unix_ms_from_request(request: &RequestTraceMetrics) -> u64 {
 pub(crate) fn emit_request_end(
     request_id: String,
     tracker: &RequestTracker,
-    replay: RequestReplayMetrics,
+    replay: Option<RequestReplayMetrics>,
 ) {
     let timing = tracker.get_timing_info();
     let event_time_unix_ms = timing.total_time_ms.map_or_else(unix_time_ms, |elapsed| {
@@ -87,7 +87,7 @@ pub(crate) fn emit_request_end(
         kv_transfer_estimated_latency_ms: timing.kv_transfer_estimated_latency_ms,
         queue_depth: timing.router_queue_depth.map(|v| v as u64),
         worker,
-        replay: Some(replay),
+        replay,
         finish_reason_metadata: None,
         routing_decision: tracker.routing_decision_trace(),
         cache_loss: tracker.cache_loss_trace(),
@@ -203,12 +203,12 @@ mod tests {
         emit_request_end(
             "req-1".to_string(),
             &tracker,
-            RequestReplayMetrics {
+            Some(RequestReplayMetrics {
                 trace_block_size: 2,
                 input_length: 3,
                 input_sequence_hashes: vec![11, 22],
                 output_sequence_hashes: Vec::new(),
-            },
+            }),
         );
 
         let record = loop {

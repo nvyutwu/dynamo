@@ -113,6 +113,9 @@ pub struct RequestTraceMetrics {
     pub queue_depth: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<RequestTraceWorkerInfo>,
+    /// Replay hashes for the prompt and generated continuation. Omitted when the request cannot
+    /// be replayed as one token stream (multimodal inputs: the engine prompt expands image tokens
+    /// the frontend never sees); every other field is still recorded for such requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay: Option<RequestReplayMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]

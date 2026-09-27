@@ -21,7 +21,9 @@ use crate::request_trace::{
 
 struct RequestTraceRequestEndState {
     request_tracker: Arc<RequestTracker>,
-    replay_metrics: Arc<RequestReplayMetrics>,
+    /// `None` when the request cannot be replayed as one token stream (multimodal inputs): the
+    /// record is still emitted, without its `replay` section.
+    replay_metrics: Option<Arc<RequestReplayMetrics>>,
     output_sequence_hash_capture: Option<SharedOutputSequenceHashCapture>,
 }
 
@@ -36,14 +38,21 @@ fn request_trace_rejection(common_request: &PreprocessedRequest) -> Option<&'sta
     if common_request.prompt_embeds.is_some() {
         return Some("prompt embeddings are not supported");
     }
-    if common_request.multi_modal_data.is_some() {
-        return Some("multimodal inputs are not supported");
-    }
     if common_request.sampling_options.n.unwrap_or(1) > 1 {
         return Some("multiple output choices are not supported");
     }
     if common_request.sampling_options.best_of.unwrap_or(1) > 1 {
         return Some("best_of greater than one is not supported");
+    }
+    None
+}
+
+/// Requests whose frontend token ids do not describe what the engine prefilled cannot be replayed
+/// as one token stream. They are traced without the `replay` section instead of being dropped, so
+/// their timings, worker, routing decision and cache-loss stages stay observable.
+fn replay_unsupported_reason(common_request: &PreprocessedRequest) -> Option<&'static str> {
+    if common_request.multi_modal_data.is_some() {
+        return Some("multimodal inputs cannot be replayed as one token stream");
     }
     None
 }
@@ -107,27 +116,37 @@ fn build_request_end_trace_state_for_policy(
         }
     };
 
-    let replay_metrics = match shared_replay_metrics(&common_request.token_ids, trace_block_size) {
-        Some(metrics) => metrics,
-        None => {
-            tracing::warn!(
+    let replay_metrics = match replay_unsupported_reason(common_request) {
+        Some(reason) => {
+            tracing::debug!(
                 %request_id,
-                "request trace skipped because the KV cache block size is unavailable"
+                reason,
+                "request trace emitted without replay hashes"
             );
-            return None;
+            None
         }
+        None => match shared_replay_metrics(&common_request.token_ids, trace_block_size) {
+            Some(metrics) => Some(metrics),
+            None => {
+                tracing::warn!(
+                    %request_id,
+                    "request trace skipped because the KV cache block size is unavailable"
+                );
+                return None;
+            }
+        },
     };
 
     let agent = has_agent_context
         .then(|| super::build_agent_context_trace_state(common_request, tracker, context))
         .flatten();
 
+    let output_sequence_hash_capture = replay_metrics.as_ref().map(|replay_metrics| {
+        super::output_sequence_hash_capture(&common_request.token_ids, replay_metrics)
+    });
     let request = RequestTraceRequestEndState {
         request_tracker,
-        output_sequence_hash_capture: Some(super::output_sequence_hash_capture(
-            &common_request.token_ids,
-            &replay_metrics,
-        )),
+        output_sequence_hash_capture,
         replay_metrics,
     };
 
@@ -141,22 +160,30 @@ fn build_request_end_trace_state_for_policy(
 
 impl RequestEndTraceState {
     fn emit(&mut self) {
-        let Some(request_state) = self.request.take() else {
+        let Some(RequestTraceRequestEndState {
+            request_tracker,
+            replay_metrics,
+            output_sequence_hash_capture,
+        }) = self.request.take()
+        else {
             return;
         };
-        let mut replay_metrics = super::into_owned_replay_metrics(request_state.replay_metrics);
-        if let Some(capture) = request_state.output_sequence_hash_capture {
-            replay_metrics.output_sequence_hashes = capture.lock().unwrap().sequence_hashes();
-        }
+        let replay_metrics = replay_metrics.map(|replay_metrics| {
+            let mut replay_metrics = super::into_owned_replay_metrics(replay_metrics);
+            if let Some(capture) = &output_sequence_hash_capture {
+                replay_metrics.output_sequence_hashes = capture.lock().unwrap().sequence_hashes();
+            }
+            replay_metrics
+        });
         if let Some(agent_state) = self.agent.take() {
             let (agent_context, mut metrics) =
                 super::request_metrics_from_agent_state(agent_state, self.request_id.clone());
-            metrics.replay = Some(replay_metrics);
+            metrics.replay = replay_metrics;
             super::record::emit_agent_request_end(agent_context, metrics);
         } else {
             super::record::emit_request_end(
                 self.request_id.clone(),
-                &request_state.request_tracker,
+                &request_tracker,
                 replay_metrics,
             );
         }
@@ -296,12 +323,12 @@ mod tests {
                 agent: None,
                 request: Some(RequestTraceRequestEndState {
                     request_tracker: tracker,
-                    replay_metrics: Arc::new(RequestReplayMetrics {
+                    replay_metrics: Some(Arc::new(RequestReplayMetrics {
                         trace_block_size: 2,
                         input_length: 2,
                         input_sequence_hashes: vec![11],
                         output_sequence_hashes: Vec::new(),
-                    }),
+                    })),
                     output_sequence_hash_capture: None,
                 }),
                 request_id: request_id.to_string(),
@@ -363,8 +390,66 @@ mod tests {
         multi_choice.multi_modal_data = Some(Default::default());
         assert_eq!(
             request_trace_rejection(&multi_choice),
-            Some("multimodal inputs are not supported")
+            None,
+            "multimodal requests are traced; only their replay section is withheld"
         );
+        assert_eq!(
+            replay_unsupported_reason(&multi_choice),
+            Some("multimodal inputs cannot be replayed as one token stream")
+        );
+        assert_eq!(
+            replay_unsupported_reason(&preprocessed_request(SamplingOptions::default())),
+            None
+        );
+    }
+
+    #[test]
+    fn multimodal_request_is_traced_without_replay() {
+        BUS.init(16);
+        let mut receiver = BUS.subscribe();
+
+        let mut request = preprocessed_request(SamplingOptions::default());
+        request.multi_modal_data = Some(Default::default());
+        let tracker = Arc::new(RequestTracker::new());
+        tracker.record_isl(3, Some(0));
+        tracker.record_osl(2);
+        tracker.record_finish();
+        let context = Context::new(());
+        let request_id = context.id().to_string();
+
+        let mut state =
+            build_request_end_trace_state_for_policy(&request, &Some(tracker), &context, 2, true)
+                .expect("multimodal requests are traced");
+        let request_state = state.request.as_ref().expect("request state");
+        assert!(request_state.replay_metrics.is_none());
+        assert!(request_state.output_sequence_hash_capture.is_none());
+
+        state.emit();
+        let records = drain_request_records(&mut receiver, &request_id);
+        assert_eq!(records.len(), 1);
+        let traced = records[0].request.as_ref().expect("request payload");
+        assert!(traced.replay.is_none());
+        assert_eq!(traced.input_tokens, Some(3));
+        assert_eq!(traced.output_tokens, Some(2));
+        let json = serde_json::to_value(&records[0]).expect("serializable record");
+        assert!(
+            json["request"].get("replay").is_none(),
+            "the replay section is omitted, not serialized as null"
+        );
+        assert_eq!(json["event_type"], "request_end");
+
+        // Text-only requests are unchanged: they keep their replay hashes.
+        let text_state = build_request_end_trace_state_for_policy(
+            &preprocessed_request(SamplingOptions::default()),
+            &Some(Arc::new(RequestTracker::new())),
+            &Context::new(()),
+            2,
+            true,
+        )
+        .expect("text requests are traced");
+        let text_request = text_state.request.as_ref().expect("request state");
+        assert!(text_request.replay_metrics.is_some());
+        assert!(text_request.output_sequence_hash_capture.is_some());
     }
 
     #[test]
