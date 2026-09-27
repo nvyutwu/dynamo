@@ -32,11 +32,29 @@ pub(crate) struct RequestEndTraceState {
     request_context: Arc<dyn AsyncEngineContext>,
 }
 
+/// `DYN_REQUEST_TRACE_INCLUDE_MULTIMODAL=1` records request_end traces for multimodal requests
+/// too. Their `replay` section cannot reproduce the request (the media is not carried), but the
+/// routing decision and cache-loss fields are what a routing-accuracy comparison needs; the
+/// hybrid probe's image-prompt verification on Kimi-K3 reads them (2026-09-27).
+fn include_multimodal_traces() -> bool {
+    static INCLUDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INCLUDE.get_or_init(|| {
+        std::env::var("DYN_REQUEST_TRACE_INCLUDE_MULTIMODAL")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn request_trace_rejection(common_request: &PreprocessedRequest) -> Option<&'static str> {
     if common_request.prompt_embeds.is_some() {
         return Some("prompt embeddings are not supported");
     }
-    if common_request.multi_modal_data.is_some() {
+    if common_request.multi_modal_data.is_some() && !include_multimodal_traces() {
         return Some("multimodal inputs are not supported");
     }
     if common_request.sampling_options.n.unwrap_or(1) > 1 {
