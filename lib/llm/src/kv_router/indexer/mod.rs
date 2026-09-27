@@ -386,8 +386,19 @@ impl Indexer {
                 true
             }
             KvCacheEventData::Cleared => {
-                let tier = event.clears_single_tier().then_some(event.storage_tier);
-                hybrid.clear(worker, tier);
+                // A scoped clear names the one tier it resets. A legacy clear is vLLM's
+                // `AllBlocksCleared`: the block pool's GPU reset, converted with the all-tier
+                // scope. The offload connector's CPU pool survives that reset and is only ever
+                // mutated by its own store/remove events, so the probe index resets the device
+                // tier alone (Falcon-H1 and K3 GB300 runs, 2026-09-27: the engine restored
+                // 1,888 and 24,576 tokens from CPU right after a flush that had emptied the
+                // index's host keys). Worker departure goes through `remove_worker_dp_rank`.
+                let tier = if event.clears_single_tier() {
+                    event.storage_tier
+                } else {
+                    dynamo_kv_router::protocols::StorageTier::Device
+                };
+                hybrid.clear(worker, Some(tier));
                 false
             }
             KvCacheEventData::Stored(_) | KvCacheEventData::Removed(_) => false,
@@ -813,16 +824,39 @@ mod tests {
         assert!(hybrid.keys(worker, Device, FullAttention).is_empty());
         assert_eq!(hybrid.keys(worker, HostPinned, Recurrent), vec![21]);
 
-        // An all-tier clear empties the worker.
+        // A legacy all-tier clear is vLLM's GPU `AllBlocksCleared`: it resets the device keys
+        // and leaves the host keys (the CPU offload pool survives the engine's flush).
+        indexer
+            .try_apply_event(event(
+                5,
+                KvCacheEventData::HybridKeysStored(HybridKeysData {
+                    group: Recurrent,
+                    hashes: keys(&[13]),
+                }),
+                Device,
+            ))
+            .await
+            .unwrap();
         indexer
             .try_apply_event(RouterEvent::new(
                 7,
                 KvCacheEvent {
-                    event_id: 5,
+                    event_id: 6,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 0,
                 },
             ))
+            .await
+            .unwrap();
+        assert!(hybrid.keys(worker, Device, Recurrent).is_empty());
+        assert_eq!(hybrid.keys(worker, HostPinned, Recurrent), vec![21]);
+
+        // A scoped host clear drops only the host keys; the worker is then empty.
+        indexer
+            .try_apply_event(
+                event(7, KvCacheEventData::Cleared, HostPinned)
+                    .with_clear_scope(ClearScope::SingleTier),
+            )
             .await
             .unwrap();
         assert_eq!(hybrid.stats(), HybridIndexStats::default());
@@ -830,7 +864,7 @@ mod tests {
         // Hybrid key events never reach the radix tree, and the refresher stays off.
         indexer
             .try_apply_event(event(
-                6,
+                8,
                 KvCacheEventData::HybridKeysStored(HybridKeysData {
                     group: FullAttention,
                     hashes: keys(&[31]),
