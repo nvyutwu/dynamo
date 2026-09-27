@@ -291,7 +291,17 @@ impl KvRouterConfig {
             );
         }
 
+        // The hybrid engine-hash probe knobs are deployment settings without a Python keyword
+        // yet; they come from the DYN_ROUTER_HYBRID_* variables through the same loader the
+        // Rust-only router uses, so one set of names configures both entry points.
+        let env_config = dynamo_kv_router::config::try_kv_router_config_from_dynamo_env()
+            .map_err(PyValueError::new_err)?;
+
         let inner = RsKvRouterConfig {
+            router_hybrid_engine_hash_index: env_config.router_hybrid_engine_hash_index,
+            router_hybrid_hash_algo: env_config.router_hybrid_hash_algo,
+            router_hybrid_none_hash_seed: env_config.router_hybrid_none_hash_seed,
+            router_hybrid_hash_unit: env_config.router_hybrid_hash_unit,
             overlap_score_credit,
             overlap_score_credit_decay,
             prefill_load_scale,
