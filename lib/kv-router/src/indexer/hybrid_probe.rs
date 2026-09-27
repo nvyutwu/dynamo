@@ -287,9 +287,11 @@ impl HybridProbeIndex {
 ///    deepest device full-attention key (whole blocks, then the interior hash-unit boundaries
 ///    of the next block from the top down); the device hit is the deepest device recurrent key
 ///    at or below `L`.
-/// 2. `OffloadingConnectorScheduler._lookup`: from the block-aligned device hit, complete host
-///    chunks need both groups; the partial-tail probe anchors on the host full-attention prefix
-///    and scans the next block's boundaries from the top down for a boundary both groups hold.
+/// 2. `OffloadingConnectorScheduler._lookup`: from the block-aligned device hit, the complete
+///    host hit is the deepest full-attention chunk of the maximal prefix that has a recurrent
+///    state at its boundary (the recurrent groups are one-chunk sliding-window lookups); the
+///    partial-tail probe anchors on the host full-attention prefix and scans the next block's
+///    boundaries from the top down for a boundary both groups hold.
 /// 3. `Scheduler.schedule`: a host hit replaces the device partial tail only when it is longer.
 pub fn reconcile(
     probe: &dyn Fn(StorageTier, HybridCacheGroup, usize) -> bool,
@@ -334,23 +336,37 @@ pub fn reconcile(
     let partial_tail = local % b;
     let aligned_local = local - partial_tail;
 
-    // Host: complete chunks beyond the aligned device hit need both groups.
-    let num_chunks = num_tokens / b;
+    // Host complete chunks beyond the aligned device hit (`_lookup_complete_chunks`): the
+    // full-attention group is a maximal-prefix lookup; each recurrent group is a
+    // sliding-window lookup of width one chunk, so the hit ends at the deepest full-attention
+    // chunk that has a recurrent state at its boundary. Interior boundaries need no state:
+    // K3 stores KDA states only where a prefill step ends, and a divergent request that ended
+    // a step at 24,576 made chunks 1-2 restorable although no state ever existed at 12,288
+    // (lyrix run 2, E01). The last prompt token is always computed, so a prompt that ends
+    // exactly on a chunk boundary cannot reuse its last chunk.
+    let num_chunks = (num_tokens - 1) / b;
     let first_chunk = aligned_local / b;
-    let mut complete = first_chunk;
-    while complete < num_chunks
-        && probe(HostPinned, FullAttention, (complete + 1) * b)
-        && probe(HostPinned, Recurrent, (complete + 1) * b)
-    {
-        complete += 1;
-    }
-    let complete_hit = complete * b - aligned_local;
-    // The partial-tail probe anchors on the host full-attention prefix alone.
     let mut anchor = first_chunk;
     while anchor < num_chunks && probe(HostPinned, FullAttention, (anchor + 1) * b) {
         anchor += 1;
     }
-    let anchor_hit = complete_hit.max(anchor * b - aligned_local);
+    let mut complete = first_chunk;
+    for chunk in (first_chunk + 1..=anchor).rev() {
+        if probe(HostPinned, Recurrent, chunk * b) {
+            complete = chunk;
+            break;
+        }
+    }
+    let complete_hit = complete * b - aligned_local;
+    // The partial-tail probe anchors on the host full-attention prefix alone
+    // (`_full_attention_complete_hit`), which may reach one chunk further when the prompt
+    // ends exactly on a chunk boundary.
+    let mut anchor_fa = anchor;
+    let anchor_chunks = num_tokens / b;
+    while anchor_fa < anchor_chunks && probe(HostPinned, FullAttention, (anchor_fa + 1) * b) {
+        anchor_fa += 1;
+    }
+    let anchor_hit = complete_hit.max(anchor_fa * b - aligned_local);
     let boundary0 = aligned_local + anchor_hit;
     let max_boundary = ((num_tokens - 1).min(boundary0 + b - 1) / u) * u;
     let mut ext = complete_hit;
@@ -529,6 +545,37 @@ mod tests {
                 host_tokens: 0
             }
         );
+    }
+
+    /// K3 lyrix run 2, E01: chunks 1-2 of a 28,200-token fill sat on the CPU as full-attention
+    /// rows and the only recurrent state on the CPU was at 24,576 (a divergent request's
+    /// prefill step ended there); the engine restored 24,576. The recurrent lookup is a
+    /// one-chunk sliding window, so no state is needed at 12,288.
+    #[test]
+    fn recurrent_state_at_the_last_chunk_alone_completes_the_hit() {
+        use HybridCacheGroup::{FullAttention, Recurrent};
+        use StorageTier::HostPinned;
+        let w = worker();
+        let index = HybridProbeIndex::new(BLOCK as u32, UNIT as u32);
+        index.store(w, HostPinned, FullAttention, &[key(12_288), key(24_576)]);
+        index.store(w, HostPinned, Recurrent, &[key(24_576)]);
+        assert_eq!(
+            hit(&index, 29_762, 29_762),
+            HybridHit {
+                device_tokens: 0,
+                host_tokens: 24_576
+            }
+        );
+        // A state at chunk 1 only stops the hit there, even with two full-attention chunks.
+        let index = HybridProbeIndex::new(BLOCK as u32, UNIT as u32);
+        index.store(w, HostPinned, FullAttention, &[key(12_288), key(24_576)]);
+        index.store(w, HostPinned, Recurrent, &[key(12_288)]);
+        assert_eq!(hit(&index, 29_762, 29_762).host_tokens, 12_288);
+        // A prompt that ends exactly on a chunk boundary cannot reuse its last chunk.
+        let index = HybridProbeIndex::new(BLOCK as u32, UNIT as u32);
+        index.store(w, HostPinned, FullAttention, &[key(12_288), key(24_576)]);
+        index.store(w, HostPinned, Recurrent, &[key(12_288), key(24_576)]);
+        assert_eq!(hit(&index, 24_576, 24_576).host_tokens, 12_288);
     }
 
     #[test]
