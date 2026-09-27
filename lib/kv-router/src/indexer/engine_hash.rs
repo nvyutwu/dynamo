@@ -124,6 +124,46 @@ impl EngineChainHasher {
         digests
     }
 
+    /// [`Self::chain_digests`] with vLLM's per-block extra keys: `extra(i)` returns the keys of
+    /// unit block `i` (tokens `[i*unit, (i+1)*unit)`), e.g. the `(identifier, offset_in_block)`
+    /// pairs of the multimodal items overlapping it and the cache salt on block 0.
+    pub fn chain_digests_with_extra(
+        &self,
+        tokens: &[u32],
+        unit: u32,
+        extra: &dyn Fn(usize) -> Option<Vec<ExtraKey>>,
+    ) -> Vec<Vec<u8>> {
+        let unit = unit as usize;
+        if unit == 0 {
+            return Vec::new();
+        }
+        let mut digests = Vec::with_capacity(tokens.len() / unit);
+        let mut parent = self.none_hash.clone();
+        let mut buf = Vec::with_capacity(unit * 5 + 48);
+        for (i, block) in tokens.chunks_exact(unit).enumerate() {
+            buf.clear();
+            let keys = extra(i);
+            encode_block_with_extra(&mut buf, &parent, block, keys.as_deref());
+            parent = self.algo.digest(&buf);
+            digests.push(parent.clone());
+        }
+        digests
+    }
+
+    /// [`Self::chain_keys`] with vLLM's per-block extra keys (see
+    /// [`Self::chain_digests_with_extra`]).
+    pub fn chain_keys_with_extra(
+        &self,
+        tokens: &[u32],
+        unit: u32,
+        extra: &dyn Fn(usize) -> Option<Vec<ExtraKey>>,
+    ) -> Vec<u64> {
+        self.chain_digests_with_extra(tokens, unit, extra)
+            .iter()
+            .map(|digest| wire_key(digest))
+            .collect()
+    }
+
     /// Wire keys (low 64 bits of each digest) for every complete `unit`-token boundary of
     /// `tokens`, in prefix order: element `i` names the prefix `[0, (i + 1) * unit)`.
     pub fn chain_keys(&self, tokens: &[u32], unit: u32) -> Vec<u64> {
@@ -152,15 +192,122 @@ pub fn wire_key(digest: &[u8]) -> u64 {
         .fold(0u64, |acc, &byte| (acc << 8) | u64::from(byte))
 }
 
-/// Canonical CBOR for the Python tuple `(parent: bytes, tuple(token_ids), None)`.
+/// One element of vLLM's `extra_keys` tuple for a block (`generate_block_hash_extra_keys`):
+/// a multimodal item as `(identifier, offset_in_block)` or a plain string (LoRA name, cache
+/// salt on the first block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtraKey {
+    Mm { identifier: String, offset: i64 },
+    Text(String),
+}
+
+/// Canonical CBOR for the Python tuple `(parent: bytes, tuple(token_ids), extra_keys)` where
+/// `extra_keys` is `None` or a tuple of `(str, int)` tuples and strings.
 fn encode_block(buf: &mut Vec<u8>, parent: &[u8], tokens: &[u32]) {
+    encode_block_with_extra(buf, parent, tokens, None);
+}
+
+fn encode_block_with_extra(
+    buf: &mut Vec<u8>,
+    parent: &[u8],
+    tokens: &[u32],
+    extra: Option<&[ExtraKey]>,
+) {
     cbor_head(buf, 4, 3);
     cbor_bytes(buf, parent);
     cbor_head(buf, 4, tokens.len() as u64);
     for &token in tokens {
         cbor_head(buf, 0, u64::from(token));
     }
-    buf.push(0xf6);
+    match extra {
+        None => buf.push(0xf6),
+        Some(keys) if keys.is_empty() => buf.push(0xf6),
+        Some(keys) => {
+            cbor_head(buf, 4, keys.len() as u64);
+            for key in keys {
+                match key {
+                    ExtraKey::Mm { identifier, offset } => {
+                        cbor_head(buf, 4, 2);
+                        cbor_text(buf, identifier);
+                        cbor_int(buf, *offset);
+                    }
+                    ExtraKey::Text(text) => cbor_text(buf, text),
+                }
+            }
+        }
+    }
+}
+
+/// vLLM's per-unit-block multimodal extra keys, rebuilt from the frontend's block-level
+/// multimodal info (`BlockExtraInfo`: per router block, each object's placeholder ranges clipped
+/// to that block). A placeholder run that crosses a router-block boundary appears in both blocks
+/// (`(s, block_size)` then `(0, e)`); consecutive clipped ranges of the same object are one
+/// occurrence whose absolute start is the first range's. For unit block `i` the keys are, in
+/// start order, `(identifier(mm_hash), start - i*unit)` for every occurrence overlapping the
+/// unit — negative when the item began earlier — exactly `generate_block_hash_extra_keys`
+/// (`_gen_mm_extra_hash_keys`). Returns one entry per unit block (`None` = no extra keys).
+pub fn mm_extra_keys_by_unit(
+    block_mm_infos: &[Option<crate::protocols::BlockExtraInfo>],
+    block_size: usize,
+    unit: usize,
+    num_units: usize,
+    identifier: &dyn Fn(u64) -> String,
+) -> Vec<Option<Vec<ExtraKey>>> {
+    // occurrences: (abs_start, abs_end, mm_hash)
+    let mut occurrences: Vec<(usize, usize, u64)> = Vec::new();
+    for (block_index, info) in block_mm_infos.iter().enumerate() {
+        let Some(info) = info else { continue };
+        let base = block_index * block_size;
+        for object in &info.mm_objects {
+            for &(s, e) in &object.offsets {
+                let (abs_s, abs_e) = (base + s, base + e);
+                // continuation of an occurrence that ended exactly at this block's start
+                if s == 0
+                    && let Some(last) = occurrences
+                        .iter_mut()
+                        .rev()
+                        .find(|(_, end, hash)| *hash == object.mm_hash && *end == base)
+                {
+                    last.1 = abs_e;
+                    continue;
+                }
+                occurrences.push((abs_s, abs_e, object.mm_hash));
+            }
+        }
+    }
+    occurrences.sort_by_key(|(s, _, _)| *s);
+    let mut out = Vec::with_capacity(num_units);
+    for i in 0..num_units {
+        let (u_start, u_end) = (i * unit, (i + 1) * unit);
+        let keys: Vec<ExtraKey> = occurrences
+            .iter()
+            .filter(|(s, e, _)| *s < u_end && *e > u_start)
+            .map(|(s, _, hash)| ExtraKey::Mm {
+                identifier: identifier(*hash),
+                offset: *s as i64 - u_start as i64,
+            })
+            .collect();
+        out.push((!keys.is_empty()).then_some(keys));
+    }
+    out
+}
+
+/// vLLM's multimodal item identifier (`MultiModalHasher.hash_kwargs("blake3", model_id=…,
+/// image=item)`): kwargs are hashed in key order, each as its key then its serialization. An
+/// image fetched by vLLM arrives as `MediaWithBytes` without `io_config`, whose serialization
+/// re-emits the key before the original encoded bytes, so the stream is
+/// `b"image" b"image" <bytes> b"model_id" <model_id>`. Raw `bytes` items (`media_with_bytes =
+/// false`) emit the key once.
+pub fn mm_identifier_blake3(model_id: &str, image_bytes: &[u8], media_with_bytes: bool) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"image");
+    if media_with_bytes {
+        hasher.update(b"image");
+    }
+    hasher.update(image_bytes);
+    hasher.update(b"model_id");
+    hasher.update(model_id.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn cbor_head(buf: &mut Vec<u8>, major: u8, value: u64) {
@@ -179,6 +326,16 @@ fn cbor_head(buf: &mut Vec<u8>, major: u8, value: u64) {
     } else {
         buf.push(mt | 27);
         buf.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+/// CBOR integer: major 0 for non-negative values, major 1 (`-1 - n`) for negative ones — vLLM's
+/// in-block offset of a multimodal item is negative when the item started in an earlier block.
+fn cbor_int(buf: &mut Vec<u8>, value: i64) {
+    if value >= 0 {
+        cbor_head(buf, 0, value as u64);
+    } else {
+        cbor_head(buf, 1, (-1 - value) as u64);
     }
 }
 
@@ -274,6 +431,133 @@ mod tests {
         let digest: Vec<u8> = (1..=32u8).collect();
         assert_eq!(wire_key(&digest), 0x191a_1b1c_1d1e_1f20);
         assert_eq!(wire_key(&[0x01, 0x02]), 0x0102);
+    }
+
+    #[test]
+    /// Goldens from vLLM `hash_block_tokens(sha256_cbor, …)` with `extra_keys`, seed "0",
+    /// tokens 1000..1127 (`kv_cache_utils.generate_block_hash_extra_keys` shapes).
+    #[test]
+    fn extra_keys_reproduce_vllm_block_hashes() {
+        let hasher = EngineChainHasher::new(EngineHashAlgo::Sha256Cbor, "0");
+        assert_eq!(
+            hex(hasher.none_hash()),
+            "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e"
+        );
+        let tokens: Vec<u32> = (1000..1128).collect();
+        let digest = |extra: Option<Vec<ExtraKey>>| {
+            let d = hasher.chain_digests_with_extra(&tokens, 128, &|_| extra.clone());
+            hex(&d[0])
+        };
+        assert_eq!(
+            digest(None),
+            "199e2f20e73a6e2cc3e0e6fdf521eff7b636122d5e122320c22c380d95e5863e"
+        );
+        let mm = ExtraKey::Mm {
+            identifier: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            offset: 5,
+        };
+        assert_eq!(
+            digest(Some(vec![mm])),
+            "3597444c4db23e603150784eeb8467b6895e64d29667e2496941709e6bad8adb"
+        );
+        assert_eq!(
+            digest(Some(vec![ExtraKey::Text("my-salt".into())])),
+            "84611d254438937d076c5739d973f17e1febd6a252387f535357a817319908b0"
+        );
+        assert_eq!(
+            digest(Some(vec![
+                ExtraKey::Mm {
+                    identifier: "aaaa".into(),
+                    offset: 3
+                },
+                ExtraKey::Text("my-salt".into()),
+            ])),
+            "3f56ea40d074550a58b6ddadba236109d86356a3cc0aeca8a0c70c4be0df5cc0"
+        );
+        // second block parented on the plain first block, two items in the block
+        let two: Vec<u32> = (1000..1128).chain(1000..1128).collect();
+        let d = hasher.chain_digests_with_extra(&two, 128, &|i| {
+            (i == 1).then(|| {
+                vec![
+                    ExtraKey::Mm {
+                        identifier: "aaaa".into(),
+                        offset: 0,
+                    },
+                    ExtraKey::Mm {
+                        identifier: "bbbb".into(),
+                        offset: 64,
+                    },
+                ]
+            })
+        });
+        assert_eq!(
+            hex(&d[1]),
+            "2ea9f0275be48f4499ccdd95ca2d8cd26c5a995c2a9b08d7aa4ef2a5902569fc"
+        );
+        assert_eq!(wire_key(&d[1]), 12272012827533076988);
+        // an item that began in an earlier block carries a negative in-block offset
+        assert_eq!(
+            digest(Some(vec![ExtraKey::Mm {
+                identifier: "aaaa".into(),
+                offset: -3
+            }])),
+            "c914451f83e397a290b4a1749465eb9a832fc78ef98f8e32dace9514242864f2"
+        );
+    }
+
+    /// vLLM golden (`generate_block_hash_extra_keys`, this session): items A [100,300), B [300,330),
+    /// C [450,500) in a 512-token prompt, unit 128 → unit0 (A,100); unit1 (A,-28); unit2 (A,-156),(B,44);
+    /// unit3 (C,66). The frontend's block info uses router block 256 here so A is clipped across
+    /// two blocks and B/C share block 1.
+    #[test]
+    fn mm_extra_keys_by_unit_match_vllm_generate_block_hash_extra_keys() {
+        use crate::protocols::{BlockExtraInfo, BlockMmObjectInfo};
+        let block = |objects: Vec<(u64, Vec<(usize, usize)>)>| {
+            Some(BlockExtraInfo {
+                mm_objects: objects
+                    .into_iter()
+                    .map(|(mm_hash, offsets)| BlockMmObjectInfo { mm_hash, offsets })
+                    .collect(),
+            })
+        };
+        let infos = vec![
+            block(vec![(0xA, vec![(100, 256)])]),
+            block(vec![
+                (0xA, vec![(0, 44)]),
+                (0xB, vec![(44, 74)]),
+                (0xC, vec![(194, 244)]),
+            ]),
+        ];
+        let ident = |h: u64| format!("{h:x}");
+        let keys = mm_extra_keys_by_unit(&infos, 256, 128, 4, &ident);
+        let mm = |id: &str, offset: i64| ExtraKey::Mm {
+            identifier: id.into(),
+            offset,
+        };
+        assert_eq!(keys[0], Some(vec![mm("a", 100)]));
+        assert_eq!(keys[1], Some(vec![mm("a", -28)]));
+        assert_eq!(keys[2], Some(vec![mm("a", -156), mm("b", 44)]));
+        assert_eq!(keys[3], Some(vec![mm("c", 66)]));
+        // a text-only block yields None, and the same image twice is two occurrences
+        let infos = vec![None, block(vec![(0xA, vec![(0, 10), (20, 30)])])];
+        let keys = mm_extra_keys_by_unit(&infos, 128, 128, 2, &ident);
+        assert_eq!(keys[0], None);
+        assert_eq!(keys[1], Some(vec![mm("a", 0), mm("a", 20)]));
+    }
+
+    /// Goldens from vLLM `MultiModalHasher.hash_kwargs("blake3", model_id="model-x", image=…)`
+    /// for raw bytes and for `MediaWithBytes(PIL image, bytes)` without io_config.
+    #[test]
+    fn mm_identifier_matches_vllm_multimodal_hasher() {
+        let bytes = b"\x89PNG\r\n\x1a\nfakeimagebytes";
+        assert_eq!(
+            mm_identifier_blake3("model-x", bytes, false),
+            "64c6d9eba7d0afd03255306a918077dd7dcec4e7b74c3845378453c26874901c"
+        );
+        assert_eq!(
+            mm_identifier_blake3("model-x", bytes, true),
+            "3c33a6df32c3c9be34ca134b438c73647e304ebd030efb566520d685c6eb4880"
+        );
     }
 
     #[test]
