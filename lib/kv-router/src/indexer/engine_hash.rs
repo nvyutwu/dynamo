@@ -292,6 +292,56 @@ pub fn mm_extra_keys_by_unit(
     out
 }
 
+/// The identifier vLLM ends up with for a frontend-routed image: the worker forwards the
+/// frontend's 64-bit `mm_hash` as the item's UUID, canonicalised to 16 hex digits plus 48 zeros
+/// (`mark_forwarded_mm_hashes_for_routing`), and vLLM uses a provided UUID verbatim as the item
+/// identifier when no processor kwargs are set. Same string as `mark_mm_hash_for_extra_key`.
+pub fn hybrid_mm_identifier(mm_hash: u64) -> String {
+    crate::zmq_wire::mark_mm_hash_for_extra_key(mm_hash)
+}
+
+/// The engine's token ids for a multimodal request, recovered from the router's normalised
+/// routing sequence. The frontend replaces every placeholder run of an image with
+/// `pad_value_for_mm_hash(mm_hash)` so Dynamo's local block hashes carry image identity
+/// (`normalize_mm_placeholder_runs`); the engine hashes the real placeholder token ids. Runs are
+/// exactly the `BlockExtraInfo` offset ranges, so each pad is put back to the image token id.
+/// Returns `None` when the sequence cannot be recovered exactly (no image token id, an object
+/// without offsets, an unexpected token inside a run, or both image and video ids so the kind of
+/// a run is ambiguous); callers then keep the radix path.
+pub fn mm_engine_tokens(
+    routing_tokens: &[u32],
+    block_mm_infos: &[Option<crate::protocols::BlockExtraInfo>],
+    block_size: usize,
+    image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
+) -> Option<Vec<u32>> {
+    let placeholder = match (image_token_id, video_token_id) {
+        (Some(image), None) => image,
+        (None, Some(video)) => video,
+        _ => return None,
+    };
+    let mut tokens = routing_tokens.to_vec();
+    for (block_index, info) in block_mm_infos.iter().enumerate() {
+        let Some(info) = info else { continue };
+        let base = block_index * block_size;
+        for object in &info.mm_objects {
+            if object.offsets.is_empty() {
+                return None;
+            }
+            let pad = crate::protocols::pad_value_for_mm_hash(object.mm_hash);
+            for &(s, e) in &object.offsets {
+                for pos in base + s..(base + e).min(tokens.len()) {
+                    if tokens[pos] != pad {
+                        return None;
+                    }
+                    tokens[pos] = placeholder;
+                }
+            }
+        }
+    }
+    Some(tokens)
+}
+
 /// vLLM's multimodal item identifier (`MultiModalHasher.hash_kwargs("blake3", model_id=…,
 /// image=item)`): kwargs are hashed in key order, each as its key then its serialization. An
 /// image fetched by vLLM arrives as `MediaWithBytes` without `io_config`, whose serialization
@@ -543,6 +593,58 @@ mod tests {
         let keys = mm_extra_keys_by_unit(&infos, 128, 128, 2, &ident);
         assert_eq!(keys[0], None);
         assert_eq!(keys[1], Some(vec![mm("a", 0), mm("a", 20)]));
+    }
+
+    /// The routing sequence round-trips: normalise the engine tokens the way the frontend and the
+    /// worker publisher do, then recover them from the block info.
+    #[test]
+    fn mm_engine_tokens_invert_the_routing_normalisation() {
+        use crate::protocols::{BlockExtraInfo, BlockMmObjectInfo};
+        use crate::zmq_wire::normalize_mm_placeholder_runs;
+        const IMG: u32 = 7_777;
+        // 512 tokens, router block 256: image A at [100, 300) is clipped into [100,256) + [0,44);
+        // image B at [301, 331) follows one separator token (adjacent runs of the same
+        // placeholder would be one run to the normaliser; real prompts separate images with a
+        // structural token).
+        let mut engine: Vec<u32> = (1..=512).collect();
+        for t in engine[100..300].iter_mut() {
+            *t = IMG;
+        }
+        for t in engine[301..331].iter_mut() {
+            *t = IMG;
+        }
+        let (block0, _) =
+            normalize_mm_placeholder_runs(&engine[..256], Some(IMG), None, &[0xA]).unwrap();
+        let (block1, _) =
+            normalize_mm_placeholder_runs(&engine[256..], Some(IMG), None, &[0xA, 0xB]).unwrap();
+        let routing: Vec<u32> = block0.into_iter().chain(block1).collect();
+        assert_ne!(routing, engine);
+        let block = |objects: Vec<(u64, Vec<(usize, usize)>)>| {
+            Some(BlockExtraInfo {
+                mm_objects: objects
+                    .into_iter()
+                    .map(|(mm_hash, offsets)| BlockMmObjectInfo { mm_hash, offsets })
+                    .collect(),
+            })
+        };
+        let infos = vec![
+            block(vec![(0xA, vec![(100, 256)])]),
+            block(vec![(0xA, vec![(0, 44)]), (0xB, vec![(45, 75)])]),
+        ];
+        assert_eq!(
+            mm_engine_tokens(&routing, &infos, 256, Some(IMG), None).as_deref(),
+            Some(&engine[..])
+        );
+        // not recoverable: no image token id, ambiguous kinds, an object without offsets
+        assert!(mm_engine_tokens(&routing, &infos, 256, None, None).is_none());
+        assert!(mm_engine_tokens(&routing, &infos, 256, Some(IMG), Some(IMG + 1)).is_none());
+        let bare = vec![block(vec![(0xA, vec![])]), None];
+        assert!(mm_engine_tokens(&routing, &bare, 256, Some(IMG), None).is_none());
+        assert_eq!(
+            hybrid_mm_identifier(0xabc),
+            format!("{:016x}{}", 0xabc, "0".repeat(48))
+        );
+        assert_eq!(hybrid_mm_identifier(0xabc).len(), 64);
     }
 
     /// Goldens from vLLM `MultiModalHasher.hash_kwargs("blake3", model_id="model-x", image=…)`

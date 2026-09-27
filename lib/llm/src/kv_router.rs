@@ -585,6 +585,13 @@ const DYNAMO_VLLM_WORKER_HASH_SEED: &str = "0";
 /// `TieredMatchDetails` keeps whole router blocks (the shape metrics, the scores endpoint and
 /// KV-transfer hints expect), while `OverlapSignals` carries the token-precise device and host
 /// hits so worker selection sees partial-tail reuse at hash-unit resolution.
+/// Multimodal placeholder token id for the hybrid probe's engine-token recovery.
+fn hybrid_mm_token_id_from_env(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
 fn hybrid_overlap_from_hits(
     hits: impl IntoIterator<Item = (WorkerWithDpRank, HybridHit)>,
     block_size: u32,
@@ -665,6 +672,11 @@ where
     /// Reproduces the engine's prefix-chain hash for the hybrid probe index
     /// (`router_hybrid_engine_hash_index`). `None` routes through the radix path.
     hybrid_hasher: Option<EngineChainHasher>,
+    /// Placeholder token ids the engine hashes for multimodal prompts
+    /// (`DYN_ROUTER_HYBRID_MM_IMAGE_TOKEN_ID` / `DYN_ROUTER_HYBRID_MM_VIDEO_TOKEN_ID`); without
+    /// them multimodal requests keep the radix path.
+    hybrid_mm_image_token_id: Option<u32>,
+    hybrid_mm_video_token_id: Option<u32>,
     /// Optional LoRA filter. When present (LoRA serving enabled), candidate workers are
     /// narrowed to the LoRA's allocated/loaded replicas inside `find_best_match_details`,
     /// covering both the decode and prefill routers (both built via `kv_chooser_for`).
@@ -1002,6 +1014,12 @@ where
             _served_indexer_handle: served_indexer_handle,
             shared_cache,
             hybrid_hasher,
+            hybrid_mm_image_token_id: hybrid_mm_token_id_from_env(
+                "DYN_ROUTER_HYBRID_MM_IMAGE_TOKEN_ID",
+            ),
+            hybrid_mm_video_token_id: hybrid_mm_token_id_from_env(
+                "DYN_ROUTER_HYBRID_MM_VIDEO_TOKEN_ID",
+            ),
             lora_filter,
             endpoint_registration: None,
             teardown_task_guard: None,
@@ -1749,14 +1767,24 @@ where
 
         // Hybrid-attention models route on the engine's own prefix-chain hashes (D3): the
         // radix tree sees only the full-attention group and mis-credits every boundary where
-        // the recurrent state is missing. Requests with extra hash keys (LoRA, cache salt,
-        // multimodal) are not reproducible on the frontend and keep the radix path.
+        // the recurrent state is missing. Multimodal prompts are reproduced from the routing
+        // sequence (placeholder pads put back, vLLM's `(identifier, offset)` extra keys per hash
+        // unit from the block info); LoRA and cache-salt requests keep the radix path.
+        let hybrid_mm = block_mm_infos.map(|infos| {
+            dynamo_kv_router::indexer::mm_engine_tokens(
+                tokens,
+                infos,
+                self.block_size as usize,
+                self.hybrid_mm_image_token_id,
+                self.hybrid_mm_video_token_id,
+            )
+        });
         let hybrid_probe = self
             .hybrid_hasher
             .as_ref()
             .zip(self.indexer.hybrid())
             .filter(|_| {
-                block_mm_infos.is_none() && lora_name.is_none() && cache_namespace.is_none()
+                lora_name.is_none() && cache_namespace.is_none() && !matches!(hybrid_mm, Some(None))
             });
         let (
             tiered_matches,
@@ -1768,8 +1796,25 @@ where
         ) = match hybrid_probe {
             Some((hasher, hybrid)) => {
                 let lookup_start = Instant::now();
-                let chain = tracing::info_span!("kv_router.compute_engine_chain")
-                    .in_scope(|| hasher.chain_keys(tokens, hybrid.hash_unit()));
+                let unit = hybrid.hash_unit();
+                let chain =
+                    tracing::info_span!("kv_router.compute_engine_chain").in_scope(|| {
+                        match (&hybrid_mm, block_mm_infos) {
+                            (Some(Some(engine_tokens)), Some(infos)) => {
+                                let units = dynamo_kv_router::indexer::mm_extra_keys_by_unit(
+                                    infos,
+                                    self.block_size as usize,
+                                    unit as usize,
+                                    engine_tokens.len() / unit as usize,
+                                    &dynamo_kv_router::indexer::hybrid_mm_identifier,
+                                );
+                                hasher.chain_keys_with_extra(engine_tokens, unit, &|i| {
+                                    units.get(i).cloned().flatten()
+                                })
+                            }
+                            _ => hasher.chain_keys(tokens, unit),
+                        }
+                    });
                 let hits = hybrid.lookup(&chain, tokens.len());
                 let (tiered, overlap) = hybrid_overlap_from_hits(
                     hits,
