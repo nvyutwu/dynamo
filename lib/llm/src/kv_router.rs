@@ -14,8 +14,8 @@ use dynamo_kv_router::{
     SharedKvCache, TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope,
     config::{KvRouterConfig, RouterConfigOverride, min_initial_workers_from_env},
     indexer::{
-        ApproximateLruIncarnation, ApproximateLruStats, DEFAULT_NONE_HASH_SEED, EngineChainHasher,
-        HybridHit, KvRouterError, LowerTierMatchDetails, MatchDetails, RoutingDecisionHashes,
+        ApproximateLruIncarnation, ApproximateLruStats, EngineChainHasher, HybridHit,
+        KvRouterError, LowerTierMatchDetails, MatchDetails, RoutingDecisionHashes,
         TieredMatchDetails,
     },
     kv_hints::{
@@ -575,6 +575,11 @@ pub fn router_discovery_query(namespace: String, component: String) -> Discovery
     }
 }
 
+/// The PYTHONHASHSEED value `python -m dynamo.vllm` pins for its engine when the operator leaves
+/// it unset; vLLM seeds `NONE_HASH` from it (`kv_cache_utils.resolve_none_hash_seed`). vLLM's
+/// own default string (`DEFAULT_NONE_HASH_SEED`) applies only to engines started without Dynamo.
+const DYNAMO_VLLM_WORKER_HASH_SEED: &str = "0";
+
 /// Turn hybrid-probe hits into the scheduler's two overlap views.
 ///
 /// `TieredMatchDetails` keeps whole router blocks (the shape metrics, the scores endpoint and
@@ -794,13 +799,22 @@ where
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate().map_err(anyhow::Error::msg)?;
         let hybrid_hasher = kv_router_config.router_hybrid_engine_hash_index.then(|| {
-            EngineChainHasher::new(
-                kv_router_config.router_hybrid_hash_algo,
-                kv_router_config
-                    .router_hybrid_none_hash_seed
-                    .as_deref()
-                    .unwrap_or(DEFAULT_NONE_HASH_SEED),
-            )
+            // `python -m dynamo.vllm` pins PYTHONHASHSEED=0 when the operator leaves it unset
+            // (components/src/dynamo/vllm/__main__.py), and vLLM derives NONE_HASH from
+            // PYTHONHASHSEED whenever it is set. A Dynamo frontend therefore matches its workers
+            // with "0", not vLLM's bare default; an operator who exports another PYTHONHASHSEED
+            // on the workers sets DYN_ROUTER_HYBRID_NONE_HASH_SEED to the same value.
+            let seed = kv_router_config
+                .router_hybrid_none_hash_seed
+                .as_deref()
+                .unwrap_or(DYNAMO_VLLM_WORKER_HASH_SEED);
+            tracing::info!(
+                algo = %kv_router_config.router_hybrid_hash_algo,
+                seed,
+                unit = kv_router_config.router_hybrid_hash_unit,
+                "Hybrid probe: reproducing the engine prefix-chain hash"
+            );
+            EngineChainHasher::new(kv_router_config.router_hybrid_hash_algo, seed)
         });
         let tracking_hash = TrackingHashContext::from_config(&kv_router_config)?;
         let tracking_model_name =
