@@ -40,6 +40,8 @@ impl EventKind {
             KvCacheEventData::Stored(_) => Self::Stored,
             KvCacheEventData::Removed(_) => Self::Removed,
             KvCacheEventData::Cleared => Self::Cleared,
+            KvCacheEventData::HybridKeysStored(_) => Self::Stored,
+            KvCacheEventData::HybridKeysRemoved(_) => Self::Removed,
         }
     }
 

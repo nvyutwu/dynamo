@@ -648,6 +648,9 @@ impl<P: RouterEventBatchSink + 'static> Coordinator<P> {
                         .clear_rank_domain(event.dp_rank, domain, reset_tier, dedup_policy);
                     KvCacheEventData::Cleared
                 }
+                // Hybrid keys are not block residency; forward them untouched.
+                data @ (KvCacheEventData::HybridKeysStored(_)
+                | KvCacheEventData::HybridKeysRemoved(_)) => data,
             };
             event.event_id = self.next_outbound_id;
             let Some(next_outbound_id) = self.next_outbound_id.checked_add(1) else {
@@ -1486,6 +1489,8 @@ fn event_block_count(events: &[PlacementEvent]) -> usize {
             KvCacheEventData::Stored(data) => data.blocks.len(),
             KvCacheEventData::Removed(data) => data.block_hashes.len(),
             KvCacheEventData::Cleared => 0,
+            KvCacheEventData::HybridKeysStored(data)
+            | KvCacheEventData::HybridKeysRemoved(data) => data.hashes.len(),
         })
         .sum()
 }

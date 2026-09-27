@@ -177,6 +177,12 @@ impl PreparedOpenLoopTrial {
                             }
                         }
                         KvCacheEventData::Cleared => {}
+                        KvCacheEventData::HybridKeysStored(data)
+                        | KvCacheEventData::HybridKeysRemoved(data) => {
+                            for hash in &data.hashes {
+                                checksum ^= hash.0;
+                            }
+                        }
                     }
                 }
             }

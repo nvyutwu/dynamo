@@ -1296,6 +1296,7 @@ mod tests_startup_helpers {
                 next_event_id,
                 None,
                 None,
+                None,
             )
         });
 
@@ -1389,6 +1390,179 @@ mod tests_startup_helpers {
         let _ = listener_handle.await;
     }
 
+    /// With hybrid keys enabled the listener emits one key event per raw event *before* the
+    /// block filter, so the recurrent group (dropped by the block path) and removals without
+    /// group information reach the frontend's probe index, in stream order and with their own
+    /// event ids.
+    #[tokio::test]
+    async fn test_start_zmq_listener_emits_hybrid_key_events_when_enabled() {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type")]
+        enum MapKvEvent {
+            BlockStored {
+                block_hashes: Vec<u64>,
+                parent_block_hash: Option<u64>,
+                token_ids: Vec<u32>,
+                block_size: usize,
+                group_idx: Option<u32>,
+                kv_cache_spec_kind: Option<&'static str>,
+            },
+            BlockRemoved {
+                block_hashes: Vec<u64>,
+            },
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
+        let (_ipc_dir, endpoint) = unique_ipc_endpoint();
+        let pub_socket = bind_pub_socket(&endpoint).await.unwrap();
+        let token = dynamo_runtime::CancellationToken::new();
+        let next_event_id = Arc::new(AtomicU64::new(0));
+
+        let listener_handle = tokio::spawn({
+            let token = token.clone();
+            start_zmq_listener(
+                endpoint.to_string(),
+                String::new(),
+                1,
+                tx,
+                token,
+                4,
+                next_event_id,
+                None,
+                None,
+                Some(2),
+            )
+        });
+
+        let events = vec![
+            // Recurrent group: dropped by the block path, kept by the probe path.
+            MapKvEvent::BlockStored {
+                block_hashes: vec![41],
+                parent_block_hash: None,
+                token_ids: vec![0, 1, 2, 3],
+                block_size: 4,
+                group_idx: Some(0),
+                kv_cache_spec_kind: Some("mamba"),
+            },
+            // Full-attention router block: both paths.
+            MapKvEvent::BlockStored {
+                block_hashes: vec![42],
+                parent_block_hash: None,
+                token_ids: vec![0, 1, 2, 3],
+                block_size: 4,
+                group_idx: Some(1),
+                kv_cache_spec_kind: Some("full_attention"),
+            },
+            // Chain-shaped partial tail (block_size == hash unit): only its terminal hash is a key
+            // and the block path drops it as a non-router-block store.
+            MapKvEvent::BlockStored {
+                block_hashes: vec![43, 44],
+                parent_block_hash: Some(42),
+                token_ids: vec![4, 5, 6, 7],
+                block_size: 2,
+                group_idx: Some(1),
+                kv_cache_spec_kind: Some("full_attention"),
+            },
+            // Removal without group information names the key in both groups.
+            MapKvEvent::BlockRemoved {
+                block_hashes: vec![42],
+            },
+        ];
+        let batch = (0.0, events, Some(0_i32));
+        let payload = Bytes::from(rmps::to_vec_named(&batch).unwrap());
+        let frames = vec![
+            Bytes::from("").to_vec(),
+            Bytes::from(5u64.to_be_bytes().to_vec()).to_vec(),
+            payload.to_vec(),
+        ];
+
+        let event_batch = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            let mut publish_interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    event_batch = rx.recv() => {
+                        return event_batch.expect("listener channel closed");
+                    }
+                    _ = publish_interval.tick() => {
+                        send_multipart(&pub_socket, frames.clone())
+                            .await
+                            .expect("failed to send ZMQ test event");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for listener event");
+
+        let summary: Vec<String> = event_batch
+            .iter()
+            .map(|placement| match &placement.event.data {
+                KvCacheEventData::HybridKeysStored(data) => format!(
+                    "H+{:?}{:?}",
+                    data.group,
+                    data.hashes.iter().map(|h| h.0).collect::<Vec<_>>()
+                ),
+                KvCacheEventData::HybridKeysRemoved(data) => format!(
+                    "H-{:?}{:?}",
+                    data.group,
+                    data.hashes.iter().map(|h| h.0).collect::<Vec<_>>()
+                ),
+                KvCacheEventData::Stored(data) => format!(
+                    "S{:?}",
+                    data.blocks
+                        .iter()
+                        .map(|b| b.block_hash.0)
+                        .collect::<Vec<_>>()
+                ),
+                KvCacheEventData::Removed(data) => format!(
+                    "R{:?}",
+                    data.block_hashes.iter().map(|h| h.0).collect::<Vec<_>>()
+                ),
+                KvCacheEventData::Cleared => "C".to_string(),
+            })
+            .collect();
+        // The block path still converts the non-router-block tail into its (pre-existing)
+        // empty store; the probe path is what carries the tail's terminal key.
+        assert_eq!(
+            summary,
+            vec![
+                "H+Recurrent[41]",
+                "H+FullAttention[42]",
+                "S[42]",
+                "H+FullAttention[44]",
+                "S[]",
+                "H-FullAttention[42]",
+                "H-Recurrent[42]",
+                "R[42]",
+            ],
+            "hybrid key events precede the block event derived from the same raw event"
+        );
+        let ids: Vec<u64> = event_batch.iter().map(|p| p.event.event_id).collect();
+        assert_eq!(
+            ids,
+            (0..8).collect::<Vec<_>>(),
+            "every emitted event gets its own id"
+        );
+        assert!(
+            event_batch
+                .iter()
+                .all(|p| p.placement.tier == StorageTier::Device && p.event.dp_rank == 0)
+        );
+        let router_events: Vec<_> = event_batch
+            .iter()
+            .cloned()
+            .filter_map(PlacementEvent::into_router_event)
+            .collect();
+        assert_eq!(
+            router_events.iter().filter(|e| e.is_hybrid_keys()).count(),
+            5
+        );
+
+        token.cancel();
+        let _ = listener_handle.await;
+    }
+
     /// Unknown media (e.g. vLLM 0.26.0 `FS`) must be filtered in `preprocess`, not
     /// dropped later in conversion. A conversion-time drop would still burn a
     /// next_event_id (the listener increments it before `normalize_preprocessed`),
@@ -1425,6 +1599,7 @@ mod tests_startup_helpers {
                 token,
                 4,
                 Arc::new(AtomicU64::new(0)),
+                None,
                 None,
                 None,
             )
@@ -1526,6 +1701,7 @@ mod tests_startup_helpers {
                 Arc::new(AtomicU64::new(0)),
                 None,
                 None,
+                None,
             )
         });
 
@@ -1608,7 +1784,18 @@ mod tests_startup_helpers {
         let listener_handle = tokio::spawn({
             let token = token.clone();
             let endpoint = endpoint.clone();
-            start_zmq_listener(endpoint, topic, 1, tx, token, 4, next_event_id, None, None)
+            start_zmq_listener(
+                endpoint,
+                topic,
+                1,
+                tx,
+                token,
+                4,
+                next_event_id,
+                None,
+                None,
+                None,
+            )
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;

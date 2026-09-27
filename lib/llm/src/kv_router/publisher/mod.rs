@@ -151,6 +151,7 @@ impl KvEventSource {
                             next_event_id,
                             image_token_id,
                             video_token_id,
+                            zmq_listener::hybrid_hash_unit_from_env(),
                         ));
                 let listener_abort_handle = listener_handle.abort_handle();
                 let supervisor_handle =

@@ -3766,6 +3766,7 @@ policy_classes:
                         (WorkerWithDpRank::new(0, 0), 16),
                         (WorkerWithDpRank::new(1, 0), 144),
                     ]),
+                    tier_overlap_tokens: None,
                 },
             },
         });
@@ -3858,6 +3859,7 @@ policy_classes:
                     tier_overlap_blocks: Default::default(),
                     effective_overlap_blocks: HashMap::from([(worker, 5.0)]),
                     effective_cached_tokens: HashMap::from([(worker, 80)]),
+                    tier_overlap_tokens: None,
                 },
             },
         });
@@ -3902,6 +3904,7 @@ policy_classes:
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::from([(worker, 7.0)]),
                 effective_cached_tokens: HashMap::from([(worker, 56)]),
+                tier_overlap_tokens: None,
             },
         )));
         let (queue, slots) = make_queue_with_blocking_refresher(

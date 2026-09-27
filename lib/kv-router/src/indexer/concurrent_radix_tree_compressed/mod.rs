@@ -239,6 +239,10 @@ impl ConcurrentRadixTreeCompressed {
                 self.erase_worker_coverage(lookup, WorkerRemovalTarget::DpRank(worker), true);
                 Ok(())
             }
+            // Hybrid-probe keys are not block events; the dispatcher routes them elsewhere.
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {
+                Ok(())
+            }
         }
     }
 }

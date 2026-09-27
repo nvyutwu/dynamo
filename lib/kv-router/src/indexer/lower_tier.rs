@@ -554,6 +554,10 @@ impl LowerTierIndexer {
                 self.remove_blocks_impl(worker_blocks, owner, &remove_data.block_hashes)
             }
             KvCacheEventData::Cleared => unreachable!("Cleared returned above"),
+            // Hybrid-probe keys carry no block lineage; they belong to the hybrid probe index.
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {
+                Ok(())
+            }
         }
     }
 

@@ -301,6 +301,10 @@ impl ConcurrentRadixTree {
                 self.remove_worker_dp_rank(lookup, worker.worker_id, worker.dp_rank);
                 Ok(())
             }
+            // Hybrid-probe keys are not block events; the dispatcher routes them elsewhere.
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {
+                Ok(())
+            }
         }
     }
 

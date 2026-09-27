@@ -573,6 +573,8 @@ impl DcCkfState {
                     retain_first_error(&mut first_error, error);
                 }
             }
+            // Hybrid-probe keys are not block events; the dispatcher routes them elsewhere.
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {}
         }
         self.telemetry.unknown_removals = self
             .telemetry

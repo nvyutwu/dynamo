@@ -19,12 +19,23 @@ pub struct CacheHitEstimates {
     pub cached_tokens: FxHashMap<WorkerWithDpRank, usize>,
 }
 
+/// Token-precise per-tier overlap for indexes that resolve reuse below block granularity
+/// (the hybrid engine-hash probe). Absent when the block-granular tiers are exact.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierOverlapTokens {
+    pub device: FxHashMap<WorkerWithDpRank, usize>,
+    pub host_pinned: FxHashMap<WorkerWithDpRank, usize>,
+}
+
 /// Compact overlap state retained while a request waits for scheduling.
 #[derive(Debug, Clone, Default)]
 pub struct OverlapSignals {
     pub tier_overlap_blocks: TierOverlapBlocks,
     pub effective_overlap_blocks: HashMap<WorkerWithDpRank, f64>,
     pub effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
+    /// Sub-block precision for the device and host tiers when the index provides it; worker
+    /// selection prefers it over `tier_overlap_blocks` so a partial-tail hit keeps its value.
+    pub tier_overlap_tokens: Option<TierOverlapTokens>,
 }
 
 impl OverlapSignals {
@@ -143,6 +154,7 @@ impl<'a> OverlapAnalysis<'a> {
             tier_overlap_blocks: tier_overlap_blocks_from_tiered_matches(self.tiered),
             effective_overlap_blocks: estimates.effective_overlap_blocks.into_iter().collect(),
             effective_cached_tokens: estimates.cached_tokens.into_iter().collect(),
+            tier_overlap_tokens: None,
         }
     }
 

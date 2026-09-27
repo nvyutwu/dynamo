@@ -312,6 +312,11 @@ fn convert_to_zmq_events(
             }]
         }
         KvCacheEventData::Cleared => vec![],
+        // Hybrid key events have no raw vLLM shape; the publisher derives them from the raw
+        // stream, so replay does not re-emit them.
+        KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {
+            Vec::new()
+        }
     }
 }
 

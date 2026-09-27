@@ -200,6 +200,9 @@ fn log_env_config(config: &KvRouterConfig) {
         disk_cache_hit_weight = config.disk_cache_hit_weight,
         router_prefill_load_model = %config.router_prefill_load_model,
         router_approximate_cache_policy = %config.router_approximate_cache_policy,
+        router_hybrid_engine_hash_index = config.router_hybrid_engine_hash_index,
+        router_hybrid_hash_algo = %config.router_hybrid_hash_algo,
+        router_hybrid_hash_unit = config.router_hybrid_hash_unit,
         "KvRouterConfig initialized (DYN_* env overrides applied)"
     );
 }
@@ -328,6 +331,18 @@ fn kv_router_config_from_lookup(
     }
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_PREDICTED_TTL_SECS") {
         config.router_predicted_ttl_secs = Some(value);
+    }
+    if let Some(value) = parse_bool(&get_env, "DYN_ROUTER_HYBRID_ENGINE_HASH_INDEX") {
+        config.router_hybrid_engine_hash_index = value;
+    }
+    if let Some(value) = get_env("DYN_ROUTER_HYBRID_HASH_ALGO") {
+        config.router_hybrid_hash_algo = value.parse()?;
+    }
+    if let Some(value) = get_env("DYN_ROUTER_HYBRID_NONE_HASH_SEED") {
+        config.router_hybrid_none_hash_seed = Some(value);
+    }
+    if let Some(value) = parse_u32(&get_env, "DYN_ROUTER_HYBRID_HASH_UNIT") {
+        config.router_hybrid_hash_unit = value;
     }
     if let Some(value) = get_env(DYN_ROUTER_APPROXIMATE_CACHE_POLICY) {
         config.router_approximate_cache_policy = value.parse()?;
@@ -691,6 +706,10 @@ struct KvRouterConfigSerde {
     conditional_disagg_eff_isl_ratio_threshold: f64,
     conditional_disagg_prefill_busy_threshold: Option<f64>,
     conditional_disagg_decode_busy_threshold: Option<f64>,
+    router_hybrid_engine_hash_index: bool,
+    router_hybrid_hash_algo: crate::indexer::EngineHashAlgo,
+    router_hybrid_none_hash_seed: Option<String>,
+    router_hybrid_hash_unit: u32,
 }
 
 impl Default for KvRouterConfigSerde {
@@ -738,6 +757,10 @@ impl Default for KvRouterConfigSerde {
                 .conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold: config
                 .conditional_disagg_decode_busy_threshold,
+            router_hybrid_engine_hash_index: config.router_hybrid_engine_hash_index,
+            router_hybrid_hash_algo: config.router_hybrid_hash_algo,
+            router_hybrid_none_hash_seed: config.router_hybrid_none_hash_seed,
+            router_hybrid_hash_unit: config.router_hybrid_hash_unit,
         }
     }
 }
@@ -925,6 +948,38 @@ pub struct KvRouterConfig {
     /// the guard is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditional_disagg_decode_busy_threshold: Option<f64>,
+
+    /// Route hybrid-attention models (full attention + recurrent layers) with the engine-hash
+    /// probe index instead of the full-attention radix tree. Requires the worker publisher to
+    /// emit hybrid keys (`DYN_KV_EVENTS_HYBRID_KEYS=1`) and the engine to hash with an
+    /// algorithm the frontend can reproduce (`--prefix-caching-hash-algo sha256_cbor`).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub router_hybrid_engine_hash_index: bool,
+
+    /// Engine `--prefix-caching-hash-algo` the frontend reproduces for the probe.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub router_hybrid_hash_algo: crate::indexer::EngineHashAlgo,
+
+    /// Seed vLLM derived `NONE_HASH` from (`PYTHONHASHSEED` on the engine when set). `None`
+    /// uses vLLM's fixed default for the cryptographic algorithms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_hybrid_none_hash_seed: Option<String>,
+
+    /// Engine `--prefix-match-unit` in tokens: the granularity of announced keys and of the
+    /// probe. Must divide the router block size.
+    #[serde(
+        default = "default_hybrid_hash_unit",
+        skip_serializing_if = "is_default_hybrid_hash_unit"
+    )]
+    pub router_hybrid_hash_unit: u32,
+}
+
+fn default_hybrid_hash_unit() -> u32 {
+    128
+}
+
+fn is_default_hybrid_hash_unit(value: &u32) -> bool {
+    *value == default_hybrid_hash_unit()
 }
 
 fn default_conditional_disagg_eff_isl_threshold() -> usize {
@@ -986,6 +1041,10 @@ impl Default for KvRouterConfig {
                 default_conditional_disagg_eff_isl_ratio_threshold(),
             conditional_disagg_prefill_busy_threshold: None,
             conditional_disagg_decode_busy_threshold: None,
+            router_hybrid_engine_hash_index: false,
+            router_hybrid_hash_algo: crate::indexer::EngineHashAlgo::default(),
+            router_hybrid_none_hash_seed: None,
+            router_hybrid_hash_unit: default_hybrid_hash_unit(),
         }
     }
 }
@@ -1052,6 +1111,10 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
                 .conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold: compat
                 .conditional_disagg_decode_busy_threshold,
+            router_hybrid_engine_hash_index: compat.router_hybrid_engine_hash_index,
+            router_hybrid_hash_algo: compat.router_hybrid_hash_algo,
+            router_hybrid_none_hash_seed: compat.router_hybrid_none_hash_seed,
+            router_hybrid_hash_unit: compat.router_hybrid_hash_unit,
         };
         config.validate()?;
         Ok(config)
@@ -1082,6 +1145,20 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
     }
     if config.router_predicted_ttl_secs.is_some() && !config.use_kv_events {
         return Err("router_predicted_ttl_secs requires use_kv_events=true".to_string());
+    }
+    if config.router_hybrid_engine_hash_index {
+        if !config.use_kv_events {
+            return Err("router_hybrid_engine_hash_index requires use_kv_events=true".to_string());
+        }
+        if config.use_remote_indexer {
+            return Err(
+                "router_hybrid_engine_hash_index is not supported with use_remote_indexer"
+                    .to_string(),
+            );
+        }
+        if config.router_hybrid_hash_unit == 0 {
+            return Err("router_hybrid_hash_unit must be positive".to_string());
+        }
     }
     if config.use_kv_events
         && config.router_approximate_cache_policy == ApproximateCachePolicyKind::Lru
@@ -1588,6 +1665,62 @@ mod tests {
     fn try_config_from_values(values: &[(&str, &str)]) -> Result<KvRouterConfig, String> {
         let values: HashMap<&str, &str> = values.iter().copied().collect();
         kv_router_config_from_lookup(|key| values.get(key).map(|value| (*value).to_string()))
+    }
+
+    #[test]
+    fn hybrid_engine_hash_index_env_parses_and_validates() {
+        let config = config_from_values(&[
+            ("DYN_ROUTER_HYBRID_ENGINE_HASH_INDEX", "1"),
+            ("DYN_ROUTER_HYBRID_HASH_ALGO", "xxhash_cbor"),
+            ("DYN_ROUTER_HYBRID_NONE_HASH_SEED", "0123abcd"),
+            ("DYN_ROUTER_HYBRID_HASH_UNIT", "256"),
+        ]);
+        assert!(config.router_hybrid_engine_hash_index);
+        assert_eq!(
+            config.router_hybrid_hash_algo,
+            crate::indexer::EngineHashAlgo::XxhashCbor
+        );
+        assert_eq!(
+            config.router_hybrid_none_hash_seed.as_deref(),
+            Some("0123abcd")
+        );
+        assert_eq!(config.router_hybrid_hash_unit, 256);
+
+        let defaults = KvRouterConfig::default();
+        assert!(!defaults.router_hybrid_engine_hash_index);
+        assert_eq!(
+            defaults.router_hybrid_hash_algo,
+            crate::indexer::EngineHashAlgo::Sha256Cbor
+        );
+        assert_eq!(defaults.router_hybrid_hash_unit, 128);
+        // Defaults stay off the wire so model cards are byte-identical to older releases.
+        let card = serde_json::to_string(&defaults).unwrap();
+        assert!(!card.contains("router_hybrid"));
+        let card = serde_json::to_string(&config).unwrap();
+        assert!(card.contains("\"router_hybrid_engine_hash_index\":true"));
+        let round_trip: KvRouterConfig = serde_json::from_str(&card).unwrap();
+        assert_eq!(round_trip.router_hybrid_hash_unit, 256);
+
+        assert!(
+            try_config_from_values(&[("DYN_ROUTER_HYBRID_HASH_ALGO", "sha256")])
+                .unwrap_err()
+                .contains("sha256_cbor")
+        );
+        let invalid = config_from_values(&[
+            ("DYN_ROUTER_HYBRID_ENGINE_HASH_INDEX", "true"),
+            ("DYN_USE_REMOTE_INDEXER", "true"),
+        ]);
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("use_remote_indexer")
+        );
+        let invalid = config_from_values(&[
+            ("DYN_ROUTER_HYBRID_ENGINE_HASH_INDEX", "true"),
+            ("DYN_ROUTER_USE_KV_EVENTS", "false"),
+        ]);
+        assert!(invalid.validate().unwrap_err().contains("use_kv_events"));
     }
 
     #[test]

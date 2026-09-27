@@ -808,6 +808,14 @@ impl<S: AsyncShardHandle> KvIndexerInterface for BranchShardedIndexer<S> {
                     shard.as_ref().apply_event(event.clone()).await;
                 }
             }
+            // Hybrid-probe keys are not block events; the dispatcher keeps them out of the
+            // sharded tree and this is only reached by direct callers.
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {
+                tracing::debug!(
+                    worker_id = event.worker_id,
+                    "ignoring hybrid key event on the branch-sharded indexer"
+                );
+            }
         }
     }
 

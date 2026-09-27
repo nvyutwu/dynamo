@@ -625,6 +625,7 @@ mod tests {
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
+                tier_overlap_tokens: None,
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,

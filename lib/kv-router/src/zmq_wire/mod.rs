@@ -19,9 +19,12 @@ mod convert;
 mod deserialize;
 mod extra_keys;
 mod filter;
+mod hybrid;
 #[cfg(test)]
 mod tests;
 mod types;
+
+pub use hybrid::{HybridKeyEvent, HybridKeyOp, hybrid_group_for_kind};
 
 pub use convert::{
     StoredBlockOptions, convert_event, create_stored_block_from_parts, create_stored_blocks,
@@ -55,6 +58,8 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    /// Engine `prefix_match_unit` when hybrid key extraction (`hybrid::hybrid_keys`) is on.
+    hybrid_hash_unit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +114,7 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            hybrid_hash_unit: None,
         }
     }
 
@@ -120,6 +126,7 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            hybrid_hash_unit: None,
         }
     }
 

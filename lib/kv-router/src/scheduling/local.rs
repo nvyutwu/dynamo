@@ -467,6 +467,7 @@ where
                 tier_overlap_blocks,
                 effective_overlap_blocks,
                 effective_cached_tokens,
+                tier_overlap_tokens: None,
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,

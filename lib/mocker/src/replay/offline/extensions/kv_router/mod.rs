@@ -82,6 +82,20 @@ impl KvEventSummary {
                 last: removed.block_hashes.last().copied(),
             },
             dynamo_kv_router::protocols::KvCacheEventData::Cleared => Self::Cleared,
+            dynamo_kv_router::protocols::KvCacheEventData::HybridKeysStored(data) => Self::Stored {
+                parent_hash: None,
+                start_position: None,
+                count: data.hashes.len(),
+                first: data.hashes.first().copied(),
+                last: data.hashes.last().copied(),
+            },
+            dynamo_kv_router::protocols::KvCacheEventData::HybridKeysRemoved(data) => {
+                Self::Removed {
+                    count: data.hashes.len(),
+                    first: data.hashes.first().copied(),
+                    last: data.hashes.last().copied(),
+                }
+            }
         }
     }
 }
@@ -296,6 +310,7 @@ impl PendingRequest {
                 tier_overlap_blocks: TierOverlapBlocks::default(),
                 effective_overlap_blocks,
                 effective_cached_tokens,
+                tier_overlap_tokens: None,
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,

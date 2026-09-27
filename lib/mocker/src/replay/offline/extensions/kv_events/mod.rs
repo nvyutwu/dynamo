@@ -80,7 +80,9 @@ impl ReplayEngineObservation for RouterEventObservation {
                     store.blocks.as_slice()
                 }
                 dynamo_kv_router::protocols::KvCacheEventData::Removed(_)
-                | dynamo_kv_router::protocols::KvCacheEventData::Cleared => &[],
+                | dynamo_kv_router::protocols::KvCacheEventData::Cleared
+                | dynamo_kv_router::protocols::KvCacheEventData::HybridKeysStored(_)
+                | dynamo_kv_router::protocols::KvCacheEventData::HybridKeysRemoved(_) => &[],
             })
             .map(|block| block.tokens_hash.0)
             .collect()
@@ -149,6 +151,11 @@ fn encode_events(
                 }
             }
             KvCacheEventData::Cleared => encoder.begin_kind(2, "cleared"),
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {
+                anyhow::bail!(
+                    "hybrid key events are not representable in the KV ingest replay format"
+                )
+            }
         }
     }
     Ok(())

@@ -1381,6 +1381,38 @@ pub enum KvCacheEventData {
     /// This is ordered only within that rank publisher's event sequence. Worker-wide removal is
     /// a separate serving-membership lifecycle operation.
     Cleared,
+    /// Engine prefix-chain keys announced for one hybrid cache group in the event's storage
+    /// tier. Consumed only by the hybrid probe index (`indexer::HybridProbeIndex`); no radix or
+    /// lower-tier index reads it. Emitted only when the worker publisher enables hybrid keys,
+    /// so legacy consumers never receive it.
+    HybridKeysStored(HybridKeysData),
+    /// Engine prefix-chain keys that left the event's storage tier.
+    HybridKeysRemoved(HybridKeysData),
+}
+
+impl KvCacheEventData {
+    /// True for the hybrid-probe key events, which bypass every block index.
+    pub fn is_hybrid_keys(&self) -> bool {
+        matches!(self, Self::HybridKeysStored(_) | Self::HybridKeysRemoved(_))
+    }
+}
+
+/// Cache group of a hybrid-attention engine, as seen by the hybrid probe index.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HybridCacheGroup {
+    /// Full or MLA attention layers: dense blocks, one key per block boundary.
+    FullAttention,
+    /// Recurrent (Mamba / KDA) layers: a key only where a resume state was kept.
+    Recurrent,
+}
+
+/// Payload of [`KvCacheEventData::HybridKeysStored`] and [`KvCacheEventData::HybridKeysRemoved`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HybridKeysData {
+    pub group: HybridCacheGroup,
+    /// Engine prefix-chain hashes as published on the wire (low 64 bits of the digest).
+    pub hashes: Vec<ExternalSequenceBlockHash>,
 }
 
 /// Represents the data associated with a stored cache event.
@@ -1753,6 +1785,9 @@ impl RouterEvent {
         &self,
         tier: StorageTier,
     ) -> Result<bool, UnsupportedResidencyDomain> {
+        if self.is_hybrid_keys() {
+            return Ok(false);
+        }
         let Some(_scope) = self.reset_scope()? else {
             self.resolved_residency_domain()?;
             return Ok(self.storage_tier == tier);
@@ -1762,7 +1797,16 @@ impl RouterEvent {
         Ok(!self.clears_single_tier() || self.storage_tier == tier)
     }
 
+    /// True for hybrid-probe key events; they bypass every radix and lower-tier index and are
+    /// applied only to the hybrid probe index.
+    pub fn is_hybrid_keys(&self) -> bool {
+        self.event.data.is_hybrid_keys()
+    }
+
     pub fn targets_primary(&self) -> Result<bool, UnsupportedResidencyDomain> {
+        if self.is_hybrid_keys() {
+            return Ok(false);
+        }
         if let Some(scope) = self.reset_scope()? {
             if matches!(scope, ResetScope::Domain(ResidencyDomain::CacheOwner)) {
                 // A cache owner holds no device residency, so a device-scoped clear in

@@ -86,7 +86,10 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                     );
 
                     match &placement_event.event.data {
-                        KvCacheEventData::Removed(_) | KvCacheEventData::Stored(_) => {
+                        KvCacheEventData::Removed(_)
+                        | KvCacheEventData::Stored(_)
+                        | KvCacheEventData::HybridKeysStored(_)
+                        | KvCacheEventData::HybridKeysRemoved(_) => {
                             batching_state
                                 .push(
                                     placement_event,

@@ -389,15 +389,35 @@ impl<'a> MaterializedSelectionInput<'a> {
         };
         let cache = if inputs.contains(WorkerInputs::CACHE) {
             let effective_overlap_blocks = self.request.effective_overlap_blocks_for(worker);
-            let reported_device_overlap_blocks = self
-                .request
-                .overlap
-                .tier_overlap_blocks
-                .device
-                .get(&worker)
-                .copied()
-                .map(|blocks| blocks as f64)
-                .unwrap_or(0.0);
+            // Token-precise tiers (hybrid probe) win over block counts so a partial-tail hit
+            // keeps its fractional value in the cache ratio.
+            let block_tokens = f64::from(self.context.block_size.max(1));
+            let overlap_tokens = self.request.overlap.tier_overlap_tokens.as_ref();
+            let reported_device_overlap_blocks =
+                match overlap_tokens.and_then(|tokens| tokens.device.get(&worker)) {
+                    Some(device_tokens) => *device_tokens as f64 / block_tokens,
+                    None => self
+                        .request
+                        .overlap
+                        .tier_overlap_blocks
+                        .device
+                        .get(&worker)
+                        .copied()
+                        .map(|blocks| blocks as f64)
+                        .unwrap_or(0.0),
+                };
+            let host_overlap_blocks =
+                match overlap_tokens.and_then(|tokens| tokens.host_pinned.get(&worker)) {
+                    Some(host_tokens) => *host_tokens as f64 / block_tokens,
+                    None => self
+                        .request
+                        .overlap
+                        .tier_overlap_blocks
+                        .host_pinned
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0) as f64,
+                };
             let device_overlap_blocks =
                 select_device_overlap(effective_overlap_blocks, reported_device_overlap_blocks);
             let shared_beyond = |device_blocks: f64| {
@@ -409,14 +429,7 @@ impl<'a> MaterializedSelectionInput<'a> {
             WorkerCacheInput {
                 effective_overlap_blocks,
                 device_overlap_blocks,
-                host_overlap_blocks: self
-                    .request
-                    .overlap
-                    .tier_overlap_blocks
-                    .host_pinned
-                    .get(&worker)
-                    .copied()
-                    .unwrap_or(0) as f64,
+                host_overlap_blocks,
                 disk_overlap_blocks: self
                     .request
                     .overlap
@@ -732,6 +745,7 @@ mod test_support {
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::default(),
                 effective_cached_tokens: HashMap::default(),
+                tier_overlap_tokens: None,
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
@@ -812,6 +826,41 @@ mod worker_stage_tests {
         input.row(second, None, WorkerInputs::NONE);
 
         assert_eq!(input.max_raw_cached_tokens(), Some(96));
+    }
+
+    #[test]
+    fn token_precise_tiers_override_block_counts_in_cache_inputs() {
+        let mut request = base_request(24_600);
+        let worker = WorkerWithDpRank::from_worker_id(1);
+        request.overlap.tier_overlap_blocks.device.insert(worker, 1);
+        request.overlap.effective_overlap_blocks.insert(worker, 2.0);
+        let mut tokens = crate::scheduling::overlap::TierOverlapTokens::default();
+        tokens.device.insert(worker, 24_192);
+        tokens.host_pinned.insert(worker, 1_536);
+        request.overlap.tier_overlap_tokens = Some(tokens);
+        let input = MaterializedSelectionInput::new_with_worker_stage_tracking(
+            &request,
+            12_288,
+            weights(),
+            false,
+        );
+
+        let candidate = input.row(worker, None, WorkerInputs::CACHE);
+
+        // 24,192 device tokens are 1.97 blocks, not the 1 whole block the tier map reports.
+        assert!((candidate.cache.device_overlap_blocks - 24_192.0 / 12_288.0).abs() < 1e-9);
+        assert!((candidate.cache.host_overlap_blocks - 1_536.0 / 12_288.0).abs() < 1e-9);
+
+        request.overlap.tier_overlap_tokens = None;
+        let input = MaterializedSelectionInput::new_with_worker_stage_tracking(
+            &request,
+            12_288,
+            weights(),
+            false,
+        );
+        let candidate = input.row(worker, None, WorkerInputs::CACHE);
+        assert_eq!(candidate.cache.device_overlap_blocks, 1.0);
+        assert_eq!(candidate.cache.host_overlap_blocks, 0.0);
     }
 
     #[test]

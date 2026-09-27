@@ -14,7 +14,9 @@ use dynamo_kv_router::{
     SharedKvCache, TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope,
     config::{KvRouterConfig, RouterConfigOverride, min_initial_workers_from_env},
     indexer::{
-        ApproximateLruIncarnation, ApproximateLruStats, KvRouterError, RoutingDecisionHashes,
+        ApproximateLruIncarnation, ApproximateLruStats, DEFAULT_NONE_HASH_SEED, EngineChainHasher,
+        HybridHit, KvRouterError, LowerTierMatchDetails, MatchDetails, RoutingDecisionHashes,
+        TieredMatchDetails,
     },
     kv_hints::{
         KvHint, KvHintAction, KvSourceLocationsPayload, KvTransferCandidateSource,
@@ -22,14 +24,18 @@ use dynamo_kv_router::{
     },
     protocols::KV_EVENT_SUBJECT,
     protocols::{
-        BlockExtraInfo, BlockHashOptions, LocalBlockHash, PrefillLoadHint, RouterEvent,
-        RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike,
-        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+        BlockExtraInfo, BlockHashOptions, LocalBlockHash, OverlapScores, PrefillLoadHint,
+        RouterEvent, RouterRequest, RouterResponse, RoutingConstraints, StorageTier,
+        TokensWithHashes, WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     scheduling::{
         AdmissionAttempt, AttemptId, CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider,
         ScheduleMode, ScheduleRequest, TieredOverlapRefresher, WorkerAvailabilityProvider,
-        effective_prefill_tokens, overlap::cache_hit_estimates_from_tiered_matches,
+        effective_prefill_tokens,
+        overlap::{
+            OverlapSignals, TierOverlapTokens, cache_hit_estimates_from_tiered_matches,
+            tier_overlap_blocks_from_tiered_matches,
+        },
     },
     selector::WorkerInputs,
 };
@@ -569,6 +575,63 @@ pub fn router_discovery_query(namespace: String, component: String) -> Discovery
     }
 }
 
+/// Turn hybrid-probe hits into the scheduler's two overlap views.
+///
+/// `TieredMatchDetails` keeps whole router blocks (the shape metrics, the scores endpoint and
+/// KV-transfer hints expect), while `OverlapSignals` carries the token-precise device and host
+/// hits so worker selection sees partial-tail reuse at hash-unit resolution.
+fn hybrid_overlap_from_hits(
+    hits: impl IntoIterator<Item = (WorkerWithDpRank, HybridHit)>,
+    block_size: u32,
+    host_cache_hit_weight: f64,
+) -> (TieredMatchDetails, OverlapSignals) {
+    let block = block_size.max(1) as usize;
+    let mut device = OverlapScores::new();
+    let mut host = LowerTierMatchDetails::default();
+    let mut tokens = TierOverlapTokens::default();
+    let mut overlap = OverlapSignals::default();
+    for (worker, hit) in hits {
+        let device_blocks = hit.device_tokens / block;
+        if device_blocks > 0 {
+            device
+                .scores
+                .insert(worker, u32::try_from(device_blocks).unwrap_or(u32::MAX));
+        }
+        let host_blocks = hit.host_tokens / block;
+        if host_blocks > 0 {
+            host.hits.insert(worker, host_blocks);
+        }
+        if hit.device_tokens > 0 {
+            tokens.device.insert(worker, hit.device_tokens);
+        }
+        if hit.host_tokens > 0 {
+            tokens.host_pinned.insert(worker, hit.host_tokens);
+        }
+        let effective_tokens =
+            hit.device_tokens as f64 + host_cache_hit_weight * hit.host_tokens as f64;
+        overlap
+            .effective_overlap_blocks
+            .insert(worker, effective_tokens / block as f64);
+        overlap
+            .effective_cached_tokens
+            .insert(worker, effective_tokens.round().max(0.0) as usize);
+    }
+    let mut lower_tier = HashMap::new();
+    if !host.hits.is_empty() {
+        lower_tier.insert(StorageTier::HostPinned, host);
+    }
+    let tiered = TieredMatchDetails {
+        device: MatchDetails {
+            overlap_scores: device,
+            ..Default::default()
+        },
+        lower_tier,
+    };
+    overlap.tier_overlap_blocks = tier_overlap_blocks_from_tiered_matches(&tiered);
+    overlap.tier_overlap_tokens = Some(tokens);
+    (tiered, overlap)
+}
+
 /// A KvRouter only decides which worker you should use. It doesn't send you there.
 /// TODO: Rename this to indicate it only selects a worker, it does not route.
 pub struct KvRouter<Sel = DefaultWorkerSelector>
@@ -594,6 +657,9 @@ where
     /// Optional external shared KV cache pool. When present, `find_best_match`
     /// queries it in parallel with the indexer and factors shared hits into scoring.
     shared_cache: Option<Box<dyn SharedKvCache>>,
+    /// Reproduces the engine's prefix-chain hash for the hybrid probe index
+    /// (`router_hybrid_engine_hash_index`). `None` routes through the radix path.
+    hybrid_hasher: Option<EngineChainHasher>,
     /// Optional LoRA filter. When present (LoRA serving enabled), candidate workers are
     /// narrowed to the LoRA's allocated/loaded replicas inside `find_best_match_details`,
     /// covering both the decode and prefill routers (both built via `kv_chooser_for`).
@@ -727,6 +793,15 @@ where
         };
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate().map_err(anyhow::Error::msg)?;
+        let hybrid_hasher = kv_router_config.router_hybrid_engine_hash_index.then(|| {
+            EngineChainHasher::new(
+                kv_router_config.router_hybrid_hash_algo,
+                kv_router_config
+                    .router_hybrid_none_hash_seed
+                    .as_deref()
+                    .unwrap_or(DEFAULT_NONE_HASH_SEED),
+            )
+        });
         let tracking_hash = TrackingHashContext::from_config(&kv_router_config)?;
         let tracking_model_name =
             resolve_tracking_model_name(tracking_hash.algorithm(), model_name.as_deref())?;
@@ -912,6 +987,7 @@ where
             request_leases,
             _served_indexer_handle: served_indexer_handle,
             shared_cache,
+            hybrid_hasher,
             lora_filter,
             endpoint_registration: None,
             teardown_task_guard: None,
@@ -1657,25 +1733,82 @@ where
             });
         }
 
-        let TieredLookupResult {
+        // Hybrid-attention models route on the engine's own prefix-chain hashes (D3): the
+        // radix tree sees only the full-attention group and mis-credits every boundary where
+        // the recurrent state is missing. Requests with extra hash keys (LoRA, cache salt,
+        // multimodal) are not reproducible on the frontend and keep the radix path.
+        let hybrid_probe = self
+            .hybrid_hasher
+            .as_ref()
+            .zip(self.indexer.hybrid())
+            .filter(|_| {
+                block_mm_infos.is_none() && lora_name.is_none() && cache_namespace.is_none()
+            });
+        let (
             tiered_matches,
             shared_cache_hits,
             indexer_duration,
             shared_cache_duration,
             retained_block_hashes,
-        } = query_tiered_matches(
-            &self.indexer,
-            self.shared_cache.as_deref(),
-            tokens,
-            self.block_size,
-            block_hashes,
-            TieredLookupOptions {
-                cache_namespace: cache_namespace.as_deref(),
-                retain_block_hashes,
-                retain_kv_transfer_chain,
-            },
-        )
-        .await?;
+            hybrid_overlap,
+        ) = match hybrid_probe {
+            Some((hasher, hybrid)) => {
+                let lookup_start = Instant::now();
+                let chain = tracing::info_span!("kv_router.compute_engine_chain")
+                    .in_scope(|| hasher.chain_keys(tokens, hybrid.hash_unit()));
+                let hits = hybrid.lookup(&chain, tokens.len());
+                let (tiered, overlap) = hybrid_overlap_from_hits(
+                    hits,
+                    self.block_size,
+                    self.kv_router_config.host_cache_hit_weight,
+                );
+                if self.shared_cache.is_some() {
+                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    WARN_ONCE.call_once(|| {
+                        tracing::warn!(
+                            "shared cache scoring is not applied to hybrid-probe routed requests"
+                        );
+                    });
+                }
+                (
+                    tiered,
+                    None,
+                    lookup_start.elapsed(),
+                    None,
+                    retain_block_hashes.then_some(block_hashes),
+                    Some(overlap),
+                )
+            }
+            None => {
+                let TieredLookupResult {
+                    tiered_matches,
+                    shared_cache_hits,
+                    indexer_duration,
+                    shared_cache_duration,
+                    retained_block_hashes,
+                } = query_tiered_matches(
+                    &self.indexer,
+                    self.shared_cache.as_deref(),
+                    tokens,
+                    self.block_size,
+                    block_hashes,
+                    TieredLookupOptions {
+                        cache_namespace: cache_namespace.as_deref(),
+                        retain_block_hashes,
+                        retain_kv_transfer_chain,
+                    },
+                )
+                .await?;
+                (
+                    tiered_matches,
+                    shared_cache_hits,
+                    indexer_duration,
+                    shared_cache_duration,
+                    retained_block_hashes,
+                    None,
+                )
+            }
+        };
 
         let (block_hashes_for_refresh, routing_block_hashes) = retained_block_hashes
             .map(|block_hashes| {
@@ -1687,9 +1820,11 @@ where
             })
             .unwrap_or((None, None));
 
-        let overlap =
-            OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
-                .signals();
+        let overlap = match hybrid_overlap {
+            Some(overlap) => overlap,
+            None => OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
+                .signals(),
+        };
         let kv_transfer_candidates = retain_kv_transfer_chain
             .then(|| tiered_matches.kv_transfer_candidates().cloned())
             .flatten();

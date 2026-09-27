@@ -419,6 +419,8 @@ impl PoolCapacityTracker {
                 }
             }
             KvCacheEventData::Cleared => self.clear(member)?,
+            // Hybrid key events are not block residency; the CKF shadow ignores them.
+            KvCacheEventData::HybridKeysStored(_) | KvCacheEventData::HybridKeysRemoved(_) => {}
         }
         self.event_count = self
             .event_count

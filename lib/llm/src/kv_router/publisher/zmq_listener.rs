@@ -44,6 +44,60 @@ pub(super) fn decode_zmq_kv_batch(
     })
 }
 
+/// Wrap one hybrid key mutation as a placement event in the worker's tier.
+pub(super) fn hybrid_placement_event(
+    worker: WorkerWithDpRank,
+    event_id: u64,
+    key_event: HybridKeyEvent,
+) -> PlacementEvent {
+    let data = HybridKeysData {
+        group: key_event.group,
+        hashes: key_event
+            .hashes
+            .into_iter()
+            .map(ExternalSequenceBlockHash)
+            .collect(),
+    };
+    let data = match key_event.op {
+        HybridKeyOp::Stored => KvCacheEventData::HybridKeysStored(data),
+        HybridKeyOp::Removed => KvCacheEventData::HybridKeysRemoved(data),
+    };
+    PlacementEvent::new(
+        Placement::local_worker(worker.worker_id, worker.dp_rank, key_event.tier),
+        KvCacheEvent {
+            event_id,
+            data,
+            dp_rank: worker.dp_rank,
+        },
+    )
+}
+
+/// `DYN_KV_EVENTS_HYBRID_KEYS` enables hybrid key extraction on the worker publisher;
+/// `DYN_KV_EVENTS_HYBRID_HASH_UNIT` is the engine's `prefix_match_unit` (default 128).
+pub(super) fn hybrid_hash_unit_from_env() -> Option<u32> {
+    let enabled = std::env::var("DYN_KV_EVENTS_HYBRID_KEYS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let unit = std::env::var("DYN_KV_EVENTS_HYBRID_HASH_UNIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(128);
+    if unit == 0 {
+        tracing::warn!("DYN_KV_EVENTS_HYBRID_HASH_UNIT must be positive; hybrid keys disabled");
+        return None;
+    }
+    Some(unit)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn start_zmq_listener(
     zmq_endpoint: String,
@@ -55,16 +109,24 @@ pub(super) async fn start_zmq_listener(
     next_event_id: Arc<AtomicU64>,
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,
+    hybrid_hash_unit: Option<u32>,
 ) {
     tracing::debug!(
         "KVEventPublisher connecting to ZMQ endpoint {} (topic '{}')",
         zmq_endpoint,
         zmq_topic
     );
+    if let Some(unit) = hybrid_hash_unit {
+        tracing::info!(
+            hash_unit = unit,
+            "KVEventPublisher emitting hybrid engine-hash key events alongside block events"
+        );
+    }
 
     let mut normalizer = ZmqEventNormalizer::new(kv_block_size)
         .with_image_token_id(image_token_id)
-        .with_video_token_id(video_token_id);
+        .with_video_token_id(video_token_id)
+        .with_hybrid_keys(hybrid_hash_unit);
     let socket = match connect_sub_socket(&zmq_endpoint, Some(&zmq_topic)).await {
         Ok(socket) => socket,
         Err(error) => {
@@ -126,6 +188,18 @@ pub(super) async fn start_zmq_listener(
                         metrics.increment_zmq_event("received", event_type);
                     }
                     let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                    // Hybrid keys are read before the block filter below, which drops the
+                    // recurrent group and every non-router-block store the probe index needs.
+                    for key_event in normalizer.hybrid_keys(&raw_event, dp_rank) {
+                        if let Some(metrics) = &metrics {
+                            metrics.increment_zmq_event("hybrid_keys", event_type);
+                        }
+                        events.push(hybrid_placement_event(
+                            worker,
+                            next_event_id.fetch_add(1, Ordering::SeqCst),
+                            key_event,
+                        ));
+                    }
                     let raw_event = match normalizer.preprocess_with_reason(raw_event, worker) {
                         Ok(raw_event) => raw_event,
                         Err(reason) => {
@@ -171,4 +245,60 @@ pub(super) async fn start_zmq_listener(
         exit_reason,
         messages_processed
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_placement_event_carries_tier_group_and_keys() {
+        let worker = WorkerWithDpRank::new(3, 1);
+        let event = hybrid_placement_event(
+            worker,
+            42,
+            HybridKeyEvent {
+                tier: StorageTier::HostPinned,
+                group: HybridCacheGroup::Recurrent,
+                op: HybridKeyOp::Removed,
+                hashes: vec![5, 6],
+            },
+        );
+        assert_eq!(
+            event.placement,
+            Placement::local_worker(3, 1, StorageTier::HostPinned)
+        );
+        assert_eq!(event.event.event_id, 42);
+        assert_eq!(event.event.dp_rank, 1);
+        match &event.event.data {
+            KvCacheEventData::HybridKeysRemoved(data) => {
+                assert_eq!(data.group, HybridCacheGroup::Recurrent);
+                assert_eq!(
+                    data.hashes,
+                    vec![ExternalSequenceBlockHash(5), ExternalSequenceBlockHash(6)]
+                );
+            }
+            other => panic!("unexpected event data {other:?}"),
+        }
+        let router_event = event.into_router_event().unwrap();
+        assert!(router_event.is_hybrid_keys());
+        assert_eq!(router_event.storage_tier, StorageTier::HostPinned);
+        assert!(matches!(router_event.targets_primary(), Ok(false)));
+
+        let stored = hybrid_placement_event(
+            worker,
+            43,
+            HybridKeyEvent {
+                tier: StorageTier::Device,
+                group: HybridCacheGroup::FullAttention,
+                op: HybridKeyOp::Stored,
+                hashes: vec![9],
+            },
+        );
+        assert!(matches!(
+            stored.event.data,
+            KvCacheEventData::HybridKeysStored(_)
+        ));
+        assert!(stored.placement.is_local_gpu());
+    }
 }

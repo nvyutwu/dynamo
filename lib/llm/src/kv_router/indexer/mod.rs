@@ -9,9 +9,9 @@ use dynamo_kv_router::{
     approx::PruneConfig,
     config::{ApproximateCachePolicyKind, KvRouterConfig},
     indexer::{
-        ApproximateLruIncarnation, ApproximateLruStats, ApproximateRetentionConfig, KvIndexer,
-        KvIndexerInterface, KvIndexerMetrics, KvRouterError, LowerTierIndexers, ThreadPoolIndexer,
-        record_unsupported_residency_event,
+        ApproximateLruIncarnation, ApproximateLruStats, ApproximateRetentionConfig,
+        HybridProbeIndex, KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError,
+        LowerTierIndexers, ThreadPoolIndexer, record_unsupported_residency_event,
     },
     protocols::{
         DpRank, KvCacheEventData, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent,
@@ -69,12 +69,16 @@ pub enum Indexer {
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        /// Engine-hash probe index for hybrid-attention models
+        /// (`router_hybrid_engine_hash_index`). Fed by `HybridKeys*` events and clears.
+        hybrid: Option<Arc<HybridProbeIndex>>,
     },
     Concurrent {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        hybrid: Option<Arc<HybridProbeIndex>>,
     },
     Remote {
         primary: Arc<RemoteIndexer>,
@@ -153,7 +157,9 @@ impl Indexer {
     }
 
     pub(crate) fn supports_overlap_refresh(&self) -> bool {
-        matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. })
+        // The refresher only has local block hashes; hybrid-routed requests keep their
+        // enqueue-time engine-hash estimate rather than falling back to the radix view.
+        matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. }) && self.hybrid().is_none()
     }
 
     pub(crate) fn supports_kv_transfer_chain_retention(&self) -> bool {
@@ -197,6 +203,31 @@ impl Indexer {
                  do not combine a primary approximate indexer with a side approximate indexer"
             );
         }
+        let hybrid = if kv_router_config.router_hybrid_engine_hash_index {
+            if !kv_router_config.use_kv_events {
+                anyhow::bail!("router_hybrid_engine_hash_index requires use_kv_events=true");
+            }
+            if kv_router_config.use_remote_indexer {
+                anyhow::bail!(
+                    "router_hybrid_engine_hash_index is not supported with use_remote_indexer"
+                );
+            }
+            let unit = kv_router_config.router_hybrid_hash_unit;
+            if unit == 0 || block_size % unit != 0 {
+                anyhow::bail!(
+                    "router_hybrid_hash_unit ({unit}) must be a positive divisor of the router block size ({block_size})"
+                );
+            }
+            tracing::info!(
+                block_size,
+                hash_unit = unit,
+                hash_algo = %kv_router_config.router_hybrid_hash_algo,
+                "Hybrid engine-hash probe index enabled"
+            );
+            Some(Arc::new(HybridProbeIndex::new(block_size, unit)))
+        } else {
+            None
+        };
         if kv_router_config.use_remote_indexer {
             let model_name = model_name
                 .ok_or_else(|| {
@@ -257,6 +288,7 @@ impl Indexer {
                     ),
                     approx: None,
                     primary_records_routing_decisions: true,
+                    hybrid,
                 });
             }
 
@@ -274,6 +306,7 @@ impl Indexer {
                 ),
                 approx: None,
                 primary_records_routing_decisions: true,
+                hybrid,
             });
         }
 
@@ -300,6 +333,7 @@ impl Indexer {
                 ),
                 approx,
                 primary_records_routing_decisions: false,
+                hybrid,
             });
         }
 
@@ -318,7 +352,46 @@ impl Indexer {
             ),
             approx,
             primary_records_routing_decisions: false,
+            hybrid,
         })
+    }
+
+    /// The hybrid engine-hash probe index, when `router_hybrid_engine_hash_index` is on.
+    pub(crate) fn hybrid(&self) -> Option<&Arc<HybridProbeIndex>> {
+        match self {
+            Self::KvIndexer { hybrid, .. } | Self::Concurrent { hybrid, .. } => hybrid.as_ref(),
+            Self::Remote { .. } | Self::None => None,
+        }
+    }
+
+    /// Apply a hybrid key event, or mirror a clear onto the probe index. Returns `true` when
+    /// the event was a hybrid key event (and therefore fully handled here).
+    fn apply_hybrid_event(&self, event: &RouterEvent) -> bool {
+        let Some(hybrid) = self.hybrid() else {
+            return event.is_hybrid_keys();
+        };
+        let worker = dynamo_kv_router::protocols::WorkerWithDpRank::new(
+            event.worker_id,
+            event.event.dp_rank,
+        );
+        match &event.event.data {
+            KvCacheEventData::HybridKeysStored(data) => {
+                let hashes: Vec<u64> = data.hashes.iter().map(|hash| hash.0).collect();
+                hybrid.store(worker, event.storage_tier, data.group, &hashes);
+                true
+            }
+            KvCacheEventData::HybridKeysRemoved(data) => {
+                let hashes: Vec<u64> = data.hashes.iter().map(|hash| hash.0).collect();
+                hybrid.remove(worker, event.storage_tier, data.group, &hashes);
+                true
+            }
+            KvCacheEventData::Cleared => {
+                let tier = event.clears_single_tier().then_some(event.storage_tier);
+                hybrid.clear(worker, tier);
+                false
+            }
+            KvCacheEventData::Stored(_) | KvCacheEventData::Removed(_) => false,
+        }
     }
 
     pub(crate) async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
@@ -341,6 +414,9 @@ impl Indexer {
     }
 
     pub(crate) async fn try_apply_event(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        if self.apply_hybrid_event(&event) {
+            return Ok(());
+        }
         let targets_primary = match event.targets_primary() {
             Ok(targets_primary) => targets_primary,
             Err(_) => {
@@ -430,6 +506,9 @@ impl Indexer {
         worker_id: WorkerId,
         dp_rank: DpRank,
     ) -> Result<(), KvRouterError> {
+        if let Some(hybrid) = self.hybrid() {
+            hybrid.remove_worker_dp_rank(worker_id, dp_rank);
+        }
         match self {
             Self::KvIndexer {
                 primary,
@@ -603,6 +682,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(1, 4),
             approx: None,
             primary_records_routing_decisions: false,
+            hybrid: None,
         }
     }
 
@@ -616,6 +696,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: false,
+            hybrid: None,
         }
     }
 
@@ -632,7 +713,140 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: true,
+            hybrid: None,
         }
+    }
+
+    fn make_test_hybrid_indexer() -> (Indexer, Arc<dynamo_kv_router::indexer::HybridProbeIndex>) {
+        let hybrid = Arc::new(dynamo_kv_router::indexer::HybridProbeIndex::new(4, 2));
+        let indexer = Indexer::KvIndexer {
+            primary: KvIndexer::new(
+                CancellationToken::new(),
+                4,
+                Arc::new(KvIndexerMetrics::new_unregistered()),
+            ),
+            lower_tier: LowerTierIndexers::new(1, 4),
+            approx: None,
+            primary_records_routing_decisions: false,
+            hybrid: Some(Arc::clone(&hybrid)),
+        };
+        (indexer, hybrid)
+    }
+
+    #[tokio::test]
+    async fn hybrid_key_events_feed_the_probe_index_and_clears_reset_it() {
+        use HybridCacheGroup::{FullAttention, Recurrent};
+        use StorageTier::{Device, HostPinned};
+        use dynamo_kv_router::indexer::HybridIndexStats;
+        use dynamo_kv_router::protocols::{
+            ClearScope, ExternalSequenceBlockHash, HybridCacheGroup, HybridKeysData, KvCacheEvent,
+            KvCacheEventData, RouterEvent,
+        };
+
+        let (indexer, hybrid) = make_test_hybrid_indexer();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let keys = |hashes: &[u64]| -> Vec<ExternalSequenceBlockHash> {
+            hashes
+                .iter()
+                .copied()
+                .map(ExternalSequenceBlockHash)
+                .collect()
+        };
+        let event = |event_id: u64, data: KvCacheEventData, tier: StorageTier| {
+            RouterEvent::with_storage_tier(
+                7,
+                KvCacheEvent {
+                    event_id,
+                    data,
+                    dp_rank: 0,
+                },
+                tier,
+            )
+        };
+
+        indexer
+            .try_apply_event(event(
+                1,
+                KvCacheEventData::HybridKeysStored(HybridKeysData {
+                    group: FullAttention,
+                    hashes: keys(&[11, 12]),
+                }),
+                Device,
+            ))
+            .await
+            .unwrap();
+        indexer
+            .try_apply_event(event(
+                2,
+                KvCacheEventData::HybridKeysStored(HybridKeysData {
+                    group: Recurrent,
+                    hashes: keys(&[21]),
+                }),
+                HostPinned,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hybrid.keys(worker, Device, FullAttention), vec![11, 12]);
+        assert_eq!(hybrid.keys(worker, HostPinned, Recurrent), vec![21]);
+
+        indexer
+            .try_apply_event(event(
+                3,
+                KvCacheEventData::HybridKeysRemoved(HybridKeysData {
+                    group: FullAttention,
+                    hashes: keys(&[11]),
+                }),
+                Device,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hybrid.keys(worker, Device, FullAttention), vec![12]);
+
+        // A single-tier (device) clear leaves the host keys in place.
+        indexer
+            .try_apply_event(
+                event(4, KvCacheEventData::Cleared, Device)
+                    .with_clear_scope(ClearScope::SingleTier),
+            )
+            .await
+            .unwrap();
+        assert!(hybrid.keys(worker, Device, FullAttention).is_empty());
+        assert_eq!(hybrid.keys(worker, HostPinned, Recurrent), vec![21]);
+
+        // An all-tier clear empties the worker.
+        indexer
+            .try_apply_event(RouterEvent::new(
+                7,
+                KvCacheEvent {
+                    event_id: 5,
+                    data: KvCacheEventData::Cleared,
+                    dp_rank: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hybrid.stats(), HybridIndexStats::default());
+
+        // Hybrid key events never reach the radix tree, and the refresher stays off.
+        indexer
+            .try_apply_event(event(
+                6,
+                KvCacheEventData::HybridKeysStored(HybridKeysData {
+                    group: FullAttention,
+                    hashes: keys(&[31]),
+                }),
+                Device,
+            ))
+            .await
+            .unwrap();
+        let dumped = indexer.dump_events().await.unwrap();
+        assert!(
+            dumped.is_empty(),
+            "radix dump must not contain hybrid keys: {dumped:?}"
+        );
+        assert!(!indexer.supports_overlap_refresh());
+        assert!(indexer.hybrid().is_some());
+        assert!(make_test_indexer().hybrid().is_none());
     }
 
     #[test]
@@ -1040,6 +1254,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
+            hybrid: None,
         };
         assert!(indexer.records_routing_decisions());
 
@@ -1171,6 +1386,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
+            hybrid: None,
         };
 
         let primary_worker = WorkerWithDpRank::new(10, 0);
