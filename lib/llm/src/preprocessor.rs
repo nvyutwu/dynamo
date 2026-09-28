@@ -1090,19 +1090,41 @@ fn apply_tracked_mm_replacements(
         }
     }
 
-    // The hybrid probe index reproduces vLLM's per-block extra keys `(identifier, offset)` and
-    // therefore needs each item's request-absolute placeholder span with its full hash; the
-    // pad-token normalisation above keeps only the low 30 bits. Attach every span to the blocks
-    // it overlaps. A block whose `mm_objects` stays empty hashes as text-only on the radix path.
-    for (start, end, mm_hash) in &spans {
+    attach_mm_spans(&mut block_mm_infos, &spans, block_size);
+
+    Ok((routing_tokens, expanded_prompt_len, block_mm_infos))
+}
+
+/// Request-absolute placeholder span of one media item in the expanded prompt:
+/// `(start, end, mm_hash)` with `end` exclusive. For Kimi-K3 `start` is the position of the
+/// `<|media_begin|>` that opens the item's dimension-bearing media block, which is the offset
+/// vLLM records in the block-hash extra key `(identifier, offset)`.
+#[cfg(feature = "mm-routing")]
+type MmSpan = (usize, usize, u64);
+
+/// Attach every media span to the blocks it overlaps. The hybrid probe index reproduces
+/// vLLM's per-block extra keys `(identifier, offset)` and therefore needs each item's
+/// request-absolute span with its full hash; the pad-token normalisation of the routing
+/// sequence keeps only the low 30 bits. A block whose `mm_objects` stays empty still hashes
+/// as text-only on the radix path.
+#[cfg(feature = "mm-routing")]
+fn attach_mm_spans(
+    block_mm_infos: &mut [Option<dynamo_kv_router::protocols::BlockExtraInfo>],
+    spans: &[MmSpan],
+    block_size: usize,
+) {
+    if block_size == 0 || block_mm_infos.is_empty() {
+        return;
+    }
+    for (start, end, mm_hash) in spans {
         if *end <= *start {
             continue;
         }
         let first = start / block_size;
         let last = (end - 1) / block_size;
-        for block_index in first..=last.min(block_mm_infos.len().saturating_sub(1)) {
+        for block_index in first..=last.min(block_mm_infos.len() - 1) {
             block_mm_infos[block_index]
-                .get_or_insert_with(BlockExtraInfo::default)
+                .get_or_insert_with(dynamo_kv_router::protocols::BlockExtraInfo::default)
                 .mm_spans
                 .push(dynamo_kv_router::protocols::BlockMmSpan {
                     start: *start,
@@ -1111,12 +1133,29 @@ fn apply_tracked_mm_replacements(
                 });
         }
     }
+}
 
-    Ok((routing_tokens, expanded_prompt_len, block_mm_infos))
+/// Block infos for the image-only expansion path: no radix `mm_objects` (the pad-value fill
+/// already carries item identity into the block hash) but the media spans the hybrid probe
+/// index needs. Sized for the block-padded prompt the caller produces from
+/// `expanded_prompt_len`.
+#[cfg(feature = "mm-routing")]
+fn block_mm_infos_from_spans(
+    expanded_prompt_len: usize,
+    spans: &[MmSpan],
+    block_size: usize,
+) -> Vec<Option<dynamo_kv_router::protocols::BlockExtraInfo>> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let mut block_mm_infos = vec![None; expanded_prompt_len.div_ceil(block_size)];
+    attach_mm_spans(&mut block_mm_infos, spans, block_size);
+    block_mm_infos
 }
 /// Construct the unpadded routing sequence and return its exact logical
-/// length. Errors are routing-only: callers must discard the partial vector
-/// and fall back without failing the inference request.
+/// length plus each image's request-absolute span in that sequence. Errors are
+/// routing-only: callers must discard the partial vector and fall back without
+/// failing the inference request.
 #[cfg(feature = "mm-routing")]
 fn expand_mm_routing_tokens(
     tokenizer: &dyn Tokenizer,
@@ -1126,7 +1165,7 @@ fn expand_mm_routing_tokens(
     mm_image_entries: &[MmImageEntry],
     n_tokens: &[usize],
     token_ids: &[TokenIdType],
-) -> Result<(Vec<TokenIdType>, usize)> {
+) -> Result<(Vec<TokenIdType>, usize, Vec<MmSpan>)> {
     debug_assert_eq!(mm_image_entries.len(), n_tokens.len());
     let n_total: usize = n_tokens.iter().sum();
     let bos_extra = routing_prepend_bos.is_some() as usize;
@@ -1135,9 +1174,11 @@ fn expand_mm_routing_tokens(
         expanded.push(bos);
     }
 
+    let mut spans = Vec::with_capacity(mm_image_entries.len());
     let mut image_idx = 0usize;
     for &token_id in token_ids {
         if token_id == find_token_id && image_idx < mm_image_entries.len() {
+            let start = expanded.len();
             append_mm_routing_replacement(
                 &mut expanded,
                 tokenizer,
@@ -1145,6 +1186,7 @@ fn expand_mm_routing_tokens(
                 mm_image_entries[image_idx],
                 n_tokens[image_idx],
             )?;
+            spans.push((start, expanded.len(), mm_image_entries[image_idx].mm_hash));
             image_idx += 1;
         } else {
             expanded.push(token_id);
@@ -1152,7 +1194,7 @@ fn expand_mm_routing_tokens(
     }
 
     let expanded_prompt_len = expanded.len();
-    Ok((expanded, expanded_prompt_len))
+    Ok((expanded, expanded_prompt_len, spans))
 }
 
 #[cfg(feature = "mm-routing")]
@@ -1166,7 +1208,7 @@ fn try_expand_mm_routing_tokens(
     n_tokens: &[usize],
     token_ids: &[TokenIdType],
     model_id: &str,
-) -> Option<(Vec<TokenIdType>, usize)> {
+) -> Option<(Vec<TokenIdType>, usize, Vec<MmSpan>)> {
     match expand_mm_routing_tokens(
         tokenizer,
         prompt_layout,
@@ -3844,7 +3886,7 @@ impl OpenAIPreprocessor {
                 .iter()
                 .map(|image| counter.count_tokens(image.width, image.height))
                 .collect();
-            let (expanded, expanded_prompt_len) = try_expand_mm_routing_tokens(
+            let (expanded, expanded_prompt_len, spans) = try_expand_mm_routing_tokens(
                 self.tokenizer.as_ref(),
                 self.routing_image_prompt_layout
                     .expect("image prompt layout requirement checked above"),
@@ -3855,7 +3897,10 @@ impl OpenAIPreprocessor {
                 token_ids,
                 counter.model_id(),
             )?;
-            (expanded, expanded_prompt_len, Vec::new())
+            // Exact image blocks carry item identity in their pad-value fill, so the radix
+            // path needs no `mm_objects`; the hybrid probe index still needs the spans.
+            let block_mm_infos = block_mm_infos_from_spans(expanded_prompt_len, &spans, block_size);
+            (expanded, expanded_prompt_len, block_mm_infos)
         } else {
             let mut replacements = Vec::with_capacity(entries.len());
             let video_token_id = entries.iter().find_map(|entry| match entry {
@@ -8250,7 +8295,7 @@ mod tests {
         let dimension_token_count = "image 320x240".len();
         let image_token_count = 3;
 
-        let (expanded, expanded_prompt_len) = expand_mm_routing_tokens(
+        let (expanded, expanded_prompt_len, _spans) = expand_mm_routing_tokens(
             &tokenizer,
             layout,
             None,
@@ -8266,6 +8311,40 @@ mod tests {
         let reference_len = 2 + 3 + dimension_token_count + image_token_count;
         assert_eq!(expanded_prompt_len, reference_len);
         assert_eq!(expanded.len(), reference_len);
+        // The item's span opens at `<|media_begin|>` (right after the leading text token) and
+        // closes after `<|media_end|>`: that is the offset vLLM stores in the block-hash extra key.
+        assert_eq!(_spans, vec![(1usize, reference_len - 1, 0x1234u64)]);
+        assert_eq!(expanded[1], 163602, "span start must be <|media_begin|>");
+        assert_eq!(
+            expanded[reference_len - 2],
+            163604,
+            "span ends after <|media_end|>"
+        );
+
+        // The image-only routing path turns those spans into block infos carrying only
+        // `mm_spans` (no radix `mm_objects`), one entry per padded block.
+        let block_size = 8;
+        let infos = block_mm_infos_from_spans(expanded_prompt_len, &_spans, block_size);
+        assert_eq!(infos.len(), reference_len.div_ceil(block_size));
+        let covered: Vec<usize> = infos
+            .iter()
+            .enumerate()
+            .filter_map(|(i, info)| info.as_ref().map(|_| i))
+            .collect();
+        let expected: Vec<usize> = (1 / block_size..=(reference_len - 2) / block_size).collect();
+        assert_eq!(covered, expected);
+        for info in infos.iter().flatten() {
+            assert!(info.mm_objects.is_empty());
+            assert_eq!(
+                info.mm_spans,
+                vec![dynamo_kv_router::protocols::BlockMmSpan {
+                    start: 1,
+                    end: reference_len - 1,
+                    mm_hash: 0x1234,
+                }]
+            );
+        }
+        assert!(block_mm_infos_from_spans(expanded_prompt_len, &_spans, 0).is_empty());
     }
 
     #[cfg(feature = "mm-routing")]
@@ -8308,7 +8387,7 @@ mod tests {
             width: 320,
             height: 240,
         };
-        let (expanded, expanded_prompt_len) = expand_mm_routing_tokens(
+        let (expanded, expanded_prompt_len, _spans) = expand_mm_routing_tokens(
             &tokenizer,
             layout,
             None,
@@ -8376,7 +8455,7 @@ mod tests {
         let first_fill = dynamo_kv_router::protocols::pad_value_for_mm_hash(images[0].mm_hash);
         let second_fill = dynamo_kv_router::protocols::pad_value_for_mm_hash(images[1].mm_hash);
 
-        let (expanded, prompt_len) = expand_mm_routing_tokens(
+        let (expanded, prompt_len, spans) = expand_mm_routing_tokens(
             &tokenizer,
             RoutingImagePromptLayout::RepeatedPad,
             Some(1),
@@ -8402,6 +8481,14 @@ mod tests {
             ]
         );
         assert_eq!(prompt_len, expanded.len());
+        // One span per image, in request order, positioned in the BOS-prefixed sequence.
+        assert_eq!(
+            spans,
+            vec![
+                (2usize, 4usize, images[0].mm_hash),
+                (5usize, 8usize, images[1].mm_hash)
+            ]
+        );
     }
 
     #[cfg(feature = "mm-routing")]
