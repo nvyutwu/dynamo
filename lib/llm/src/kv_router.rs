@@ -585,6 +585,12 @@ const DYNAMO_VLLM_WORKER_HASH_SEED: &str = "0";
 /// `TieredMatchDetails` keeps whole router blocks (the shape metrics, the scores endpoint and
 /// KV-transfer hints expect), while `OverlapSignals` carries the token-precise device and host
 /// hits so worker selection sees partial-tail reuse at hash-unit resolution.
+/// `DYN_ROUTER_HYBRID_MM_DEBUG=1` logs what the probe derived for each multimodal request.
+fn hybrid_mm_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DYN_ROUTER_HYBRID_MM_DEBUG").is_some())
+}
+
 /// Multimodal placeholder token id for the hybrid probe's engine-token recovery.
 fn hybrid_mm_token_id_from_env(name: &str) -> Option<u32> {
     std::env::var(name)
@@ -1797,6 +1803,7 @@ where
             Some((hasher, hybrid)) => {
                 let lookup_start = Instant::now();
                 let unit = hybrid.hash_unit();
+                let mut mm_units_debug: Vec<String> = Vec::new();
                 let chain =
                     tracing::info_span!("kv_router.compute_engine_chain").in_scope(|| {
                         match (&hybrid_mm, block_mm_infos) {
@@ -1808,6 +1815,34 @@ where
                                     engine_tokens.len() / unit as usize,
                                     &dynamo_kv_router::indexer::hybrid_mm_identifier,
                                 );
+                                if hybrid_mm_debug() {
+                                    mm_units_debug = units
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, keys)| {
+                                            keys.as_ref().map(|keys| {
+                                                let parts: Vec<String> = keys
+                                                    .iter()
+                                                    .map(|key| {
+                                                        match key {
+                                                        dynamo_kv_router::indexer::ExtraKey::Mm {
+                                                            identifier,
+                                                            offset,
+                                                        } => format!(
+                                                            "{}@{offset}",
+                                                            &identifier[..identifier.len().min(16)]
+                                                        ),
+                                                        dynamo_kv_router::indexer::ExtraKey::Text(
+                                                            text,
+                                                        ) => text.clone(),
+                                                    }
+                                                    })
+                                                    .collect();
+                                                format!("u{i}:{}", parts.join(","))
+                                            })
+                                        })
+                                        .collect();
+                                }
                                 hasher.chain_keys_with_extra(engine_tokens, unit, &|i| {
                                     units.get(i).cloned().flatten()
                                 })
@@ -1816,6 +1851,42 @@ where
                         }
                     });
                 let hits = hybrid.lookup(&chain, tokens.len());
+                if hybrid_mm_debug() && block_mm_infos.is_some() {
+                    // DYN_ROUTER_HYBRID_MM_DEBUG=1: one line per multimodal request with everything the
+                    // probe derived, to compare against the engine's own rows on the raw event stream.
+                    let recovered_pads = hybrid_mm
+                        .as_ref()
+                        .and_then(|r| r.as_ref())
+                        .map(|engine| engine.iter().zip(tokens).filter(|(a, b)| a != b).count());
+                    let infos: Vec<String> = block_mm_infos
+                        .unwrap_or_default()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, info)| {
+                            info.as_ref().map(|info| {
+                                let objects: Vec<String> = info
+                                    .mm_objects
+                                    .iter()
+                                    .map(|o| format!("{:016x}:{:?}", o.mm_hash, o.offsets))
+                                    .collect();
+                                format!("b{i}:[{}]", objects.join(" "))
+                            })
+                        })
+                        .collect();
+                    let n = chain.len();
+                    tracing::info!(
+                        request_id = ?context_id,
+                        tokens = tokens.len(),
+                        recovered_pads = ?recovered_pads,
+                        block_mm_infos = ?infos,
+                        mm_units = ?mm_units_debug,
+                        chain_head = ?&chain[..n.min(3)],
+                        chain_tail = ?&chain[n.saturating_sub(3)..],
+                        image_token_id = ?self.hybrid_mm_image_token_id,
+                        hits = hits.len(),
+                        "hybrid mm probe debug"
+                    );
+                }
                 let (tiered, overlap) = hybrid_overlap_from_hits(
                     hits,
                     self.block_size,
