@@ -253,12 +253,59 @@ pub fn mm_extra_keys_by_unit(
     num_units: usize,
     identifier: &dyn Fn(u64) -> String,
 ) -> Vec<Option<Vec<ExtraKey>>> {
+    let mut occurrences = mm_occurrences(block_mm_infos, block_size);
+    occurrences.sort_by_key(|(s, _, _)| *s);
+    let mut out = Vec::with_capacity(num_units);
+    for i in 0..num_units {
+        let (u_start, u_end) = (i * unit, (i + 1) * unit);
+        let keys: Vec<ExtraKey> = occurrences
+            .iter()
+            .filter(|(s, e, _)| *s < u_end && *e > u_start)
+            .map(|(s, _, hash)| ExtraKey::Mm {
+                identifier: identifier(*hash),
+                offset: *s as i64 - u_start as i64,
+            })
+            .collect();
+        out.push((!keys.is_empty()).then_some(keys));
+    }
+    out
+}
+
+/// The request's multimodal placeholder occurrences `(abs_start, abs_end, mm_hash)`. Preferred
+/// source: the frontend's `mm_spans` (request-absolute, written for the probe; the same span is
+/// attached to every block it overlaps, so duplicates are dropped). Fallback: re-join the clipped
+/// per-block `offsets` of worker-derived infos.
+pub fn mm_occurrences(
+    block_mm_infos: &[Option<crate::protocols::BlockExtraInfo>],
+    block_size: usize,
+) -> Vec<(usize, usize, u64)> {
+    let mut spans: Vec<(usize, usize, u64)> = block_mm_infos
+        .iter()
+        .flatten()
+        .flat_map(|info| info.mm_spans.iter().map(|s| (s.start, s.end, s.mm_hash)))
+        .collect();
+    if !spans.is_empty() {
+        spans.sort_unstable();
+        spans.dedup();
+        return spans;
+    }
+    mm_occurrences_from_offsets(block_mm_infos, block_size)
+}
+
+fn mm_occurrences_from_offsets(
+    block_mm_infos: &[Option<crate::protocols::BlockExtraInfo>],
+    block_size: usize,
+) -> Vec<(usize, usize, u64)> {
     // occurrences: (abs_start, abs_end, mm_hash)
     let mut occurrences: Vec<(usize, usize, u64)> = Vec::new();
     for (block_index, info) in block_mm_infos.iter().enumerate() {
         let Some(info) = info else { continue };
         let base = block_index * block_size;
         for object in &info.mm_objects {
+            if object.offsets.is_empty() {
+                // a boundary block whose object carries no range cannot be reproduced
+                return Vec::new();
+            }
             for &(s, e) in &object.offsets {
                 let (abs_s, abs_e) = (base + s, base + e);
                 // continuation of an occurrence that ended exactly at this block's start
@@ -275,21 +322,7 @@ pub fn mm_extra_keys_by_unit(
             }
         }
     }
-    occurrences.sort_by_key(|(s, _, _)| *s);
-    let mut out = Vec::with_capacity(num_units);
-    for i in 0..num_units {
-        let (u_start, u_end) = (i * unit, (i + 1) * unit);
-        let keys: Vec<ExtraKey> = occurrences
-            .iter()
-            .filter(|(s, e, _)| *s < u_end && *e > u_start)
-            .map(|(s, _, hash)| ExtraKey::Mm {
-                identifier: identifier(*hash),
-                offset: *s as i64 - u_start as i64,
-            })
-            .collect();
-        out.push((!keys.is_empty()).then_some(keys));
-    }
-    out
+    occurrences
 }
 
 /// The identifier vLLM ends up with for a frontend-routed image: the worker forwards the
@@ -322,27 +355,22 @@ pub fn mm_engine_tokens(
         (None, Some(video)) => video,
         _ => return None,
     };
+    let occurrences = mm_occurrences(block_mm_infos, block_size);
+    if occurrences.is_empty() {
+        return None;
+    }
     let mut tokens = routing_tokens.to_vec();
-    for (block_index, info) in block_mm_infos.iter().enumerate() {
-        let Some(info) = info else { continue };
-        let base = block_index * block_size;
-        for object in &info.mm_objects {
-            if object.offsets.is_empty() {
-                return None;
+    for (start, end, mm_hash) in occurrences {
+        let pad = crate::protocols::pad_value_for_mm_hash(mm_hash);
+        let mut restored = 0usize;
+        for pos in start..end.min(tokens.len()) {
+            if tokens[pos] == pad {
+                tokens[pos] = placeholder;
+                restored += 1;
             }
-            let pad = crate::protocols::pad_value_for_mm_hash(object.mm_hash);
-            let mut restored = 0usize;
-            for &(s, e) in &object.offsets {
-                for pos in base + s..(base + e).min(tokens.len()) {
-                    if tokens[pos] == pad {
-                        tokens[pos] = placeholder;
-                        restored += 1;
-                    }
-                }
-            }
-            if restored == 0 {
-                return None;
-            }
+        }
+        if restored == 0 {
+            return None;
         }
     }
     Some(tokens)
@@ -574,6 +602,7 @@ mod tests {
                     .into_iter()
                     .map(|(mm_hash, offsets)| BlockMmObjectInfo { mm_hash, offsets })
                     .collect(),
+                mm_spans: Vec::new(),
             })
         };
         let infos = vec![
@@ -633,6 +662,7 @@ mod tests {
                     .into_iter()
                     .map(|(mm_hash, offsets)| BlockMmObjectInfo { mm_hash, offsets })
                     .collect(),
+                mm_spans: Vec::new(),
             })
         };
         let infos = vec![
@@ -648,6 +678,30 @@ mod tests {
         assert!(mm_engine_tokens(&routing, &infos, 256, Some(IMG), Some(IMG + 1)).is_none());
         let bare = vec![block(vec![(0xA, vec![])]), None];
         assert!(mm_engine_tokens(&routing, &bare, 256, Some(IMG), None).is_none());
+        // the frontend's spans (request-absolute, attached to every overlapping block, objects empty)
+        let span = |s: usize, e: usize, h: u64| crate::protocols::BlockMmSpan {
+            start: s,
+            end: e,
+            mm_hash: h,
+        };
+        let spans_only = vec![
+            Some(BlockExtraInfo {
+                mm_objects: vec![],
+                mm_spans: vec![span(100, 300, 0xA)],
+            }),
+            Some(BlockExtraInfo {
+                mm_objects: vec![],
+                mm_spans: vec![span(100, 300, 0xA), span(301, 331, 0xB)],
+            }),
+        ];
+        assert_eq!(
+            mm_engine_tokens(&routing, &spans_only, 256, Some(IMG), None).as_deref(),
+            Some(&engine[..])
+        );
+        assert_eq!(
+            mm_occurrences(&spans_only, 256),
+            vec![(100, 300, 0xA), (301, 331, 0xB)]
+        );
         assert_eq!(
             hybrid_mm_identifier(0xabc),
             format!("{:016x}{}", 0xabc, "0".repeat(48))

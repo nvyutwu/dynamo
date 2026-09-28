@@ -1084,8 +1084,31 @@ fn apply_tracked_mm_replacements(
                             offsets: Vec::new(),
                         })
                         .collect(),
+                    mm_spans: Vec::new(),
                 });
             }
+        }
+    }
+
+    // The hybrid probe index reproduces vLLM's per-block extra keys `(identifier, offset)` and
+    // therefore needs each item's request-absolute placeholder span with its full hash; the
+    // pad-token normalisation above keeps only the low 30 bits. Attach every span to the blocks
+    // it overlaps. A block whose `mm_objects` stays empty hashes as text-only on the radix path.
+    for (start, end, mm_hash) in &spans {
+        if *end <= *start {
+            continue;
+        }
+        let first = start / block_size;
+        let last = (end - 1) / block_size;
+        for block_index in first..=last.min(block_mm_infos.len().saturating_sub(1)) {
+            block_mm_infos[block_index]
+                .get_or_insert_with(BlockExtraInfo::default)
+                .mm_spans
+                .push(dynamo_kv_router::protocols::BlockMmSpan {
+                    start: *start,
+                    end: *end,
+                    mm_hash: *mm_hash,
+                });
         }
     }
 
@@ -11488,6 +11511,15 @@ mod tests {
     }
 
     #[cfg(feature = "mm-routing")]
+    /// A normalisable block carries no radix objects (it hashes like text on the radix path); it may
+    /// still carry the request's placeholder spans for the hybrid probe.
+    fn assert_no_radix_objects(info: &Option<dynamo_kv_router::protocols::BlockExtraInfo>) {
+        assert!(
+            info.as_ref().is_none_or(|info| info.mm_objects.is_empty()),
+            "unexpected radix objects: {info:?}"
+        );
+    }
+
     #[test]
     fn tracked_video_boundary_uses_native_metadata_only_when_needed() {
         use dynamo_kv_router::protocols::pad_value_for_mm_hash;
@@ -11516,7 +11548,7 @@ mod tests {
         assert_eq!(&tokens[..4], &[1, 3, 4, 5]);
         assert_eq!(&tokens[4..], &[6, video_pad, video_pad, 2]);
         assert_eq!(infos[0].as_ref().unwrap().mm_objects[0].mm_hash, mm_hash);
-        assert!(infos[1].is_none());
+        assert_no_radix_objects(&infos[1]);
     }
 
     #[cfg(feature = "mm-routing")]
@@ -11583,7 +11615,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [image_hash, video_hash]
         );
-        assert!(infos[1].is_none());
+        assert_no_radix_objects(&infos[1]);
     }
 
     #[cfg(feature = "mm-routing")]
@@ -11634,7 +11666,7 @@ mod tests {
                 4,
             ]
         );
-        assert!(infos[0].is_none());
+        assert_no_radix_objects(&infos[0]);
     }
 
     #[cfg(feature = "mm-routing")]

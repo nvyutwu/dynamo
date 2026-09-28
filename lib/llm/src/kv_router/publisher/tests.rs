@@ -4066,6 +4066,7 @@ mod event_plane_batch_tests {
                                     mm_hash: event_id * 100_000 + index as u64,
                                     offsets: vec![(0, 16)],
                                 }],
+                                mm_spans: Vec::new(),
                             }),
                         })
                         .collect(),

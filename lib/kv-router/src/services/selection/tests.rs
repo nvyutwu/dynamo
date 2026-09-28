@@ -494,6 +494,7 @@ fn prompt_normalization_uses_mm_routing_info_and_eagle_hashing() {
             mm_hash: 42,
             offsets: vec![(0, 2)],
         }],
+        mm_spans: Vec::new(),
     })];
     let request = PromptRequest {
         token_ids: Some(vec![1, 2, 3, 4]),

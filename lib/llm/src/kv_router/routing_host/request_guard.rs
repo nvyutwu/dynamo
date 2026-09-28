@@ -1881,6 +1881,7 @@ mod output_hash_tests {
                 mm_hash: 42,
                 offsets: vec![(0, 2)],
             }],
+            mm_spans: Vec::new(),
         })];
         let mut tracker = CanonicalOutputTracker::from_parts(
             &prompt,

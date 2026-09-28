@@ -1895,6 +1895,7 @@ mod tests {
                     mm_hash: 42,
                     offsets: vec![],
                 }],
+                mm_spans: Vec::new(),
             }),
             None,
         ];

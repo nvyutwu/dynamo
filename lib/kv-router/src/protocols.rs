@@ -195,6 +195,7 @@ fn for_each_block_hash_for_seq_with_seed(
         let chunk = &tokens[start..start + window_size];
         if let Some(mm_infos) = options.block_mm_infos
             && let Some(Some(block_mm_info)) = mm_infos.get(block_idx)
+            && !block_mm_info.mm_objects.is_empty()
         {
             bytes.clear();
             for &token in chunk {
@@ -1437,11 +1438,27 @@ pub struct BlockMmObjectInfo {
     pub offsets: Vec<(usize, usize)>,
 }
 
+/// One multimodal placeholder span of the request as the engine sees it: request-absolute token
+/// range of the expanded media block (vLLM's `mm_position.offset` / `length`) and the full 64-bit
+/// frontend hash of the item. Written by the frontend for the hybrid probe index, which must
+/// reproduce vLLM's per-block extra keys `(identifier, offset)`; the radix path never reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BlockMmSpan {
+    pub start: usize,
+    pub end: usize,
+    pub mm_hash: u64,
+}
+
 /// Extra metadata for a block containing multimodal objects
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BlockExtraInfo {
     /// All multimodal objects referenced in this block
     pub mm_objects: Vec<BlockMmObjectInfo>,
+    /// Placeholder spans overlapping this block (request-absolute), for the hybrid probe. Empty on
+    /// worker-derived infos and on older producers. A block whose `mm_objects` is empty hashes like
+    /// a text-only block on the radix path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mm_spans: Vec<BlockMmSpan>,
 }
 
 /// Request-level multimodal object information.
@@ -1504,8 +1521,10 @@ impl RequestExtraInfo {
                     let local_end = (*req_end).min(block_end_global) - block_start_global;
 
                     if local_start < local_end {
-                        let block_info = block_info_opt
-                            .get_or_insert_with(|| BlockExtraInfo { mm_objects: vec![] });
+                        let block_info = block_info_opt.get_or_insert_with(|| BlockExtraInfo {
+                            mm_objects: vec![],
+                            mm_spans: Vec::new(),
+                        });
 
                         // Check if we already have this mm_hash in this block
                         if let Some(existing) = block_info
@@ -2546,6 +2565,7 @@ mod tests {
                     mm_hash: 42,
                     offsets: vec![(0, 1)],
                 }],
+                mm_spans: Vec::new(),
             }),
             None,
         ];

@@ -535,6 +535,7 @@ fn test_deserialize_block_stored_sequence_preserves_block_mm_infos_and_metadata(
             mm_hash: 99,
             offsets: vec![(0, 1)],
         }],
+        mm_spans: Vec::new(),
     })];
     let raw_event = (
         "BlockStored",

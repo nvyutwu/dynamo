@@ -531,6 +531,7 @@ mod normalize_tests {
                 mm_hash,
                 offsets: vec![],
             }],
+            mm_spans: Vec::new(),
         };
 
         let stored = create_stored_block_from_parts(
@@ -579,6 +580,7 @@ mod normalize_tests {
                     offsets: vec![],
                 })
                 .collect(),
+            mm_spans: Vec::new(),
         };
 
         let stored = create_stored_block_from_parts(
@@ -620,6 +622,7 @@ mod normalize_tests {
                     offsets: vec![],
                 })
                 .collect(),
+            mm_spans: Vec::new(),
         };
         let expected_tokens = normalize_mm_token_runs(&tokens, image_token_id, &[41, 42])
             .expect("image-only event normalizes")
@@ -657,6 +660,7 @@ mod normalize_tests {
                     offsets: vec![],
                 })
                 .collect(),
+            mm_spans: Vec::new(),
         };
 
         let stored = create_stored_block_from_parts(
@@ -707,6 +711,7 @@ mod normalize_tests {
                         mm_hash: image_hash,
                         offsets: vec![],
                     }],
+                    mm_spans: Vec::new(),
                 }),
                 Some(BlockExtraInfo {
                     mm_objects: vec![
@@ -719,6 +724,7 @@ mod normalize_tests {
                             offsets: vec![],
                         },
                     ],
+                    mm_spans: Vec::new(),
                 }),
             ];
             create_stored_blocks(
@@ -754,6 +760,7 @@ mod normalize_tests {
                 mm_hash,
                 offsets: vec![],
             }],
+            mm_spans: Vec::new(),
         };
 
         let stored = create_stored_block_from_parts(
@@ -896,6 +903,7 @@ mod normalize_tests {
                     mm_hash: image_hash,
                     offsets: vec![],
                 }],
+                mm_spans: Vec::new(),
             }),
             Some(BlockExtraInfo {
                 mm_objects: vec![
@@ -908,12 +916,14 @@ mod normalize_tests {
                         offsets: vec![],
                     },
                 ],
+                mm_spans: Vec::new(),
             }),
             Some(BlockExtraInfo {
                 mm_objects: vec![BlockMmObjectInfo {
                     mm_hash: video_hash,
                     offsets: vec![],
                 }],
+                mm_spans: Vec::new(),
             }),
         ];
 
@@ -970,6 +980,7 @@ mod normalize_tests {
                     mm_hash,
                     offsets: vec![],
                 }],
+                mm_spans: Vec::new(),
             });
             create_stored_blocks(
                 block_size,
@@ -998,6 +1009,7 @@ mod normalize_tests {
                         mm_hash: 41,
                         offsets: vec![],
                     }],
+                    mm_spans: Vec::new(),
                 }),
                 ..Default::default()
             },

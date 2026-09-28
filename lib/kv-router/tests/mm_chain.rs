@@ -11,7 +11,7 @@ use dynamo_kv_router::indexer::{
     EngineChainHasher, EngineHashAlgo, hybrid_mm_identifier, mm_engine_tokens,
     mm_extra_keys_by_unit,
 };
-use dynamo_kv_router::protocols::{BlockExtraInfo, BlockMmObjectInfo};
+use dynamo_kv_router::protocols::{BlockExtraInfo, BlockMmObjectInfo, BlockMmSpan};
 use dynamo_kv_router::zmq_wire::normalize_mm_placeholder_runs;
 
 #[derive(serde::Deserialize)]
@@ -39,12 +39,27 @@ fn kimi_k3_image_request_chain_matches_the_engine() {
         normalize_mm_placeholder_runs(&fx.tokens, Some(fx.image_token_id), None, &[mm_hash])
             .unwrap();
     assert_ne!(routing, fx.tokens);
+    // as the frontend writes it for the probe: no radix objects, one request-absolute span
     let infos = vec![Some(BlockExtraInfo {
+        mm_objects: vec![],
+        mm_spans: vec![BlockMmSpan {
+            start: fx.item_offset,
+            end: fx.item_end,
+            mm_hash,
+        }],
+    })];
+    // worker-derived shape (clipped offsets) gives the same occurrence
+    let from_offsets = vec![Some(BlockExtraInfo {
         mm_objects: vec![BlockMmObjectInfo {
             mm_hash,
             offsets: vec![(fx.item_offset, fx.item_end)],
         }],
+        mm_spans: Vec::new(),
     })];
+    assert_eq!(
+        dynamo_kv_router::indexer::mm_occurrences(&from_offsets, BLOCK),
+        dynamo_kv_router::indexer::mm_occurrences(&infos, BLOCK)
+    );
 
     let engine = mm_engine_tokens(&routing, &infos, BLOCK, Some(fx.image_token_id), None)
         .expect("recoverable");

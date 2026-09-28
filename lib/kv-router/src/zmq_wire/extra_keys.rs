@@ -105,7 +105,10 @@ pub fn extra_keys_to_block_mm_infos(
             if mm_objects.is_empty() {
                 None
             } else {
-                Some(BlockExtraInfo { mm_objects })
+                Some(BlockExtraInfo {
+                    mm_objects,
+                    mm_spans: Vec::new(),
+                })
             }
         })
         .collect();
