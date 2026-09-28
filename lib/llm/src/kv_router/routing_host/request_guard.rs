@@ -966,7 +966,7 @@ where
     ) -> Self {
         let chooser = &cleanup.chooser;
         let block_size = chooser.block_size() as usize;
-        let isl_tokens = request.token_ids.len();
+        let isl_tokens = request.prompt_token_count();
         let expected_output_tokens = request
             .routing
             .as_ref()
@@ -1042,7 +1042,7 @@ where
             observability: RequestObservability::new(request.tracker.clone(), request_metrics),
             // Builtin policies do not track scheduler blocks. Emit one final ITL sample
             // when the request completes rather than observing every streamed token.
-            output_blocks: OutputBlockTracker::new(false, request.token_ids.len(), 1, None),
+            output_blocks: OutputBlockTracker::new(false, request.prompt_token_count(), 1, None),
             approximate_lru: None,
             approximate_lru_active: false,
             output_hashes: None,

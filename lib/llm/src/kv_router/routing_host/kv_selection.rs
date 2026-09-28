@@ -65,8 +65,13 @@ impl SelectionOutcome {
 
 #[derive(Clone, Copy)]
 pub(super) struct RoutingRequestParts<'a> {
+    /// Tokens hashed for KV overlap. With multimodal routing info this is the expanded sequence
+    /// padded to whole blocks, so its length is not the prompt length.
     pub(super) token_ids: &'a [TokenIdType],
     pub(super) block_mm_infos: Option<&'a [Option<BlockExtraInfo>]>,
+    /// Prompt length in engine tokens: the funnel denominator, the traced `input_tokens` and the
+    /// value the worker's cache-loss report must match (`PreprocessedRequest::prompt_token_count`).
+    pub(super) prompt_tokens: usize,
 }
 
 impl<'a> RoutingRequestParts<'a> {
@@ -75,7 +80,79 @@ impl<'a> RoutingRequestParts<'a> {
         Self {
             token_ids,
             block_mm_infos,
+            prompt_tokens: request.prompt_token_count(),
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_token_count_tests {
+    use super::RoutingRequestParts;
+    use crate::preprocessor::PreprocessedRequest;
+    use crate::protocols::common::preprocessor::MmRoutingInfo;
+    use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+
+    fn request(token_ids: Vec<u32>) -> PreprocessedRequest {
+        PreprocessedRequest::builder()
+            .model("test-model".to_string())
+            .token_ids(token_ids)
+            .stop_conditions(StopConditions::default())
+            .sampling_options(SamplingOptions::default())
+            .output_options(OutputOptions::default())
+            .eos_token_ids(vec![])
+            .annotations(vec![])
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn text_requests_count_their_token_ids() {
+        let request = request(vec![1, 2, 3, 4, 5]);
+        let parts = RoutingRequestParts::new(&request);
+        assert_eq!(parts.prompt_tokens, 5);
+        assert_eq!(parts.token_ids.len(), 5);
+        assert!(parts.block_mm_infos.is_none());
+    }
+
+    #[test]
+    fn multimodal_requests_count_the_expanded_unpadded_prompt() {
+        // One placeholder in the worker prompt; the routing view expands it to the engine's
+        // image tokens (92 total) and pads to two 64-token blocks (128).
+        let mut request = request(vec![7; 29]);
+        request.mm_routing_info = Some(MmRoutingInfo {
+            routing_token_ids: vec![9; 128],
+            block_mm_infos: vec![None, None],
+            expanded_prompt_len: 92,
+        });
+        let parts = RoutingRequestParts::new(&request);
+        assert_eq!(
+            parts.token_ids.len(),
+            128,
+            "hashing keeps the padded sequence"
+        );
+        assert_eq!(
+            parts.prompt_tokens, 92,
+            "the denominator is the engine prompt length"
+        );
+        assert_eq!(request.prompt_token_count(), 92);
+    }
+
+    #[test]
+    fn multimodal_info_without_expanded_length_falls_back_to_the_padded_sequence() {
+        let mut request = request(vec![7; 29]);
+        request.mm_routing_info = Some(MmRoutingInfo {
+            routing_token_ids: vec![9; 128],
+            block_mm_infos: vec![None, None],
+            expanded_prompt_len: 0,
+        });
+        assert_eq!(request.prompt_token_count(), 128);
+        let mut empty = request.clone();
+        empty.mm_routing_info = Some(MmRoutingInfo::default());
+        assert_eq!(
+            empty.prompt_token_count(),
+            29,
+            "empty routing tokens mean text routing"
+        );
     }
 }
 

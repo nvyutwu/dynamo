@@ -803,11 +803,10 @@ where
             let routing_parts = RoutingRequestParts::new(&request);
             if let Some(ref tracker) = request.tracker {
                 let isl_blocks = routing_parts
-                    .token_ids
-                    .len()
+                    .prompt_tokens
                     .div_ceil(self.kv_router().block_size() as usize);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
-                tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
+                tracker.record_isl(routing_parts.prompt_tokens, Some(selection.cached_tokens));
                 tracker.record_worker(
                     selection.worker.worker_id,
                     Some(selection.worker.dp_rank),

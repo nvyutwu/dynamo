@@ -372,7 +372,7 @@ where
         let request_context = request.context().clone();
         self.request_metrics
             .input_sequence_tokens
-            .observe(request.token_ids.len() as f64);
+            .observe(request.prompt_token_count() as f64);
         drop(route_guard);
 
         guard.start_dispatch(&phase_label);

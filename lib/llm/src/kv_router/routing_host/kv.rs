@@ -424,7 +424,7 @@ where
                 .map(|(max_raw_cached_tokens, selected_raw_cached_tokens)| {
                     CacheLossTracking::new(
                         RouteObservation {
-                            prompt_tokens: routing_parts.token_ids.len() as u64,
+                            prompt_tokens: routing_parts.prompt_tokens as u64,
                             best_router_tokens: max_raw_cached_tokens as u64,
                             selected_router_tokens: selected_raw_cached_tokens as u64,
                             best_router_tiers: selection.best_router_tiers,
@@ -474,7 +474,7 @@ where
                 CacheHistoryTracking::new(
                     Arc::clone(history),
                     prompt_hashes,
-                    routing_parts.token_ids.len() as u64,
+                    routing_parts.prompt_tokens as u64,
                 ),
                 request,
                 chooser.block_size(),
@@ -547,9 +547,9 @@ where
                 if let Some(trace) = selection.decision_trace.take() {
                     tracker.record_routing_decision_trace(request_trace_routing_decision(*trace));
                 }
-                let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
+                let isl_blocks = routing_parts.prompt_tokens.div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
-                tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
+                tracker.record_isl(routing_parts.prompt_tokens, Some(selection.cached_tokens));
                 tracker.record_worker(
                     selection.worker.worker_id,
                     Some(selection.worker.dp_rank),
@@ -564,7 +564,7 @@ where
                 guard
                     .request_metrics()
                     .input_sequence_tokens
-                    .observe(request.token_ids.len() as f64);
+                    .observe(request.prompt_token_count() as f64);
             }
             Ok(())
         }

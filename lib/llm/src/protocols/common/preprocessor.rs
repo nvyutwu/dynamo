@@ -493,6 +493,23 @@ impl PreprocessedRequest {
         }
         (tokens, Some(mm.block_mm_infos.as_slice()))
     }
+
+    /// Prompt length in engine tokens. With multimodal routing info the routing sequence is
+    /// expanded to the engine's image tokens and then padded to whole KV blocks, so its length
+    /// is not a token count; use the unpadded `expanded_prompt_len` instead (falling back to the
+    /// padded length for producers that predate that field). Text requests: `token_ids.len()`.
+    pub fn prompt_token_count(&self) -> usize {
+        match self.mm_routing_info.as_ref() {
+            Some(mm) if !mm.routing_token_ids.is_empty() => {
+                if mm.expanded_prompt_len > 0 {
+                    mm.expanded_prompt_len
+                } else {
+                    mm.routing_token_ids.len()
+                }
+            }
+            _ => self.token_ids.len(),
+        }
+    }
 }
 
 /// [`PreprocessedEmbeddingRequest`] is the internal representation of an embedding request
