@@ -112,6 +112,29 @@ impl Parameters {
     }
 }
 
+/// Environment variable that overrides the policy file's `cache_threshold`.
+pub const CACHE_THRESHOLD_ENV: &str = "DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD";
+
+/// `Ok(None)` when the variable is unset or empty; an unparsable value is a startup error
+/// (a mistyped experiment knob must fail loudly, like an unknown YAML key).
+fn cache_threshold_override() -> Result<Option<f64>, WorkerSelectionPolicyProviderError> {
+    let raw = std::env::var_os(CACHE_THRESHOLD_ENV).map(|v| v.to_string_lossy().into_owned());
+    parse_cache_threshold_override(raw.as_deref())
+}
+
+fn parse_cache_threshold_override(
+    raw: Option<&str>,
+) -> Result<Option<f64>, WorkerSelectionPolicyProviderError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    raw.parse::<f64>().map(Some).map_err(|_| {
+        WorkerSelectionPolicyProviderError::new(format!(
+            "{CACHE_THRESHOLD_ENV} must be a number between 0.0 and 1.0, got {raw:?}"
+        ))
+    })
+}
+
 fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> Option<usize> {
     rows.min_by_key(|&row| load[row].active_requests())
 }
@@ -290,7 +313,15 @@ impl WorkerPicker for TwoTierCostFnPicker {
 fn provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    let parameters: Parameters = parameters.deserialize()?;
+    let mut parameters: Parameters = parameters.deserialize()?;
+    // Operational override for A/B runs on a baked policy file: the NVCF image carries
+    // /etc/dynamo/worker-selection-two-tier.yaml read-only, and `cache_threshold` is the knob an
+    // experiment changes most often after the host weight (which already has
+    // DYN_ROUTER_HOST_CACHE_HIT_WEIGHT). The env value wins over the YAML and is logged below as the
+    // resolved parameter, so a run that sets it cannot silently compare two identical arms.
+    if let Some(value) = cache_threshold_override()? {
+        parameters.cache_threshold = value;
+    }
     parameters.validate()?;
 
     // Announce the RESOLVED parameters, not the file contents: every field is optional and
@@ -579,6 +610,28 @@ mod tests {
         assert!(cache(-0.1).is_err() && cache(1.1).is_err() && cache(f64::NAN).is_err());
         assert!(ratio(0.9).is_err() && ratio(f64::NAN).is_err());
         assert!(Parameters::default().validate().is_ok());
+    }
+
+    #[test]
+    fn cache_threshold_env_override_parses_or_fails_loudly() {
+        assert_eq!(parse_cache_threshold_override(None).unwrap(), None);
+        assert_eq!(parse_cache_threshold_override(Some("")).unwrap(), None);
+        assert_eq!(parse_cache_threshold_override(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_cache_threshold_override(Some(" 0.3 ")).unwrap(),
+            Some(0.3)
+        );
+        assert!(parse_cache_threshold_override(Some("thirty percent")).is_err());
+        // Out-of-range values are caught by Parameters::validate after the override is applied.
+        let mut p = Parameters::default();
+        p.cache_threshold = parse_cache_threshold_override(Some("1.5"))
+            .unwrap()
+            .unwrap();
+        assert!(p.validate().is_err());
+        p.cache_threshold = parse_cache_threshold_override(Some("0.3"))
+            .unwrap()
+            .unwrap();
+        assert!(p.validate().is_ok());
     }
 
     #[test]
