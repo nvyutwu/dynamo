@@ -774,10 +774,36 @@ fn convert_tools(tools: &[Tool]) -> anyhow::Result<Vec<ChatCompletionTool>> {
                     }
                 }
             }
-            _ => return unsupported_tool(tool, "tools"),
+            _ => {
+                let tool_type = serde_json::to_value(tool)?["type"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string();
+                if is_hosted_tool_type(&tool_type) {
+                    // Hosted tools run on the provider's side; the model behind this
+                    // adapter cannot call them. Codex declares `web_search` on every
+                    // request by default, so rejecting it would break the client.
+                    tracing::debug!(tool_type, "dropping hosted Responses tool");
+                    continue;
+                }
+                return unsupported_tool(tool, "tools");
+            }
         }
     }
     Ok(converted)
+}
+
+/// Responses tool types executed by the provider (not by the client), which the
+/// model behind the Chat Completions adapter never calls. They are dropped rather
+/// than rejected. Client-executed types (`custom` freeform tools, `local_shell`)
+/// are still rejected: the client expects the model to call them.
+fn is_hosted_tool_type(tool_type: &str) -> bool {
+    tool_type.starts_with("web_search")
+        || tool_type.starts_with("computer_use")
+        || matches!(
+            tool_type,
+            "file_search" | "code_interpreter" | "image_generation" | "mcp"
+        )
 }
 
 /// Chat Completions `strict` for a Responses function tool.
