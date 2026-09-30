@@ -83,6 +83,10 @@ struct Parameters {
     /// With `respect_soft_affinity`, release the target when its load fails the balance gate
     /// against the least-loaded eligible row, so the load tier can place the request elsewhere.
     soft_affinity_load_gate: bool,
+    /// Absolute active-request gap the load gate uses. `None` — inherit `balance_abs_threshold`.
+    soft_affinity_gate_abs: Option<usize>,
+    /// Load ratio the load gate uses. `None` — inherit `balance_rel_threshold`.
+    soft_affinity_gate_rel: Option<f64>,
 }
 
 impl Default for Parameters {
@@ -94,6 +98,8 @@ impl Default for Parameters {
             host_cache_weight: None,
             respect_soft_affinity: DEFAULT_RESPECT_SOFT_AFFINITY,
             soft_affinity_load_gate: DEFAULT_SOFT_AFFINITY_LOAD_GATE,
+            soft_affinity_gate_abs: None,
+            soft_affinity_gate_rel: None,
         }
     }
 }
@@ -110,6 +116,13 @@ impl Parameters {
                 "balance_rel_threshold must be a finite number greater than or equal to 1.0",
             ));
         }
+        if let Some(rel) = self.soft_affinity_gate_rel
+            && (!rel.is_finite() || rel < 1.0)
+        {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "soft_affinity_gate_rel must be a finite number greater than or equal to 1.0",
+            ));
+        }
         if let Some(weight) = self.host_cache_weight
             && (!weight.is_finite() || weight < 0.0)
         {
@@ -119,12 +132,31 @@ impl Parameters {
         }
         Ok(())
     }
+
+    fn soft_affinity_gate_abs(&self) -> usize {
+        self.soft_affinity_gate_abs
+            .unwrap_or(self.balance_abs_threshold)
+    }
+
+    fn soft_affinity_gate_rel(&self) -> f64 {
+        self.soft_affinity_gate_rel
+            .unwrap_or(self.balance_rel_threshold)
+    }
 }
 
-/// Both balance gates: `high` exceeds `low` by more than the absolute and relative thresholds.
+/// Both gates: `high` exceeds `low` by more than `abs` and by more than `rel` times.
+fn exceeds(abs: usize, rel: f64, high: usize, low: usize) -> bool {
+    high.saturating_sub(low) > abs && (high as f64) > rel * (low as f64)
+}
+
+/// The load tier's balance gates.
 fn imbalanced(parameters: &Parameters, high: usize, low: usize) -> bool {
-    high.saturating_sub(low) > parameters.balance_abs_threshold
-        && (high as f64) > parameters.balance_rel_threshold * (low as f64)
+    exceeds(
+        parameters.balance_abs_threshold,
+        parameters.balance_rel_threshold,
+        high,
+        low,
+    )
 }
 
 fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> Option<usize> {
@@ -144,6 +176,21 @@ const REASON_LOAD_IMBALANCE: &str = "load_imbalance_least_loaded";
 const REASON_CACHE_TIER: &str = "cache_tier_least_loaded_among_max_overlap";
 const REASON_NO_CACHE_WINNER: &str = "least_loaded_no_cache_winner";
 const REASON_SOFT_AFFINITY: &str = "soft_affinity_target";
+const REASON_SOFT_AFFINITY_RELEASED: &str = "soft_affinity_released_load_gate";
+
+/// What happened to the request's soft-affinity target, reported as `soft_affinity_outcome` in
+/// the routing-decision trace so pin keep / release / drop rates can be counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AffinityOutcome {
+    /// No soft target, or `respect_soft_affinity` is off.
+    None = 0,
+    /// The target was eligible and kept.
+    Kept = 1,
+    /// The target was eligible but the load gate released it.
+    ReleasedByGate = 2,
+    /// The target was not among the eligible candidates (busy-threshold filtered or gone).
+    NotEligible = 3,
+}
 
 /// One two-tier decision, with the quantities that determined it.
 struct Decision {
@@ -157,6 +204,9 @@ struct Decision {
     max_load: usize,
     /// Two-tier effective overlap per input row, in blocks.
     row_overlap: Vec<f64>,
+    affinity: AffinityOutcome,
+    /// Active requests on the soft target's chosen row, when it was eligible.
+    affinity_target_load: Option<usize>,
 }
 
 /// The two-tier decision restricted to rows where `include` holds; `|_| true` is the policy.
@@ -195,6 +245,8 @@ fn decide(
         min_load,
         max_load,
         row_overlap: row_overlap.clone(),
+        affinity: AffinityOutcome::None,
+        affinity_target_load: None,
     };
 
     if imbalanced(parameters, max_load, min_load) {
@@ -218,7 +270,8 @@ impl TwoTierCostFnPicker {
     /// The policy's decision, shared by `pick` and `explain_pick` so the trace names the branch
     /// that chose the row. With `respect_soft_affinity`, an eligible soft target is retained by
     /// running the two-tier decision over the target's rows only; the load gate, when enabled,
-    /// releases it once it is imbalanced against the least-loaded eligible row. The oracle fields
+    /// releases it once its load exceeds the least-loaded eligible row's by more than
+    /// `soft_affinity_gate_abs` and `soft_affinity_gate_rel` (default: the load tier's thresholds). The oracle fields
     /// (`max_overlap_row`, cache ratio, load range) always describe the full candidate set.
     fn decide_for(
         &self,
@@ -244,7 +297,7 @@ impl TwoTierCostFnPicker {
                 worker.worker_id == target.worker_id
                     && target.dp_rank.is_none_or(|rank| worker.dp_rank == rank)
             };
-            if let Some(kept) = decide(
+            let Some(kept) = decide(
                 &self.parameters,
                 cache,
                 load,
@@ -252,20 +305,36 @@ impl TwoTierCostFnPicker {
                 self.host_cache_weight,
                 is_target,
             )
-            .map(|d| d.row)
-                && !(self.parameters.soft_affinity_load_gate
-                    && imbalanced(
-                        &self.parameters,
-                        load[kept].active_requests(),
-                        global.min_load,
-                    ))
-            {
+            .map(|d| d.row) else {
                 return Some(Decision {
-                    row: kept,
-                    reason: REASON_SOFT_AFFINITY,
+                    affinity: AffinityOutcome::NotEligible,
                     ..global
                 });
-            }
+            };
+            let target_load = load[kept].active_requests();
+            let released = self.parameters.soft_affinity_load_gate
+                && exceeds(
+                    self.parameters.soft_affinity_gate_abs(),
+                    self.parameters.soft_affinity_gate_rel(),
+                    target_load,
+                    global.min_load,
+                );
+            return Some(if released {
+                Decision {
+                    reason: REASON_SOFT_AFFINITY_RELEASED,
+                    affinity: AffinityOutcome::ReleasedByGate,
+                    affinity_target_load: Some(target_load),
+                    ..global
+                }
+            } else {
+                Decision {
+                    row: kept,
+                    reason: REASON_SOFT_AFFINITY,
+                    affinity: AffinityOutcome::Kept,
+                    affinity_target_load: Some(target_load),
+                    ..global
+                }
+            });
         }
         Some(global)
     }
@@ -328,6 +397,22 @@ impl WorkerPicker for TwoTierCostFnPicker {
                 ("max_effective_overlap_blocks".into(), decision.max_overlap),
                 ("min_active_requests".into(), decision.min_load as f64),
                 ("max_active_requests".into(), decision.max_load as f64),
+                (
+                    "soft_affinity_gate_abs".into(),
+                    self.parameters.soft_affinity_gate_abs() as f64,
+                ),
+                (
+                    "soft_affinity_gate_rel".into(),
+                    self.parameters.soft_affinity_gate_rel(),
+                ),
+                (
+                    "soft_affinity_outcome".into(),
+                    decision.affinity as u8 as f64,
+                ),
+                (
+                    "soft_affinity_target_active_requests".into(),
+                    decision.affinity_target_load.map_or(-1.0, |l| l as f64),
+                ),
             ],
         })
     }
@@ -635,6 +720,15 @@ mod tests {
 
         assert!(cache(-0.1).is_err() && cache(1.1).is_err() && cache(f64::NAN).is_err());
         assert!(ratio(0.9).is_err() && ratio(f64::NAN).is_err());
+        let gate_ratio = |v| {
+            Parameters {
+                soft_affinity_gate_rel: Some(v),
+                ..Default::default()
+            }
+            .validate()
+        };
+        assert!(gate_ratio(0.9).is_err() && gate_ratio(f64::NAN).is_err());
+        assert!(gate_ratio(1.0).is_ok());
         assert!(Parameters::default().validate().is_ok());
     }
 
@@ -721,5 +815,23 @@ mod tests {
             ),
             worker(B)
         );
+    }
+
+    #[test]
+    fn load_gate_takes_its_own_thresholds_without_moving_the_load_tier() {
+        let own_gate = Parameters {
+            soft_affinity_gate_abs: Some(6),
+            soft_affinity_gate_rel: Some(1.5),
+            ..gated()
+        };
+        // Gap 7 > 6 and 9 > 1.5 * 2: released; the shared 32 / 1.1 gate keeps it.
+        assert_eq!(select_soft(gated(), [(A, 0, 9), (B, 0, 2)]), worker(A));
+        assert_eq!(select_soft(own_gate, [(A, 0, 9), (B, 0, 2)]), worker(B));
+        // Gap 6 is not > 6: kept.
+        assert_eq!(select_soft(own_gate, [(A, 0, 8), (B, 0, 2)]), worker(A));
+        // Gap 10 but 30 is not > 1.5 * 20: kept.
+        assert_eq!(select_soft(own_gate, [(A, 0, 30), (B, 0, 20)]), worker(A));
+        // Without a soft target the load tier still uses 32 / 1.1: B's cache wins at a gap of 7.
+        assert_eq!(select_with(own_gate, [(A, 0, 2), (B, 10, 9)]), worker(B));
     }
 }

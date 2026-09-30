@@ -107,7 +107,7 @@ fn select_with(
         .resolve(&config)
         .expect("baked YAML must resolve")
         .expect("baked YAML must produce a factory");
-    let mut policy = factory(
+    let policy = factory(
         &config,
         WorkerType::Aggregated,
         RoutingPartitionRef::new("model", "default"),
@@ -270,9 +270,58 @@ fn soft_affinity_branch_is_traced() {
         [(A, 0, 0, 40), (B, 0, 0, 2)],
     );
     assert_eq!(selected, worker(B));
+    let trace = trace.unwrap();
+    assert_eq!(trace.selection_reason, "soft_affinity_released_load_gate");
+    assert_eq!(param(&trace, "soft_affinity_outcome"), 2.0);
+    assert_eq!(param(&trace, "soft_affinity_target_active_requests"), 40.0);
+}
+
+/// Every trace carries the gate thresholds in force and the soft-affinity outcome:
+/// 0 no target, 1 kept, 2 released by the gate, 3 target not among the eligible candidates.
+#[test]
+fn soft_affinity_outcome_is_traced() {
+    const GATE_YAML: &str = r#"
+worker_selection:
+  aggregated: dynamo-two-tier-cost-fn
+  instances:
+    - name: dynamo-two-tier-cost-fn
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        respect_soft_affinity: true
+        soft_affinity_load_gate: true
+        soft_affinity_gate_abs: 6
+        soft_affinity_gate_rel: 1.5
+"#;
+    let outcome = |target: Option<u64>, workers, request_id: &str| {
+        let (selected, trace) = select_with(
+            GATE_YAML,
+            target.map(|id| WorkerAffinityTarget::new(id, None)),
+            request_id,
+            workers,
+        );
+        let trace = trace.unwrap();
+        assert_eq!(param(&trace, "soft_affinity_gate_abs"), 6.0);
+        assert_eq!(param(&trace, "soft_affinity_gate_rel"), 1.5);
+        (selected, param(&trace, "soft_affinity_outcome"))
+    };
+
     assert_eq!(
-        trace.unwrap().selection_reason,
-        "load_imbalance_least_loaded"
+        outcome(None, [(A, 0, 0, 5), (B, 8, 0, 5)], "req-none"),
+        (worker(B), 0.0)
+    );
+    assert_eq!(
+        outcome(Some(A), [(A, 0, 0, 8), (B, 0, 0, 2)], "req-kept"),
+        (worker(A), 1.0)
+    );
+    // Gap 7 > 6 and 9 > 1.5 * 2: released, where the shared 32 / 1.1 gate would have kept it.
+    assert_eq!(
+        outcome(Some(A), [(A, 0, 0, 9), (B, 0, 0, 2)], "req-released"),
+        (worker(B), 2.0)
+    );
+    // The target is not a candidate (e.g. filtered as busy): the global decision stands.
+    assert_eq!(
+        outcome(Some(99), [(A, 0, 0, 5), (B, 8, 0, 5)], "req-not-eligible"),
+        (worker(B), 3.0)
     );
 }
 
