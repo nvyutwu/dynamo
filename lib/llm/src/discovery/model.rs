@@ -654,6 +654,19 @@ impl Model {
             .ok_or_else(|| self.engine_error(self.has_chat_engine()))
     }
 
+    /// The Rust chat preprocessor and parsing options of the WorkerSet the
+    /// chat engine would be selected from, for render-only work (Anthropic
+    /// `count_tokens`). `None` when no WorkerSet has a Rust chat preprocessor.
+    pub fn get_chat_preprocessor_with_parsing(
+        &self,
+    ) -> Option<(Arc<crate::preprocessor::OpenAIPreprocessor>, ParsingOptions)> {
+        self.select_worker_set_with(|ws| {
+            ws.chat_preprocessor
+                .clone()
+                .map(|preprocessor| (preprocessor, ws.parsing_options()))
+        })
+    }
+
     pub fn get_completions_engine_with_parsing(
         &self,
     ) -> Result<(OpenAICompletionsStreamingEngine, ParsingOptions), ModelManagerError> {
@@ -1868,6 +1881,41 @@ mod tests {
         model.add_worker_set("ns1".to_string(), Arc::new(ws));
 
         assert!(model.is_ready_to_serve());
+    }
+
+    /// `count_tokens` finds the Rust chat preprocessor of a serving WorkerSet,
+    /// and reports none for a chat engine without one (Python chat processor).
+    #[test]
+    fn test_get_chat_preprocessor_with_parsing() {
+        let without = Model::new("llama".to_string());
+        let mut ws = WorkerSet::new(
+            "ns1".to_string(),
+            "abc".to_string(),
+            crate::model_card::ModelDeploymentCard::default(),
+        );
+        ws.chat_engine = Some(make_test_chat_engine());
+        without.add_worker_set("ns1".to_string(), Arc::new(ws));
+        assert!(without.get_chat_preprocessor_with_parsing().is_none());
+
+        let card = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        let preprocessor = crate::preprocessor::OpenAIPreprocessor::new(card).unwrap();
+        let with = Model::new("llama".to_string());
+        let mut ws = WorkerSet::new(
+            "ns1".to_string(),
+            "abc".to_string(),
+            crate::model_card::ModelDeploymentCard::default(),
+        );
+        ws.chat_engine = Some(make_test_chat_engine());
+        ws.chat_preprocessor = Some(preprocessor.clone());
+        with.add_worker_set("ns1".to_string(), Arc::new(ws));
+        let (found, _parsing) = with
+            .get_chat_preprocessor_with_parsing()
+            .expect("preprocessor registered");
+        assert!(Arc::ptr_eq(&found, &preprocessor));
     }
 
     /// Build a chat completions engine backed by the in-tree echo engine.

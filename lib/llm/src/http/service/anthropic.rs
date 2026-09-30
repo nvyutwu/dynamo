@@ -44,8 +44,8 @@ use crate::protocols::anthropic::stream_converter::AnthropicStreamConverter;
 use crate::protocols::anthropic::types::{
     AnthropicContentBlock, AnthropicCountTokensRequest, AnthropicCountTokensResponse,
     AnthropicCreateMessageRequest, AnthropicErrorBody, AnthropicErrorResponse, AnthropicMessage,
-    AnthropicMessageContent, AnthropicTool, SystemContent, anthropic_budget_effort,
-    chat_completion_to_anthropic_response,
+    AnthropicMessageContent, AnthropicTool, AnthropicToolChoice, SystemContent, ThinkingConfig,
+    anthropic_budget_effort, chat_completion_to_anthropic_response,
 };
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, SESSION_AFFINITY_CONTEXT_KEY, agent_context_from_headers,
@@ -783,12 +783,41 @@ async fn anthropic_messages(
 // Count tokens
 // ---------------------------------------------------------------------------
 
+/// Body of `POST /v1/messages/count_tokens`: the pinned protocol type plus the
+/// request controls it does not model but that change the rendered prompt
+/// (thinking and effort select K3's thinking block; tool_choice can change the
+/// tool section).
+#[derive(serde::Deserialize)]
+struct AnthropicCountTokensBody {
+    #[serde(flatten)]
+    request: AnthropicCountTokensRequest,
+    #[serde(default)]
+    thinking: Option<ThinkingConfig>,
+    #[serde(default)]
+    tool_choice: Option<AnthropicToolChoice>,
+    #[serde(default)]
+    output_config: Option<serde_json::Value>,
+}
+
 /// Handler for POST /v1/messages/count_tokens.
-/// Returns an estimated input token count using a len/3 heuristic.
+///
+/// Counts the prompt exactly as `/v1/messages` would bill it: the body is
+/// converted like a Messages request (same reasoning resolution, same
+/// preamble stripping), rendered with the model's chat template, and
+/// tokenized by the model's Rust preprocessor. Falls back to the `len/3`
+/// estimate only when no Rust preprocessor is available for the model (unknown
+/// model, Python chat processor) or the body declares tools the Messages path
+/// does not convert (server tools).
 async fn handler_count_tokens(
-    State((state, _template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
-    Json(mut request): Json<AnthropicCountTokensRequest>,
+    State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    Json(body): Json<AnthropicCountTokensBody>,
 ) -> Result<Response, Response> {
+    let AnthropicCountTokensBody {
+        mut request,
+        thinking,
+        tool_choice,
+        output_config,
+    } = body;
     if let Err(error) = validate_anthropic_messages(&request.messages) {
         return Err(anthropic_error(
             error.status(),
@@ -801,11 +830,113 @@ async fn handler_count_tokens(
     if state.strip_anthropic_preamble_enabled() {
         strip_billing_preamble(&mut request.system);
     }
-    let tokens = request.estimate_tokens();
+    let tokens = match count_anthropic_prompt_tokens(
+        &state,
+        template.as_ref(),
+        &request,
+        thinking,
+        tool_choice,
+        output_config,
+    )
+    .await?
+    {
+        Some(tokens) => tokens,
+        None => request.estimate_tokens(),
+    };
     Ok(Json(AnthropicCountTokensResponse {
         input_tokens: tokens,
     })
     .into_response())
+}
+
+/// Render and tokenize a count request through the model's chat preprocessor.
+/// `Ok(None)` means "no exact count available, use the estimate".
+async fn count_anthropic_prompt_tokens(
+    state: &service_v2::State,
+    template: Option<&RequestTemplate>,
+    request: &AnthropicCountTokensRequest,
+    thinking: Option<ThinkingConfig>,
+    tool_choice: Option<AnthropicToolChoice>,
+    output_config: Option<serde_json::Value>,
+) -> Result<Option<u32>, Response> {
+    let mut model = request.model.clone();
+    if model.is_empty()
+        && let Some(template) = template
+    {
+        model = template.model.clone();
+    }
+    let model = state.manager().resolve_canonical_name(&model);
+    let Some((preprocessor, parsing_options)) =
+        state.manager().get_chat_preprocessor_with_parsing(&model)
+    else {
+        return Ok(None);
+    };
+    // Server tools have no `input_schema`; `/v1/messages` rejects them, but
+    // `count_tokens` stays permissive, so estimate instead.
+    if request
+        .tools
+        .as_deref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool.input_schema.is_none()))
+    {
+        return Ok(None);
+    }
+
+    let thinking_budget_tokens = thinking
+        .as_ref()
+        .filter(|t| t.thinking_type == "enabled")
+        .and_then(|t| t.budget_tokens);
+    let message_request = AnthropicCreateMessageRequest {
+        model: model.clone(),
+        // Not rendered; only needs to be a valid Messages value.
+        max_tokens: 1,
+        messages: request.messages.clone(),
+        nvext: None,
+        system: request.system.clone(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: false,
+        metadata: None,
+        tools: request.tools.clone(),
+        tool_choice,
+        cache_control: None,
+        thinking,
+        service_tier: None,
+        container: None,
+        output_config,
+    };
+    let invalid = |message: String| {
+        anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+    };
+    let mut chat_request = NvCreateChatCompletionRequest::try_from(message_request)
+        .map_err(|e| invalid(format!("Failed to convert request: {e}")))?;
+    apply_anthropic_reasoning_controls(
+        &mut chat_request,
+        parsing_options.reasoning_parser.as_deref(),
+        thinking_budget_tokens,
+        default_thinking_effort(),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+
+    match preprocessor.count_chat_prompt_tokens(chat_request).await {
+        Ok(tokens) => Ok(Some(tokens)),
+        // The same request would be rejected by `/v1/messages`; say so.
+        Err(e) if find_invalid_argument_in_chain(e.as_ref()).is_some() => {
+            let message = find_invalid_argument_in_chain(e.as_ref())
+                .map(|error| error.message().to_string())
+                .unwrap_or_default();
+            Err(invalid(message))
+        }
+        Err(e) => {
+            tracing::warn!(
+                model,
+                error = %e,
+                "count_tokens: prompt rendering failed; returning the estimate"
+            );
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
