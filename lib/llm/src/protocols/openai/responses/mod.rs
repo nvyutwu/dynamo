@@ -749,7 +749,7 @@ fn convert_tools(tools: &[Tool]) -> anyhow::Result<Vec<ChatCompletionTool>> {
                 name: name.to_owned(),
                 description: description.clone(),
                 parameters: parameters.clone(),
-                strict,
+                strict: chat_tool_strict(strict),
             },
         });
         Ok(())
@@ -778,6 +778,20 @@ fn convert_tools(tools: &[Tool]) -> anyhow::Result<Vec<ChatCompletionTool>> {
         }
     }
     Ok(converted)
+}
+
+/// Chat Completions `strict` for a Responses function tool.
+///
+/// Responses clients send `strict` on every function tool (the OpenAI SDK type
+/// requires it; Codex sends `false`), while Chat clients normally omit it. The
+/// converted tool is rendered into the prompt as JSON, so a forwarded
+/// `"strict":false` made each Responses tool 3 prompt tokens longer on Kimi K3
+/// than the same tool sent to Chat Completions. `false` means the same as an
+/// absent flag everywhere downstream (`strict.unwrap_or(false)`), so drop it.
+/// `true` is kept: it requests strict tool constraints, and a Chat tool with
+/// `strict: true` renders it the same way.
+fn chat_tool_strict(strict: Option<bool>) -> Option<bool> {
+    strict.filter(|strict| *strict)
 }
 
 /// Identify an unsupported tool or choice by its serialized type and return
@@ -3989,5 +4003,97 @@ thinking
 
         // nvext should be omitted when None
         assert!(json.get("nvext").is_none());
+    }
+
+    /// The tool JSON the chat template sees (the prompt renderer's `tools()`).
+    fn rendered_tools(request: &NvCreateChatCompletionRequest) -> serde_json::Value {
+        use dynamo_renderer::OAIChatLikeRequest;
+        serde_json::to_value(request.tools().expect("tools rendered")).unwrap()
+    }
+
+    fn chat_request_with_tools(tools: serde_json::Value) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+        }))
+        .unwrap()
+    }
+
+    fn responses_request_with_tools(tools: serde_json::Value) -> NvCreateChatCompletionRequest {
+        let request: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": tools,
+        }))
+        .unwrap();
+        request.try_into().unwrap()
+    }
+
+    /// A Responses function tool must reach the chat template exactly as the
+    /// same tool sent to Chat Completions, including the `strict: false` every
+    /// Codex tool carries (it rendered as 3 extra K3 prompt tokens per tool).
+    #[test]
+    fn test_responses_function_tools_render_identically_to_chat() {
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        });
+        let names = ["get_weather", "get_time", "get_news"];
+        for strict in [None, Some(false)] {
+            for count in 1..=names.len() {
+                let chat_tools: Vec<_> = names[..count]
+                    .iter()
+                    .map(|name| {
+                        serde_json::json!({"type": "function", "function": {
+                            "name": name, "description": "Look it up", "parameters": params,
+                        }})
+                    })
+                    .collect();
+                let responses_tools: Vec<_> = names[..count]
+                    .iter()
+                    .map(|name| {
+                        let mut tool = serde_json::json!({
+                            "type": "function", "name": name,
+                            "description": "Look it up", "parameters": params,
+                        });
+                        if let Some(strict) = strict {
+                            tool["strict"] = serde_json::json!(strict);
+                        }
+                        tool
+                    })
+                    .collect();
+                let chat = chat_request_with_tools(serde_json::json!(chat_tools));
+                let converted = responses_request_with_tools(serde_json::json!(responses_tools));
+                assert_eq!(
+                    rendered_tools(&converted),
+                    rendered_tools(&chat),
+                    "strict={strict:?} tools={count}"
+                );
+                assert_eq!(
+                    serde_json::to_string(&converted.inner.tools).unwrap(),
+                    serde_json::to_string(&chat.inner.tools).unwrap(),
+                );
+            }
+        }
+    }
+
+    /// `strict: true` is a real constraint request, so it is kept and renders
+    /// exactly like a Chat tool that sets it.
+    #[test]
+    fn test_responses_strict_true_tool_matches_chat_strict_true_tool() {
+        let chat = chat_request_with_tools(serde_json::json!([{"type": "function", "function": {
+            "name": "f", "parameters": {"type": "object", "properties": {}}, "strict": true,
+        }}]));
+        let converted = responses_request_with_tools(serde_json::json!([{
+            "type": "function", "name": "f",
+            "parameters": {"type": "object", "properties": {}}, "strict": true,
+        }]));
+        assert_eq!(rendered_tools(&converted), rendered_tools(&chat));
+        assert_eq!(
+            converted.inner.tools.unwrap()[0].function.strict,
+            Some(true)
+        );
     }
 }
