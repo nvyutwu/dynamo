@@ -136,6 +136,13 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
             .filter(|sequences| !sequences.is_empty())
             .map(dynamo_protocols::types::Stop::StringArray);
 
+        // Carry the client's thinking intent into the chat request so the
+        // handler's `normalize_reasoning_template_args` resolves it exactly as
+        // it does for Chat Completions (see `anthropic_thinking_intent` and
+        // `anthropic_output_effort`).
+        let thinking = anthropic_thinking_intent(req.thinking.as_ref());
+        let reasoning_effort = anthropic_output_effort(req.output_config.as_ref())?;
+
         Ok(NvCreateChatCompletionRequest {
             inner: dynamo_protocols::types::CreateChatCompletionRequest {
                 messages,
@@ -147,6 +154,7 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
                 tools,
                 tool_choice,
                 parallel_tool_calls,
+                reasoning_effort,
                 stream: Some(true), // Always stream internally
                 // Request cumulative usage on every chunk (not just the final
                 // one) so the Anthropic stream converter can stamp an
@@ -181,11 +189,64 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
             } else {
                 None
             },
-            thinking: None,
+            thinking,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
             unsupported_fields: Default::default(),
         })
+    }
+}
+
+/// Anthropic `thinking.budget_tokens` at or below this maps to K3 effort `low`.
+pub const ANTHROPIC_BUDGET_LOW_MAX_TOKENS: u32 = 4096;
+/// Anthropic `thinking.budget_tokens` at or below this (and above
+/// [`ANTHROPIC_BUDGET_LOW_MAX_TOKENS`]) maps to K3 effort `high`; larger
+/// budgets map to `max`.
+pub const ANTHROPIC_BUDGET_HIGH_MAX_TOKENS: u32 = 16384;
+
+/// Translate Anthropic `thinking.type` into the Chat Completions `thinking`
+/// object that `normalize_reasoning_template_args` understands.
+///
+/// `enabled`, `disabled`, and `adaptive` map one-to-one. Any other type (or no
+/// `thinking` at all) states nothing, so the handler's defaults apply.
+fn anthropic_thinking_intent(thinking: Option<&ThinkingConfig>) -> Option<serde_json::Value> {
+    let thinking_type = thinking?.thinking_type.as_str();
+    matches!(thinking_type, "enabled" | "disabled" | "adaptive")
+        .then(|| serde_json::json!({ "type": thinking_type }))
+}
+
+/// Read Anthropic `output_config.effort` as a Chat Completions reasoning grade.
+///
+/// The grade is forwarded verbatim (`low`, `medium`, `high`, `max`, …); the
+/// handler maps it onto a model's own levels where needed (Kimi K3:
+/// `coerce_kimi_k3_reasoning_effort`). A present but unrecognised value is a
+/// request error, matching Anthropic's own validation.
+fn anthropic_output_effort(
+    output_config: Option<&serde_json::Value>,
+) -> anyhow::Result<Option<dynamo_protocols::types::ReasoningEffort>> {
+    let Some(effort) = output_config
+        .and_then(|config| config.get("effort"))
+        .filter(|effort| !effort.is_null())
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(effort.clone())
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("output_config.effort must be one of low, medium, high, max"))
+}
+
+/// Map Anthropic `thinking.budget_tokens` onto a Kimi K3 thinking level:
+/// `<= 4096` → `low`, `<= 16384` → `high`, otherwise `max`
+/// (thresholds: [`ANTHROPIC_BUDGET_LOW_MAX_TOKENS`],
+/// [`ANTHROPIC_BUDGET_HIGH_MAX_TOKENS`]).
+pub fn anthropic_budget_effort(budget_tokens: u32) -> dynamo_protocols::types::ReasoningEffort {
+    use dynamo_protocols::types::ReasoningEffort;
+    if budget_tokens <= ANTHROPIC_BUDGET_LOW_MAX_TOKENS {
+        ReasoningEffort::Low
+    } else if budget_tokens <= ANTHROPIC_BUDGET_HIGH_MAX_TOKENS {
+        ReasoningEffort::High
+    } else {
+        ReasoningEffort::Max
     }
 }
 
@@ -2514,6 +2575,81 @@ mod tests {
             &chat_req.inner.messages[3],
             ChatCompletionRequestMessage::Tool(_)
         ));
+    }
+
+    fn anthropic_request(extra: serde_json::Value) -> AnthropicCreateMessageRequest {
+        let mut value = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn test_thinking_type_is_carried_as_chat_thinking_intent() {
+        for thinking_type in ["enabled", "disabled", "adaptive"] {
+            let req = anthropic_request(serde_json::json!({
+                "thinking": {"type": thinking_type, "budget_tokens": 2048}
+            }));
+            let chat = NvCreateChatCompletionRequest::try_from(req).unwrap();
+            assert_eq!(
+                chat.thinking,
+                Some(serde_json::json!({"type": thinking_type})),
+                "{thinking_type}"
+            );
+        }
+        let chat =
+            NvCreateChatCompletionRequest::try_from(anthropic_request(serde_json::json!({})))
+                .unwrap();
+        assert_eq!(chat.thinking, None);
+        assert_eq!(chat.inner.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_output_config_effort_maps_to_reasoning_effort() {
+        use dynamo_protocols::types::ReasoningEffort;
+        for (effort, expected) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("max", ReasoningEffort::Max),
+        ] {
+            let req = anthropic_request(serde_json::json!({"output_config": {"effort": effort}}));
+            let chat = NvCreateChatCompletionRequest::try_from(req).unwrap();
+            assert_eq!(chat.inner.reasoning_effort, Some(expected), "{effort}");
+        }
+        // `output_config` without effort (e.g. only a format) states no effort.
+        let req = anthropic_request(serde_json::json!({"output_config": {"format": null}}));
+        let chat = NvCreateChatCompletionRequest::try_from(req).unwrap();
+        assert_eq!(chat.inner.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_invalid_output_config_effort_is_rejected() {
+        let req = anthropic_request(serde_json::json!({"output_config": {"effort": "turbo"}}));
+        let err = NvCreateChatCompletionRequest::try_from(req).unwrap_err();
+        assert!(err.to_string().contains("output_config.effort"), "{err}");
+    }
+
+    #[test]
+    fn test_budget_tokens_map_to_k3_effort_thresholds() {
+        use dynamo_protocols::types::ReasoningEffort;
+        for (budget, expected) in [
+            (0, ReasoningEffort::Low),
+            (1024, ReasoningEffort::Low),
+            (4096, ReasoningEffort::Low),
+            (4097, ReasoningEffort::High),
+            (16384, ReasoningEffort::High),
+            (16385, ReasoningEffort::Max),
+            (64000, ReasoningEffort::Max),
+        ] {
+            assert_eq!(anthropic_budget_effort(budget), expected, "{budget}");
+        }
     }
 }
 

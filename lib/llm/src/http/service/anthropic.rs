@@ -44,7 +44,8 @@ use crate::protocols::anthropic::stream_converter::AnthropicStreamConverter;
 use crate::protocols::anthropic::types::{
     AnthropicContentBlock, AnthropicCountTokensRequest, AnthropicCountTokensResponse,
     AnthropicCreateMessageRequest, AnthropicErrorBody, AnthropicErrorResponse, AnthropicMessage,
-    AnthropicMessageContent, AnthropicTool, SystemContent, chat_completion_to_anthropic_response,
+    AnthropicMessageContent, AnthropicTool, SystemContent, anthropic_budget_effort,
+    chat_completion_to_anthropic_response,
 };
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, SESSION_AFFINITY_CONTEXT_KEY, agent_context_from_headers,
@@ -55,6 +56,7 @@ use crate::protocols::common::input_trigger::classify_anthropic_request;
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
     NvCreateChatCompletionStreamResponse, aggregator::ChatCompletionAggregator,
+    default_thinking_effort, is_kimi_k3_reasoning_parser,
 };
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::{RequestTemplate, resolve_request_model};
@@ -451,11 +453,14 @@ async fn anthropic_messages(
         0
     };
 
-    // Check if the Anthropic request explicitly disabled thinking.
-    let thinking_explicitly_disabled = orig_request
+    // `thinking.budget_tokens` has no Chat Completions field. It is mapped onto
+    // a Kimi K3 thinking level below (K3 targets only), so capture it before
+    // the request is consumed.
+    let thinking_budget_tokens = orig_request
         .thinking
         .as_ref()
-        .is_some_and(|t| t.thinking_type == "disabled");
+        .filter(|t| t.thinking_type == "enabled")
+        .and_then(|t| t.budget_tokens);
 
     // Convert Anthropic request -> UnifiedRequest -> Chat Completion request
     let unified_request: UnifiedRequest = orig_request.try_into().map_err(|e: anyhow::Error| {
@@ -487,39 +492,21 @@ async fn anthropic_messages(
             error.message(),
         ));
     }
-    // When a reasoning parser is configured and the client hasn't explicitly
-    // disabled thinking, assume the model's chat template will inject `<think>`.
-    //
-    // Two things must be aligned:
-    //   1. chat_template_args must include enable_thinking=true so the backend's
-    //      template actually injects `<think>` into the prompt. For the
-    //      ModelInput::Text path (SGLang without --skip-tokenizer-init), the
-    //      backend applies the template — without explicit enable_thinking the
-    //      result depends on the template's default which varies by model.
-    //   2. prompt_injected_reasoning must be true so the parser starts in
-    //      reasoning mode with stripped_think_start=true, which is critical for
-    //      correct `</think>` boundary detection in the streaming path.
-    //
-    // The OpenAI path handles this in the preprocessor: it renders the template,
-    // inspects the formatted prompt for a trailing `<think>`, and sets
-    // prompt_injected_reasoning accordingly. The Anthropic path bypasses the
-    // preprocessor, so we infer prompt injection from the reasoning parser config.
-    let prompt_injected_reasoning =
-        parsing_options.reasoning_parser.is_some() && !thinking_explicitly_disabled;
-
-    if prompt_injected_reasoning {
-        let args = chat_request
-            .chat_template_args
-            .get_or_insert_with(Default::default);
-        args.entry("enable_thinking".to_string())
-            .or_insert(serde_json::Value::Bool(true));
-        // Preserve reasoning from prior turns. Some templates (Nemotron)
-        // strip historical <think> content by default to save context.
-        // For agentic flows the model needs to see why it made prior decisions.
-        // Ref: NVIDIA's SWE training config also sets this to false:
-        // https://github.com/NVIDIA-NeMo/Nemotron/blob/main/src/nemotron/recipes/super3/stage2_rl/stage2_swe2/config/default.yaml#L287
-        args.entry("truncate_history_thinking".to_string())
-            .or_insert(serde_json::Value::Bool(false));
+    // Resolve thinking/effort the same way Chat Completions and Responses do,
+    // so the serve-time default (`DYN_KIMI_K3_DEFAULT_THINKING_EFFORT`) applies
+    // to `/v1/messages` too. See `apply_anthropic_reasoning_controls`.
+    if let Err(error) = apply_anthropic_reasoning_controls(
+        &mut chat_request,
+        parsing_options.reasoning_parser.as_deref(),
+        thinking_budget_tokens,
+        default_thinking_effort(),
+    ) {
+        inflight_guard.mark_error(ErrorType::Validation);
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &error.to_string(),
+        ));
     }
 
     let request = context.map(|_req| chat_request);
@@ -1105,6 +1092,92 @@ fn apply_anthropic_nvext_policy(
     };
 }
 
+/// Resolve an Anthropic request's thinking and effort into `chat_template_args`
+/// with the same normalization Chat Completions and Responses use, and return
+/// whether the prompt will open a reasoning block (`prompt_injected_reasoning`).
+///
+/// Effort precedence: `output_config.effort` (already on `reasoning_effort` by
+/// the conversion), then `thinking.budget_tokens` mapped onto a K3 level (Kimi
+/// K3 targets only; `anthropic_budget_effort`), then `default_effort` (the
+/// `DYN_KIMI_K3_DEFAULT_THINKING_EFFORT` server default). For K3, grades the
+/// renderer cannot render are coerced onto `low|high|max`.
+///
+/// `thinking: {type: disabled}` becomes an explicit `enable_thinking=false`
+/// (the renderer decides what that means for the model), and then the parser
+/// must not start in reasoning mode. Without a decision, a configured reasoning
+/// parser implies the template opens a reasoning block, so `enable_thinking`
+/// defaults to true; `adaptive` leaves the toggle unset.
+fn apply_anthropic_reasoning_controls(
+    chat_request: &mut NvCreateChatCompletionRequest,
+    reasoning_parser: Option<&str>,
+    thinking_budget_tokens: Option<u32>,
+    default_effort: Option<&str>,
+) -> anyhow::Result<bool> {
+    let is_kimi_k3 = is_kimi_k3_reasoning_parser(reasoning_parser);
+    if is_kimi_k3
+        && chat_request.inner.reasoning_effort.is_none()
+        && let Some(budget_tokens) = thinking_budget_tokens
+    {
+        chat_request.inner.reasoning_effort = Some(anthropic_budget_effort(budget_tokens));
+    }
+    chat_request.normalize_reasoning_template_args_with_default(default_effort)?;
+    if is_kimi_k3 {
+        chat_request.coerce_kimi_k3_reasoning_effort();
+    }
+
+    // The thinking decision after normalization: an explicit boolean in either
+    // dialect, or `None` when nothing was decided (or `adaptive`, which leaves
+    // the choice to the model).
+    let normalized_args = chat_request.chat_template_args.as_ref();
+    let thinking_decision = normalized_args.and_then(|args| {
+        ["thinking", "enable_thinking"]
+            .iter()
+            .find_map(|key| args.get(*key).and_then(|v| v.as_bool()))
+    });
+    let thinking_adaptive = normalized_args
+        .and_then(|args| args.get("thinking_mode"))
+        .and_then(|mode| mode.as_str())
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("adaptive"));
+
+    // When a reasoning parser is configured and the client hasn't explicitly
+    // disabled thinking, assume the model's chat template will inject `<think>`.
+    //
+    // Two things must be aligned:
+    //   1. chat_template_args must include enable_thinking=true so the backend's
+    //      template actually injects `<think>` into the prompt. For the
+    //      ModelInput::Text path (SGLang without --skip-tokenizer-init), the
+    //      backend applies the template — without explicit enable_thinking the
+    //      result depends on the template's default which varies by model.
+    //   2. prompt_injected_reasoning must be true so the parser starts in
+    //      reasoning mode with stripped_think_start=true, which is critical for
+    //      correct `</think>` boundary detection in the streaming path.
+    //
+    // The OpenAI path handles this in the preprocessor: it renders the template,
+    // inspects the formatted prompt for a trailing `<think>`, and sets
+    // prompt_injected_reasoning accordingly. The Anthropic path bypasses the
+    // preprocessor, so we infer prompt injection from the reasoning parser config.
+    let prompt_injected_reasoning = reasoning_parser.is_some() && thinking_decision != Some(false);
+
+    if prompt_injected_reasoning {
+        let args = chat_request
+            .chat_template_args
+            .get_or_insert_with(Default::default);
+        // `adaptive` must not carry a toggle (the model decides).
+        if !thinking_adaptive {
+            args.entry("enable_thinking".to_string())
+                .or_insert(serde_json::Value::Bool(true));
+        }
+        // Preserve reasoning from prior turns. Some templates (Nemotron)
+        // strip historical <think> content by default to save context.
+        // For agentic flows the model needs to see why it made prior decisions.
+        // Ref: NVIDIA's SWE training config also sets this to false:
+        // https://github.com/NVIDIA-NeMo/Nemotron/blob/main/src/nemotron/recipes/super3/stage2_rl/stage2_swe2/config/default.yaml#L287
+        args.entry("truncate_history_thinking".to_string())
+            .or_insert(serde_json::Value::Bool(false));
+    }
+    Ok(prompt_injected_reasoning)
+}
+
 /// Re-wrap a backend-error status from
 /// [`super::openai::check_for_backend_error`] in Anthropic's error format.
 ///
@@ -1386,5 +1459,171 @@ mod tests {
             find_invalid_argument_in_chain(error.as_ref()).map(|error| error.message()),
             Some("invalid request")
         );
+    }
+
+    /// Convert an Anthropic body and run the handler's reasoning resolution
+    /// against a K3 (`kimi_k3`) or other reasoning parser, with the server
+    /// default effort `low` (the K3 production setting).
+    fn resolve_reasoning(
+        body: serde_json::Value,
+        reasoning_parser: Option<&str>,
+    ) -> (NvCreateChatCompletionRequest, bool) {
+        let mut value = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(value).unwrap();
+        let budget = request
+            .thinking
+            .as_ref()
+            .filter(|t| t.thinking_type == "enabled")
+            .and_then(|t| t.budget_tokens);
+        let mut chat = NvCreateChatCompletionRequest::try_from(request).unwrap();
+        let injected =
+            apply_anthropic_reasoning_controls(&mut chat, reasoning_parser, budget, Some("low"))
+                .unwrap();
+        (chat, injected)
+    }
+
+    fn arg<'a>(
+        chat: &'a NvCreateChatCompletionRequest,
+        key: &str,
+    ) -> Option<&'a serde_json::Value> {
+        chat.chat_template_args
+            .as_ref()
+            .and_then(|args| args.get(key))
+    }
+
+    #[test]
+    fn test_k3_messages_without_thinking_get_server_default_effort() {
+        let (chat, injected) = resolve_reasoning(serde_json::json!({}), Some("kimi_k3"));
+        assert!(injected);
+        assert_eq!(
+            arg(&chat, "thinking_effort"),
+            Some(&serde_json::json!("low"))
+        );
+        assert_eq!(
+            arg(&chat, "enable_thinking"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(arg(&chat, "reasoning_effort"), None);
+        assert!(
+            chat.thinking.is_none(),
+            "raw thinking is folded into template args"
+        );
+    }
+
+    #[test]
+    fn test_k3_messages_budget_tokens_select_effort() {
+        for (budget, expected) in [(1024, "low"), (4096, "low"), (8192, "high"), (32000, "max")] {
+            let (chat, injected) = resolve_reasoning(
+                serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": budget}}),
+                Some("kimi_k3"),
+            );
+            assert!(injected);
+            assert_eq!(
+                arg(&chat, "reasoning_effort"),
+                Some(&serde_json::json!(expected)),
+                "budget {budget}"
+            );
+            // A per-request effort suppresses the server default.
+            assert_eq!(arg(&chat, "thinking_effort"), None, "budget {budget}");
+            assert_eq!(
+                arg(&chat, "enable_thinking"),
+                Some(&serde_json::json!(true))
+            );
+        }
+    }
+
+    #[test]
+    fn test_k3_messages_output_config_effort_wins_and_is_coerced() {
+        for (effort, expected) in [
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("max", "max"),
+        ] {
+            let (chat, _) = resolve_reasoning(
+                serde_json::json!({
+                    "thinking": {"type": "enabled", "budget_tokens": 1024},
+                    "output_config": {"effort": effort}
+                }),
+                Some("kimi_k3"),
+            );
+            assert_eq!(
+                arg(&chat, "reasoning_effort"),
+                Some(&serde_json::json!(expected)),
+                "effort {effort}"
+            );
+            assert_eq!(arg(&chat, "thinking_effort"), None);
+        }
+    }
+
+    #[test]
+    fn test_messages_thinking_disabled_is_explicit_and_not_injected() {
+        for parser in [Some("kimi_k3"), Some("qwen3")] {
+            let (chat, injected) = resolve_reasoning(
+                serde_json::json!({"thinking": {"type": "disabled"}}),
+                parser,
+            );
+            assert!(!injected, "{parser:?}");
+            assert_eq!(
+                arg(&chat, "enable_thinking"),
+                Some(&serde_json::json!(false))
+            );
+            assert_eq!(arg(&chat, "thinking"), Some(&serde_json::json!(false)));
+            assert_eq!(arg(&chat, "truncate_history_thinking"), None);
+        }
+    }
+
+    #[test]
+    fn test_non_k3_messages_ignore_budget_and_keep_effort_grade() {
+        // Budget mapping is K3 policy; other models see no effort from it.
+        let (chat, injected) = resolve_reasoning(
+            serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 32000}}),
+            Some("qwen3"),
+        );
+        assert!(injected);
+        assert_eq!(arg(&chat, "reasoning_effort"), None);
+        assert_eq!(
+            arg(&chat, "enable_thinking"),
+            Some(&serde_json::json!(true))
+        );
+        // An explicit grade is forwarded verbatim (no K3 coercion).
+        let (chat, _) = resolve_reasoning(
+            serde_json::json!({"output_config": {"effort": "medium"}}),
+            Some("qwen3"),
+        );
+        assert_eq!(
+            arg(&chat, "reasoning_effort"),
+            Some(&serde_json::json!("medium"))
+        );
+    }
+
+    #[test]
+    fn test_messages_adaptive_thinking_sets_no_toggle() {
+        let (chat, injected) = resolve_reasoning(
+            serde_json::json!({"thinking": {"type": "adaptive"}}),
+            Some("qwen3"),
+        );
+        assert!(injected);
+        assert_eq!(
+            arg(&chat, "thinking_mode"),
+            Some(&serde_json::json!("adaptive"))
+        );
+        assert_eq!(arg(&chat, "enable_thinking"), None);
+        assert_eq!(arg(&chat, "thinking"), None);
+    }
+
+    #[test]
+    fn test_messages_without_reasoning_parser_is_not_injected() {
+        let (chat, injected) = resolve_reasoning(serde_json::json!({}), None);
+        assert!(!injected);
+        assert_eq!(arg(&chat, "enable_thinking"), None);
     }
 }
