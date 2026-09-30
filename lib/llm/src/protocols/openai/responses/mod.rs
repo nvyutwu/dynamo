@@ -39,7 +39,11 @@ use super::{OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider};
 use crate::protocols::common::extensions::{NvExt, NvExtProvider};
 
 /// Request body for `POST /v1/responses`.
+///
+/// Deserialized through [`NvCreateResponseFields`] (see its `TryFrom`) so that
+/// reasoning grades the pinned async-openai enum lacks (`max`) are accepted.
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
+#[serde(try_from = "serde_json::Value")]
 pub struct NvCreateResponse {
     /// Flattened CreateResponse fields (model, input, temperature, etc.).
     ///
@@ -65,6 +69,62 @@ pub struct NvCreateResponse {
     )]
     #[schema(value_type = Object)]
     pub chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+/// Wire shape of [`NvCreateResponse`]; the derived deserializer for its fields.
+#[derive(Deserialize)]
+struct NvCreateResponseFields {
+    #[serde(flatten)]
+    inner: dynamo_protocols::types::responses::CreateResponse,
+    #[serde(default)]
+    nvext: Option<NvExt>,
+    #[serde(default, alias = "chat_template_kwargs")]
+    chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+/// `reasoning.effort` grades a Responses client may send that the pinned
+/// async-openai `ReasoningEffort` (none|minimal|low|medium|high|xhigh) cannot
+/// deserialize. Chat Completions accepts them through Dynamo's own enum.
+const EXTENDED_RESPONSES_REASONING_EFFORTS: [&str; 1] = ["max"];
+
+impl TryFrom<serde_json::Value> for NvCreateResponse {
+    type Error = serde_json::Error;
+
+    /// Move an extended `reasoning.effort` grade (e.g. `max`) out of the typed
+    /// `reasoning` object into `chat_template_args.reasoning_effort` before the
+    /// typed parse, so the request is accepted and the grade still reaches
+    /// `normalize_reasoning_template_args`. Like the top-level Chat field, it
+    /// overrides a nested `chat_template_args.reasoning_effort`. The echoed
+    /// `reasoning.effort` on the response is then null.
+    fn try_from(mut value: serde_json::Value) -> Result<Self, Self::Error> {
+        let extended_effort = take_extended_reasoning_effort(&mut value);
+        let fields: NvCreateResponseFields = serde_json::from_value(value)?;
+        let mut chat_template_args = fields.chat_template_args;
+        if let Some(effort) = extended_effort {
+            chat_template_args
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::Value::String(effort),
+                );
+        }
+        Ok(Self {
+            inner: fields.inner,
+            nvext: fields.nvext,
+            chat_template_args,
+        })
+    }
+}
+
+fn take_extended_reasoning_effort(value: &mut serde_json::Value) -> Option<String> {
+    let reasoning = value.get_mut("reasoning")?.as_object_mut()?;
+    let effort = reasoning
+        .get("effort")?
+        .as_str()
+        .filter(|effort| EXTENDED_RESPONSES_REASONING_EFFORTS.contains(effort))?
+        .to_string();
+    reasoning.remove("effort");
+    Some(effort)
 }
 
 #[derive(ToSchema, Deserialize, Validate, Debug, Clone)]
@@ -3061,6 +3121,96 @@ thinking
         let req = make_response_with_input("no reasoning");
         let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
         assert_eq!(chat.inner.reasoning_effort, None);
+    }
+
+    /// Parse a Responses body with `reasoning.effort`, convert it, and resolve
+    /// the chat-template effort the way the HTTP handler does (server default
+    /// `low`), optionally applying the Kimi K3 coercion.
+    fn resolved_effort(effort: &str, kimi_k3: bool) -> Option<serde_json::Value> {
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": effort, "summary": "auto"},
+        }))
+        .unwrap();
+        let mut chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        chat.normalize_reasoning_template_args_with_default(Some("low"))
+            .unwrap();
+        if kimi_k3 {
+            chat.coerce_kimi_k3_reasoning_effort();
+        }
+        let args = chat.chat_template_args.unwrap();
+        // A per-request grade always suppresses the server default.
+        assert!(!args.contains_key("thinking_effort"), "{effort}");
+        args.get("reasoning_effort").cloned()
+    }
+
+    #[test]
+    fn test_reasoning_effort_max_is_accepted() {
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "max", "summary": "auto"},
+            "chat_template_kwargs": {"reasoning_effort": "low", "keep": 1},
+        }))
+        .unwrap();
+        let reasoning = req.inner.reasoning.as_ref().unwrap();
+        assert!(
+            reasoning.effort.is_none(),
+            "max moves out of the typed enum"
+        );
+        assert!(reasoning.summary.is_some(), "the rest of reasoning is kept");
+        let args = req.chat_template_args.as_ref().unwrap();
+        assert_eq!(
+            args.get("reasoning_effort"),
+            Some(&serde_json::json!("max"))
+        );
+        assert_eq!(args.get("keep"), Some(&serde_json::json!(1)));
+
+        assert_eq!(
+            resolved_effort("max", false),
+            Some(serde_json::json!("max"))
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_unknown_grade_is_still_rejected() {
+        let result = serde_json::from_value::<NvCreateResponse>(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "turbo"},
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reasoning_effort_maps_onto_kimi_k3_levels() {
+        for (effort, expected) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+            ("none", "none"),
+        ] {
+            assert_eq!(
+                resolved_effort(effort, true),
+                Some(serde_json::json!(expected)),
+                "{effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_effort_is_not_remapped_for_other_models() {
+        for effort in ["minimal", "medium", "xhigh"] {
+            assert_eq!(
+                resolved_effort(effort, false),
+                Some(serde_json::json!(effort)),
+                "{effort}"
+            );
+        }
     }
 
     #[test]

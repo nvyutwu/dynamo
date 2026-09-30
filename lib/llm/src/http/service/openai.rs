@@ -3600,6 +3600,16 @@ async fn responses(
             err_response
         })?;
 
+    // Responses clients send the OpenAI grades (`minimal`/`medium`/`xhigh`;
+    // Codex defaults to `medium`), which the Kimi K3 renderer rejects. Map
+    // them onto K3's low|high|max for K3 targets only; other models keep the
+    // grade they were sent.
+    if crate::protocols::openai::chat_completions::is_kimi_k3_reasoning_parser(
+        parsing_options.reasoning_parser.as_deref(),
+    ) {
+        request.coerce_kimi_k3_reasoning_effort();
+    }
+
     // The Responses API is converted to the same chat request contract. Narrow
     // the model parser before unary aggregation just as the streaming path does.
     let parsing_options = apply_request_tool_call_parsing_options(parsing_options, &request)
