@@ -188,7 +188,18 @@ impl AnthropicStreamConverter {
             .collect();
         let last_call = ready.len().saturating_sub(1);
 
-        for (call_index, tool_call) in ready.into_iter().enumerate() {
+        // `tool_choice.disable_parallel_tool_use`: emit at most one tool_use block.
+        let call_limit = if self
+            .api_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.disable_parallel_tool_use)
+        {
+            1
+        } else {
+            usize::MAX
+        };
+
+        for (call_index, tool_call) in ready.into_iter().take(call_limit).enumerate() {
             let emitted_id = new_tool_use_id();
             tracing::debug!(
                 backend_id = %tool_call.backend_id,
@@ -1518,6 +1529,48 @@ mod tests {
             vec![1, 2],
             "each fragment stamps the cumulative output count as of its own chunk"
         );
+    }
+
+    /// `tool_choice.disable_parallel_tool_use` caps the flushed tool_use blocks
+    /// at one; without it every ready call is emitted.
+    #[test]
+    fn test_disable_parallel_tool_use_emits_only_the_first_call() {
+        for (disable_parallel_tool_use, expected) in [(false, 2), (true, 1)] {
+            let mut conv = AnthropicStreamConverter::with_context(
+                "test-model".into(),
+                0,
+                AnthropicContext {
+                    disable_parallel_tool_use,
+                    ..Default::default()
+                },
+            );
+            conv.process_chunk_tagged(&tool_call_chunk(
+                0,
+                Some("call-1"),
+                Some("first"),
+                Some(r#"{"a": 1}"#),
+            ));
+            conv.process_chunk_tagged(&tool_call_chunk(
+                1,
+                Some("call-2"),
+                Some("second"),
+                Some(r#"{"b": 2}"#),
+            ));
+            let mut events = conv.process_chunk_tagged(&finish_chunk(FinishReason::ToolCalls));
+            events.extend(conv.emit_end_events_tagged());
+            let names: Vec<String> = events
+                .iter()
+                .filter_map(|event| match &event.data {
+                    AnthropicStreamEvent::ContentBlockStart {
+                        content_block: AnthropicResponseContentBlock::ToolUse { name, .. },
+                        ..
+                    } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names.len(), expected, "disable={disable_parallel_tool_use}");
+            assert_eq!(names[0], "first");
+        }
     }
 
     #[test]
