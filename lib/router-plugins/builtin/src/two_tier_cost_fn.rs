@@ -55,6 +55,8 @@ pub const POLICY_TYPE: &str = "dynamo-two-tier-cost-fn";
 const DEFAULT_CACHE_THRESHOLD: f64 = 0.5;
 const DEFAULT_BALANCE_ABS_THRESHOLD: usize = 32;
 const DEFAULT_BALANCE_REL_THRESHOLD: f64 = 1.1;
+const DEFAULT_RESPECT_SOFT_AFFINITY: bool = false;
+const DEFAULT_SOFT_AFFINITY_LOAD_GATE: bool = false;
 
 /// Tunables for [`POLICY_TYPE`], named after their `sgl-router` counterparts.
 ///
@@ -76,6 +78,11 @@ struct Parameters {
     /// `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` is set to. Set explicitly only when this policy must
     /// value CPU residency differently from the built-in selector.
     host_cache_weight: Option<f64>,
+    /// Whether to retain an eligible soft-affinity target before considering other workers.
+    respect_soft_affinity: bool,
+    /// With `respect_soft_affinity`, release the target when its load fails the balance gate
+    /// against the least-loaded eligible row, so the load tier can place the request elsewhere.
+    soft_affinity_load_gate: bool,
 }
 
 impl Default for Parameters {
@@ -85,6 +92,8 @@ impl Default for Parameters {
             balance_abs_threshold: DEFAULT_BALANCE_ABS_THRESHOLD,
             balance_rel_threshold: DEFAULT_BALANCE_REL_THRESHOLD,
             host_cache_weight: None,
+            respect_soft_affinity: DEFAULT_RESPECT_SOFT_AFFINITY,
+            soft_affinity_load_gate: DEFAULT_SOFT_AFFINITY_LOAD_GATE,
         }
     }
 }
@@ -112,6 +121,12 @@ impl Parameters {
     }
 }
 
+/// Both balance gates: `high` exceeds `low` by more than the absolute and relative thresholds.
+fn imbalanced(parameters: &Parameters, high: usize, low: usize) -> bool {
+    high.saturating_sub(low) > parameters.balance_abs_threshold
+        && (high as f64) > parameters.balance_rel_threshold * (low as f64)
+}
+
 fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> Option<usize> {
     rows.min_by_key(|&row| load[row].active_requests())
 }
@@ -128,6 +143,7 @@ fn effective_overlap(cache: &WorkerCacheInput, host_cache_weight: f64) -> f64 {
 const REASON_LOAD_IMBALANCE: &str = "load_imbalance_least_loaded";
 const REASON_CACHE_TIER: &str = "cache_tier_least_loaded_among_max_overlap";
 const REASON_NO_CACHE_WINNER: &str = "least_loaded_no_cache_winner";
+const REASON_SOFT_AFFINITY: &str = "soft_affinity_target";
 
 /// One two-tier decision, with the quantities that determined it.
 struct Decision {
@@ -143,12 +159,14 @@ struct Decision {
     row_overlap: Vec<f64>,
 }
 
+/// The two-tier decision restricted to rows where `include` holds; `|_| true` is the policy.
 fn decide(
     parameters: &Parameters,
     cache: &[WorkerCacheInput],
     load: &[WorkerLoadInput],
     request_blocks: u64,
     host_cache_weight: f64,
+    include: impl Fn(usize) -> bool + Copy,
 ) -> Option<Decision> {
     if cache.is_empty() || cache.len() != load.len() {
         return None;
@@ -158,16 +176,16 @@ fn decide(
         .iter()
         .map(|item| effective_overlap(item, host_cache_weight))
         .collect();
-    let max_overlap_row =
-        (0..row_overlap.len()).max_by(|a, b| row_overlap[*a].total_cmp(&row_overlap[*b]))?;
+    let rows = || (0..load.len()).filter(move |&row| include(row));
+    let max_overlap_row = rows().max_by(|a, b| row_overlap[*a].total_cmp(&row_overlap[*b]))?;
     let max_overlap = row_overlap[max_overlap_row];
     let cache_ratio = if request_blocks == 0 {
         0.0
     } else {
         max_overlap / request_blocks as f64
     };
-    let min_load = load.iter().map(|item| item.active_requests()).min()?;
-    let max_load = load.iter().map(|item| item.active_requests()).max()?;
+    let min_load = rows().map(|row| load[row].active_requests()).min()?;
+    let max_load = rows().map(|row| load[row].active_requests()).max()?;
     let decision = |row, reason| Decision {
         row,
         reason,
@@ -179,32 +197,14 @@ fn decide(
         row_overlap: row_overlap.clone(),
     };
 
-    if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
-        && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
-    {
-        return least_loaded(load, 0..load.len()).map(|row| decision(row, REASON_LOAD_IMBALANCE));
+    if imbalanced(parameters, max_load, min_load) {
+        return least_loaded(load, rows()).map(|row| decision(row, REASON_LOAD_IMBALANCE));
     }
     if cache_ratio > parameters.cache_threshold {
-        return least_loaded(
-            load,
-            row_overlap
-                .iter()
-                .enumerate()
-                .filter_map(|(row, overlap)| (*overlap == max_overlap).then_some(row)),
-        )
-        .map(|row| decision(row, REASON_CACHE_TIER));
+        return least_loaded(load, rows().filter(|&row| row_overlap[row] == max_overlap))
+            .map(|row| decision(row, REASON_CACHE_TIER));
     }
-    least_loaded(load, 0..load.len()).map(|row| decision(row, REASON_NO_CACHE_WINNER))
-}
-
-fn select_row(
-    parameters: &Parameters,
-    cache: &[WorkerCacheInput],
-    load: &[WorkerLoadInput],
-    request_blocks: u64,
-    host_cache_weight: f64,
-) -> Option<usize> {
-    decide(parameters, cache, load, request_blocks, host_cache_weight).map(|d| d.row)
+    least_loaded(load, rows()).map(|row| decision(row, REASON_NO_CACHE_WINNER))
 }
 
 struct TwoTierCostFnPicker {
@@ -212,6 +212,63 @@ struct TwoTierCostFnPicker {
     /// Resolved once at construction: the instance override when given, else the router config's
     /// `host_cache_hit_weight`.
     host_cache_weight: f64,
+}
+
+impl TwoTierCostFnPicker {
+    /// The policy's decision, shared by `pick` and `explain_pick` so the trace names the branch
+    /// that chose the row. With `respect_soft_affinity`, an eligible soft target is retained by
+    /// running the two-tier decision over the target's rows only; the load gate, when enabled,
+    /// releases it once it is imbalanced against the least-loaded eligible row. The oracle fields
+    /// (`max_overlap_row`, cache ratio, load range) always describe the full candidate set.
+    fn decide_for(
+        &self,
+        context: &WorkerSelectionContext<'_>,
+        input: WorkerInputView<'_>,
+    ) -> Option<Decision> {
+        let (cache, load) = (input.cache()?, input.load()?);
+        let blocks = context.request_blocks();
+        let global = decide(
+            &self.parameters,
+            cache,
+            load,
+            blocks,
+            self.host_cache_weight,
+            |_| true,
+        )?;
+        if self.parameters.respect_soft_affinity
+            && let Some(target) = context.affinity_target()
+        {
+            let candidates = input.candidates();
+            let is_target = |row: usize| {
+                let worker = candidates[row].worker();
+                worker.worker_id == target.worker_id
+                    && target.dp_rank.is_none_or(|rank| worker.dp_rank == rank)
+            };
+            if let Some(kept) = decide(
+                &self.parameters,
+                cache,
+                load,
+                blocks,
+                self.host_cache_weight,
+                is_target,
+            )
+            .map(|d| d.row)
+                && !(self.parameters.soft_affinity_load_gate
+                    && imbalanced(
+                        &self.parameters,
+                        load[kept].active_requests(),
+                        global.min_load,
+                    ))
+            {
+                return Some(Decision {
+                    row: kept,
+                    reason: REASON_SOFT_AFFINITY,
+                    ..global
+                });
+            }
+        }
+        Some(global)
+    }
 }
 
 impl WorkerPicker for TwoTierCostFnPicker {
@@ -224,20 +281,15 @@ impl WorkerPicker for TwoTierCostFnPicker {
         context: &WorkerSelectionContext<'_>,
         input: WorkerInputView<'_>,
     ) -> Result<usize, WorkerSelectionPolicyError> {
-        let cache = input
+        input
             .cache()
             .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?;
-        let load = input
+        input
             .load()
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
-        select_row(
-            &self.parameters,
-            cache,
-            load,
-            context.request_blocks(),
-            self.host_cache_weight,
-        )
-        .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+        self.decide_for(context, input)
+            .map(|decision| decision.row)
+            .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
     }
 
     /// The routing-decision trace for this policy: which branch fired, the thresholds in force,
@@ -248,13 +300,7 @@ impl WorkerPicker for TwoTierCostFnPicker {
         input: WorkerInputView<'_>,
         row: usize,
     ) -> Option<PickExplanation> {
-        let decision = decide(
-            &self.parameters,
-            input.cache()?,
-            input.load()?,
-            context.request_blocks(),
-            self.host_cache_weight,
-        )?;
+        let decision = self.decide_for(context, input)?;
         // `pick` and `explain_pick` see the same input, so the branch must agree with the row
         // that was actually chosen. If it does not, say so rather than report a fiction.
         let reason = if decision.row == row {
@@ -361,7 +407,9 @@ pub fn register(
 mod tests {
     use std::collections::HashMap;
 
-    use dynamo_kv_router::protocols::{RoutingConstraints, WorkerConfigLike, WorkerWithDpRank};
+    use dynamo_kv_router::protocols::{
+        RoutingConstraints, WorkerAffinityTarget, WorkerConfigLike, WorkerWithDpRank,
+    };
     use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
     use dynamo_kv_router::{
         SchedulingRequest, WorkerLoadProjection, WorkerSelectionInput, WorkerSelector,
@@ -414,13 +462,22 @@ mod tests {
         parameters: Parameters,
         workers: [(u64, usize, usize, usize); 2],
     ) -> WorkerWithDpRank {
+        select_affine(parameters, workers, None)
+    }
+
+    /// `select_tiers` with a soft-affinity target on the request.
+    fn select_affine(
+        parameters: Parameters,
+        workers: [(u64, usize, usize, usize); 2],
+        affinity_target: Option<WorkerAffinityTarget>,
+    ) -> WorkerWithDpRank {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
             token_seq: None,
             isl_tokens: TEN_BLOCKS,
             lora_name: None,
             expected_output_tokens: None,
-            affinity_target: None,
+            affinity_target,
             pinned_worker: None,
             allowed_worker_ids: None,
             routing_constraints: RoutingConstraints::default(),
@@ -589,5 +646,80 @@ mod tests {
         // straddles the ratio boundary: 705 would clear it and take the load tier.
         assert_eq!(select([(A, 0, 640), (B, 10, 704)]), worker(B));
         assert_eq!(select([(A, 0, 640), (B, 10, 705)]), worker(A));
+    }
+
+    /// `(worker_id, device_blocks, active_requests)` with a soft target on A.
+    fn select_soft(parameters: Parameters, workers: [(u64, usize, usize); 2]) -> WorkerWithDpRank {
+        select_affine(
+            parameters,
+            workers.map(|(id, device_blocks, active)| (id, device_blocks, 0, active)),
+            Some(WorkerAffinityTarget::new(A, None)),
+        )
+    }
+
+    fn respecting() -> Parameters {
+        Parameters {
+            respect_soft_affinity: true,
+            ..Parameters::default()
+        }
+    }
+
+    fn gated() -> Parameters {
+        Parameters {
+            soft_affinity_load_gate: true,
+            ..respecting()
+        }
+    }
+
+    #[test]
+    fn soft_target_is_ignored_by_default_and_retained_when_respected() {
+        let workers = [(A, 0, 0), (B, 6, 4)];
+        assert_eq!(select_soft(Parameters::default(), workers), worker(B));
+        assert_eq!(select_soft(respecting(), workers), worker(A));
+        // An absent target falls back to the policy.
+        assert_eq!(
+            select_affine(
+                respecting(),
+                [(A, 0, 0, 0), (B, 6, 0, 4)],
+                Some(WorkerAffinityTarget::new(999, None)),
+            ),
+            worker(B)
+        );
+    }
+
+    /// Upstream #15139 semantics: with one row per worker the in-target load gate compares the
+    /// target with itself, so an overloaded target is kept however imbalanced the pool is.
+    #[test]
+    fn respected_target_ignores_cross_worker_load_without_the_gate() {
+        assert_eq!(select(workers_40_vs_2()), worker(B));
+        assert_eq!(select_soft(respecting(), workers_40_vs_2()), worker(A));
+        assert_eq!(
+            select_soft(respecting(), [(A, 0, 400), (B, 0, 0)]),
+            worker(A)
+        );
+    }
+
+    fn workers_40_vs_2() -> [(u64, usize, usize); 2] {
+        [(A, 0, 40), (B, 0, 2)]
+    }
+
+    #[test]
+    fn load_gate_releases_only_an_imbalanced_target() {
+        assert_eq!(select_soft(gated(), workers_40_vs_2()), worker(B));
+        // Spread 28 is within 32: kept, although plain two-tier would pick B.
+        assert_eq!(select_soft(gated(), [(A, 0, 30), (B, 0, 2)]), worker(A));
+        // Spread 64 but ratio 1.1 not exceeded: kept.
+        assert_eq!(select_soft(gated(), [(A, 0, 704), (B, 0, 640)]), worker(A));
+        // A cache-hot peer at equal load does not dislodge the target.
+        assert_eq!(select_soft(gated(), [(A, 0, 5), (B, 9, 5)]), worker(A));
+        // Host-tier overlap counts toward the released decision as usual.
+        assert_eq!(
+            select_affine(
+                gated(),
+                [(A, 0, 0, 40), (B, 0, 8, 2)],
+                Some(WorkerAffinityTarget::new(A, None)),
+            ),
+            worker(B)
+        );
     }
 }

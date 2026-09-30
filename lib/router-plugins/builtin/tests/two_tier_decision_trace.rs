@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 
 use dynamo_kv_router::protocols::{
-    RoutingConstraints, RoutingDecisionTrace, WorkerConfigLike, WorkerWithDpRank,
+    RoutingConstraints, RoutingDecisionTrace, WorkerAffinityTarget, WorkerConfigLike,
+    WorkerWithDpRank,
 };
 use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
 use dynamo_kv_router::services::selection::WorkerSelectionPolicyRegistry;
@@ -68,14 +69,34 @@ fn enable_trace() {
     }
 }
 
+const SOFT_AFFINITY_GATED_YAML: &str = r#"
+worker_selection:
+  aggregated: dynamo-two-tier-cost-fn
+  instances:
+    - name: dynamo-two-tier-cost-fn
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        respect_soft_affinity: true
+        soft_affinity_load_gate: true
+"#;
+
 /// `(worker_id, device_blocks, host_pinned_blocks, active_requests)` per worker.
 fn select(
     request_id: &str,
     workers: [(u64, usize, usize, usize); 2],
 ) -> (WorkerWithDpRank, Option<RoutingDecisionTrace>) {
+    select_with(BAKED_IMAGE_YAML, None, request_id, workers)
+}
+
+fn select_with(
+    yaml: &str,
+    affinity_target: Option<WorkerAffinityTarget>,
+    request_id: &str,
+    workers: [(u64, usize, usize, usize); 2],
+) -> (WorkerWithDpRank, Option<RoutingDecisionTrace>) {
     enable_trace();
     let policy_file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(policy_file.path(), BAKED_IMAGE_YAML).unwrap();
+    std::fs::write(policy_file.path(), yaml).unwrap();
     let config = KvRouterConfig {
         router_policy_config: Some(policy_file.path().display().to_string()),
         ..Default::default()
@@ -100,7 +121,7 @@ fn select(
         isl_tokens: EIGHT_BLOCKS,
         lora_name: None,
         expected_output_tokens: None,
-        affinity_target: None,
+        affinity_target,
         pinned_worker: None,
         allowed_worker_ids: None,
         routing_constraints: RoutingConstraints::default(),
@@ -223,6 +244,36 @@ fn load_imbalance_override_is_traced() {
     assert_eq!(param(&trace, "balance_abs_threshold"), 32.0);
     assert_eq!(param(&trace, "max_active_requests"), 40.0);
     assert_eq!(trace.avoidable_prefill_token_equivalents, 8.0 * 16.0);
+}
+
+/// A retained soft target is named as its own branch, with the oracle it passed over; a released
+/// target reports the load tier that replaced it.
+#[test]
+fn soft_affinity_branch_is_traced() {
+    let target = Some(WorkerAffinityTarget::new(A, None));
+    let (selected, trace) = select_with(
+        SOFT_AFFINITY_GATED_YAML,
+        target,
+        "req-soft-kept",
+        [(A, 0, 0, 5), (B, 8, 0, 5)],
+    );
+    assert_eq!(selected, worker(A));
+    let trace = trace.unwrap();
+    assert_eq!(trace.selection_reason, "soft_affinity_target");
+    assert_eq!(trace.selected_worker_id, A);
+    assert_eq!(trace.max_overlap_worker_id, B);
+
+    let (selected, trace) = select_with(
+        SOFT_AFFINITY_GATED_YAML,
+        target,
+        "req-soft-released",
+        [(A, 0, 0, 40), (B, 0, 0, 2)],
+    );
+    assert_eq!(selected, worker(B));
+    assert_eq!(
+        trace.unwrap().selection_reason,
+        "load_imbalance_least_loaded"
+    );
 }
 
 /// Prints the JSON exactly as it appears under `routing_decision` on a `request_end` record, for
