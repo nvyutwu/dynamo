@@ -588,7 +588,16 @@ const DYNAMO_VLLM_WORKER_HASH_SEED: &str = "0";
 /// `DYN_ROUTER_HYBRID_MM_DEBUG=1` logs what the probe derived for each multimodal request.
 fn hybrid_mm_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DYN_ROUTER_HYBRID_MM_DEBUG").is_some())
+    *ON.get_or_init(|| {
+        std::env::var("DYN_ROUTER_HYBRID_MM_DEBUG")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Multimodal placeholder token id for the hybrid probe's engine-token recovery.
