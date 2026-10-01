@@ -1457,7 +1457,8 @@ pub struct BlockExtraInfo {
     /// Placeholder spans overlapping this block (request-absolute), for the hybrid probe. Empty on
     /// worker-derived infos and on older producers. A block whose `mm_objects` is empty hashes like
     /// a text-only block on the radix path.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Not `skip_serializing_if`: positional formats (bincode) need every field present.
+    #[serde(default)]
     pub mm_spans: Vec<BlockMmSpan>,
 }
 
