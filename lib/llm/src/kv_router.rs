@@ -816,6 +816,15 @@ where
         };
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate().map_err(anyhow::Error::msg)?;
+        if kv_router_config.router_hybrid_engine_hash_index
+            && block_size % kv_router_config.router_hybrid_hash_unit != 0
+        {
+            anyhow::bail!(
+                "router_hybrid_hash_unit ({}) must divide the router block size ({})",
+                kv_router_config.router_hybrid_hash_unit,
+                block_size
+            );
+        }
         let hybrid_hasher = kv_router_config.router_hybrid_engine_hash_index.then(|| {
             // `python -m dynamo.vllm` pins PYTHONHASHSEED=0 when the operator leaves it unset
             // (components/src/dynamo/vllm/__main__.py), and vLLM derives NONE_HASH from
