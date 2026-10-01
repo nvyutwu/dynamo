@@ -1525,6 +1525,14 @@ impl RequestExtraInfo {
                             mm_objects: vec![],
                             mm_spans: Vec::new(),
                         });
+                        let span = BlockMmSpan {
+                            start: *req_start,
+                            end: *req_end,
+                            mm_hash: req_mm_obj.mm_hash,
+                        };
+                        if !block_info.mm_spans.contains(&span) {
+                            block_info.mm_spans.push(span);
+                        }
 
                         // Check if we already have this mm_hash in this block
                         if let Some(existing) = block_info
