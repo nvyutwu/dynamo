@@ -2624,6 +2624,48 @@ impl OpenAIPreprocessor {
         Ok((request, annotations, prompt_injected_reasoning))
     }
 
+    /// Request-control normalization the chat `generate` path applies before
+    /// rendering: the deployment thinking default, then parser-specific
+    /// thinking and named-tool-choice rules. Shared with
+    /// [`Self::count_chat_prompt_tokens`] so a count renders the same prompt.
+    fn normalize_chat_request_controls(&self, request: &mut NvCreateChatCompletionRequest) {
+        // Apply the deployment default before parser-specific normalization so
+        // it can override an implicit model default (for example Kimi K2.5),
+        // while explicit request controls still take precedence.
+        let thinking_control_from_client = Self::request_has_client_thinking_control(request);
+        self.apply_default_thinking_mode(request);
+        Self::normalize_thinking_arg_with_source(
+            request,
+            self.runtime_config.reasoning_parser.as_deref(),
+            self.tool_call_parser.as_deref(),
+            thinking_control_from_client,
+        );
+        Self::normalize_kimi_k3_named_tool_choice(request, self.tool_call_parser.as_deref());
+    }
+
+    /// Count the prompt tokens a chat request is billed for, without
+    /// dispatching it: the request is normalized, rendered with the model's
+    /// chat template, and tokenized exactly as `generate` does, and the result
+    /// is the client-facing `usage.prompt_tokens` (the rendered length minus
+    /// any generation-prompt stub the usage report excludes, e.g. Kimi K3's).
+    pub async fn count_chat_prompt_tokens(
+        &self,
+        mut request: NvCreateChatCompletionRequest,
+    ) -> Result<u32> {
+        request.inner.stream = Some(true);
+        self.normalize_chat_request_controls(&mut request);
+        let (preprocessed, _annotations, _prompt_injected_reasoning, _image_tokens, stub) = self
+            .preprocess_request_with_options(
+                &request,
+                None,
+                PreprocessRequestOptions::default(),
+                None,
+            )
+            .await?;
+        let rendered = u32::try_from(preprocessed.token_ids.len()).unwrap_or(u32::MAX);
+        Ok(stub.map_or(rendered, |stub| rendered.saturating_sub(stub)))
+    }
+
     fn kimi_k3_generation_stub_len(&self, formatted_prompt: Option<&str>) -> Option<u32> {
         if !matches!(
             self.runtime_config.reasoning_parser.as_deref(),
@@ -7015,18 +7057,7 @@ impl
 
         // Set stream=true for internal processing (after request payload capture)
         request.inner.stream = Some(true);
-        // Apply the deployment default before parser-specific normalization so
-        // it can override an implicit model default (for example Kimi K2.5),
-        // while explicit request controls still take precedence.
-        let thinking_control_from_client = Self::request_has_client_thinking_control(&request);
-        self.apply_default_thinking_mode(&mut request);
-        Self::normalize_thinking_arg_with_source(
-            &mut request,
-            self.runtime_config.reasoning_parser.as_deref(),
-            self.tool_call_parser.as_deref(),
-            thinking_control_from_client,
-        );
-        Self::normalize_kimi_k3_named_tool_choice(&mut request, self.tool_call_parser.as_deref());
+        self.normalize_chat_request_controls(&mut request);
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
@@ -11697,5 +11728,81 @@ mod tests {
             image,
             video(2)
         ]));
+    }
+
+    fn count_test_preprocessor() -> Arc<OpenAIPreprocessor> {
+        let mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        OpenAIPreprocessor::new(mdc).unwrap()
+    }
+
+    fn count_test_request(body: serde_json::Value) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// `count_chat_prompt_tokens` must equal the token count the generate path
+    /// sends to the engine for the same request (same normalization, same
+    /// template, same tokenizer).
+    #[tokio::test]
+    async fn test_count_chat_prompt_tokens_matches_generate_render() {
+        let preprocessor = count_test_preprocessor();
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is the capital of France? Answer briefly."}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get the weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }}]
+        });
+
+        let counted = preprocessor
+            .count_chat_prompt_tokens(count_test_request(body.clone()))
+            .await
+            .unwrap();
+
+        let mut request = count_test_request(body);
+        request.inner.stream = Some(true);
+        preprocessor.normalize_chat_request_controls(&mut request);
+        let (preprocessed, _, _) = preprocessor
+            .preprocess_request(&request, None)
+            .await
+            .unwrap();
+        assert!(counted > 0);
+        assert_eq!(counted as usize, preprocessed.token_ids.len());
+    }
+
+    #[tokio::test]
+    async fn test_count_chat_prompt_tokens_counts_every_rendered_turn() {
+        let preprocessor = count_test_preprocessor();
+        let one_turn = preprocessor
+            .count_chat_prompt_tokens(count_test_request(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .await
+            .unwrap();
+        let three_turns = preprocessor
+            .count_chat_prompt_tokens(count_test_request(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hi"},
+                    {"role": "user", "content": "hi"}
+                ]
+            })))
+            .await
+            .unwrap();
+        // Each extra turn renders at least its header and end-of-turn tokens.
+        assert!(
+            three_turns >= one_turn + 4,
+            "one={one_turn} three={three_turns}"
+        );
     }
 }

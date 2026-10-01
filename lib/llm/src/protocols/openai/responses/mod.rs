@@ -39,7 +39,11 @@ use super::{OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider};
 use crate::protocols::common::extensions::{NvExt, NvExtProvider};
 
 /// Request body for `POST /v1/responses`.
+///
+/// Deserialized through [`NvCreateResponseFields`] (see its `TryFrom`) so that
+/// reasoning grades the pinned async-openai enum lacks (`max`) are accepted.
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
+#[serde(try_from = "serde_json::Value")]
 pub struct NvCreateResponse {
     /// Flattened CreateResponse fields (model, input, temperature, etc.).
     ///
@@ -65,6 +69,62 @@ pub struct NvCreateResponse {
     )]
     #[schema(value_type = Object)]
     pub chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+/// Wire shape of [`NvCreateResponse`]; the derived deserializer for its fields.
+#[derive(Deserialize)]
+struct NvCreateResponseFields {
+    #[serde(flatten)]
+    inner: dynamo_protocols::types::responses::CreateResponse,
+    #[serde(default)]
+    nvext: Option<NvExt>,
+    #[serde(default, alias = "chat_template_kwargs")]
+    chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+/// `reasoning.effort` grades a Responses client may send that the pinned
+/// async-openai `ReasoningEffort` (none|minimal|low|medium|high|xhigh) cannot
+/// deserialize. Chat Completions accepts them through Dynamo's own enum.
+const EXTENDED_RESPONSES_REASONING_EFFORTS: [&str; 1] = ["max"];
+
+impl TryFrom<serde_json::Value> for NvCreateResponse {
+    type Error = serde_json::Error;
+
+    /// Move an extended `reasoning.effort` grade (e.g. `max`) out of the typed
+    /// `reasoning` object into `chat_template_args.reasoning_effort` before the
+    /// typed parse, so the request is accepted and the grade still reaches
+    /// `normalize_reasoning_template_args`. Like the top-level Chat field, it
+    /// overrides a nested `chat_template_args.reasoning_effort`. The echoed
+    /// `reasoning.effort` on the response is then null.
+    fn try_from(mut value: serde_json::Value) -> Result<Self, Self::Error> {
+        let extended_effort = take_extended_reasoning_effort(&mut value);
+        let fields: NvCreateResponseFields = serde_json::from_value(value)?;
+        let mut chat_template_args = fields.chat_template_args;
+        if let Some(effort) = extended_effort {
+            chat_template_args
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::Value::String(effort),
+                );
+        }
+        Ok(Self {
+            inner: fields.inner,
+            nvext: fields.nvext,
+            chat_template_args,
+        })
+    }
+}
+
+fn take_extended_reasoning_effort(value: &mut serde_json::Value) -> Option<String> {
+    let reasoning = value.get_mut("reasoning")?.as_object_mut()?;
+    let effort = reasoning
+        .get("effort")?
+        .as_str()
+        .filter(|effort| EXTENDED_RESPONSES_REASONING_EFFORTS.contains(effort))?
+        .to_string();
+    reasoning.remove("effort");
+    Some(effort)
 }
 
 #[derive(ToSchema, Deserialize, Validate, Debug, Clone)]
@@ -661,7 +721,8 @@ fn convert_input_items_to_messages(
 ///
 /// Bare function names are preserved for model compatibility. Reject collisions
 /// from different origins instead of guessing which namespace to restore on the
-/// response path.
+/// response path. Return `InvalidArgument` for non-function tools, including
+/// namespace members, instead of silently discarding unsupported definitions.
 fn convert_tools(tools: &[Tool]) -> anyhow::Result<Vec<ChatCompletionTool>> {
     let mut converted = Vec::new();
     let mut origins = HashMap::<String, Option<String>>::new();
@@ -688,7 +749,7 @@ fn convert_tools(tools: &[Tool]) -> anyhow::Result<Vec<ChatCompletionTool>> {
                 name: name.to_owned(),
                 description: description.clone(),
                 parameters: parameters.clone(),
-                strict,
+                strict: chat_tool_strict(strict),
             },
         });
         Ok(())
@@ -701,27 +762,81 @@ fn convert_tools(tools: &[Tool]) -> anyhow::Result<Vec<ChatCompletionTool>> {
             }
             Tool::Namespace(namespace) => {
                 for tool in &namespace.tools {
-                    if let NamespaceToolParamTool::Function(f) = tool {
-                        push_function(
+                    match tool {
+                        NamespaceToolParamTool::Function(f) => push_function(
                             &f.name,
                             &f.description,
                             &f.parameters,
                             f.strict,
                             Some(&namespace.name),
-                        )?;
+                        )?,
+                        _ => return unsupported_tool(tool, "tools"),
                     }
                 }
             }
-            // Only function tools are forwarded to Chat Completions.
-            _ => {}
+            _ => {
+                let tool_type = serde_json::to_value(tool)?["type"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string();
+                if is_hosted_tool_type(&tool_type) {
+                    // Hosted tools run on the provider's side; the model behind this
+                    // adapter cannot call them. Codex declares `web_search` on every
+                    // request by default, so rejecting it would break the client.
+                    tracing::debug!(tool_type, "dropping hosted Responses tool");
+                    continue;
+                }
+                return unsupported_tool(tool, "tools");
+            }
         }
     }
     Ok(converted)
 }
 
+/// Responses tool types executed by the provider (not by the client), which the
+/// model behind the Chat Completions adapter never calls. They are dropped rather
+/// than rejected. Client-executed types (`custom` freeform tools, `local_shell`)
+/// are still rejected: the client expects the model to call them.
+fn is_hosted_tool_type(tool_type: &str) -> bool {
+    tool_type.starts_with("web_search")
+        || tool_type.starts_with("computer_use")
+        || matches!(
+            tool_type,
+            "file_search" | "code_interpreter" | "image_generation" | "mcp"
+        )
+}
+
+/// Chat Completions `strict` for a Responses function tool.
+///
+/// Responses clients send `strict` on every function tool (the OpenAI SDK type
+/// requires it; Codex sends `false`), while Chat clients normally omit it. The
+/// converted tool is rendered into the prompt as JSON, so a forwarded
+/// `"strict":false` made each Responses tool 3 prompt tokens longer on Kimi K3
+/// than the same tool sent to Chat Completions. `false` means the same as an
+/// absent flag everywhere downstream (`strict.unwrap_or(false)`), so drop it.
+/// `true` is kept: it requests strict tool constraints, and a Chat tool with
+/// `strict: true` renders it the same way.
+fn chat_tool_strict(strict: Option<bool>) -> Option<bool> {
+    strict.filter(|strict| *strict)
+}
+
+/// Identify an unsupported tool or choice by its serialized type and return
+/// `InvalidArgument` with the affected request field and supported alternatives.
+fn unsupported_tool<T>(tool: &impl serde::Serialize, field: &str) -> anyhow::Result<T> {
+    let value = serde_json::to_value(tool)?;
+    let tool_type = value["type"].as_str().unwrap_or("unknown");
+    Err(ResponsesConversionError::InvalidArgument(format!(
+        "Unsupported Responses {field} type '{tool_type}': the Chat Completions adapter supports only function tools and none, auto, required, or named function tool choices"
+    ))
+    .into())
+}
+
 /// Convert Responses API ToolChoiceParam to ChatCompletionToolChoiceOption.
-fn convert_tool_choice(tc: &ToolChoiceParam) -> ChatCompletionToolChoiceOption {
-    match tc {
+///
+/// Preserve supported modes and named functions; return `InvalidArgument` for
+/// choices whose semantics cannot be represented by the adapter.
+fn convert_tool_choice(tc: &ToolChoiceParam) -> anyhow::Result<ChatCompletionToolChoiceOption> {
+    Ok(match tc {
         ToolChoiceParam::Mode(mode) => match mode {
             ToolChoiceOptions::None => ChatCompletionToolChoiceOption::None,
             ToolChoiceOptions::Auto => ChatCompletionToolChoiceOption::Auto,
@@ -735,15 +850,8 @@ fn convert_tool_choice(tc: &ToolChoiceParam) -> ChatCompletionToolChoiceOption {
                 },
             })
         }
-        ToolChoiceParam::Hosted(_) => {
-            // Hosted tools are not forwarded to chat completions
-            ChatCompletionToolChoiceOption::Auto
-        }
-        _ => {
-            // Other tool choice types (AllowedTools, Mcp, Custom, etc.) default to auto
-            ChatCompletionToolChoiceOption::Auto
-        }
-    }
+        _ => return unsupported_tool(tc, "tool_choice"),
+    })
 }
 
 /// Convert Responses API `text.format` to Chat Completions `response_format`.
@@ -860,7 +968,12 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             .filter(|t: &Vec<_>| !t.is_empty());
 
         // Convert tool_choice if present
-        let tool_choice = resp.inner.tool_choice.as_ref().map(convert_tool_choice);
+        let tool_choice = resp
+            .inner
+            .tool_choice
+            .as_ref()
+            .map(convert_tool_choice)
+            .transpose()?;
 
         // Determine stream setting: respect caller's preference, default to true for aggregation
         let stream = resp.inner.stream.or(Some(true));
@@ -3050,6 +3163,96 @@ thinking
         assert_eq!(chat.inner.reasoning_effort, None);
     }
 
+    /// Parse a Responses body with `reasoning.effort`, convert it, and resolve
+    /// the chat-template effort the way the HTTP handler does (server default
+    /// `low`), optionally applying the Kimi K3 coercion.
+    fn resolved_effort(effort: &str, kimi_k3: bool) -> Option<serde_json::Value> {
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": effort, "summary": "auto"},
+        }))
+        .unwrap();
+        let mut chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        chat.normalize_reasoning_template_args_with_default(Some("low"))
+            .unwrap();
+        if kimi_k3 {
+            chat.coerce_kimi_k3_reasoning_effort();
+        }
+        let args = chat.chat_template_args.unwrap();
+        // A per-request grade always suppresses the server default.
+        assert!(!args.contains_key("thinking_effort"), "{effort}");
+        args.get("reasoning_effort").cloned()
+    }
+
+    #[test]
+    fn test_reasoning_effort_max_is_accepted() {
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "max", "summary": "auto"},
+            "chat_template_kwargs": {"reasoning_effort": "low", "keep": 1},
+        }))
+        .unwrap();
+        let reasoning = req.inner.reasoning.as_ref().unwrap();
+        assert!(
+            reasoning.effort.is_none(),
+            "max moves out of the typed enum"
+        );
+        assert!(reasoning.summary.is_some(), "the rest of reasoning is kept");
+        let args = req.chat_template_args.as_ref().unwrap();
+        assert_eq!(
+            args.get("reasoning_effort"),
+            Some(&serde_json::json!("max"))
+        );
+        assert_eq!(args.get("keep"), Some(&serde_json::json!(1)));
+
+        assert_eq!(
+            resolved_effort("max", false),
+            Some(serde_json::json!("max"))
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_unknown_grade_is_still_rejected() {
+        let result = serde_json::from_value::<NvCreateResponse>(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "turbo"},
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reasoning_effort_maps_onto_kimi_k3_levels() {
+        for (effort, expected) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+            ("none", "none"),
+        ] {
+            assert_eq!(
+                resolved_effort(effort, true),
+                Some(serde_json::json!(expected)),
+                "{effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_effort_is_not_remapped_for_other_models() {
+        for effort in ["minimal", "medium", "xhigh"] {
+            assert_eq!(
+                resolved_effort(effort, false),
+                Some(serde_json::json!(effort)),
+                "{effort}"
+            );
+        }
+    }
+
     #[test]
     fn test_text_format_json_object_mapped() {
         use dynamo_protocols::types::ResponseFormat;
@@ -3826,5 +4029,97 @@ thinking
 
         // nvext should be omitted when None
         assert!(json.get("nvext").is_none());
+    }
+
+    /// The tool JSON the chat template sees (the prompt renderer's `tools()`).
+    fn rendered_tools(request: &NvCreateChatCompletionRequest) -> serde_json::Value {
+        use dynamo_renderer::OAIChatLikeRequest;
+        serde_json::to_value(request.tools().expect("tools rendered")).unwrap()
+    }
+
+    fn chat_request_with_tools(tools: serde_json::Value) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+        }))
+        .unwrap()
+    }
+
+    fn responses_request_with_tools(tools: serde_json::Value) -> NvCreateChatCompletionRequest {
+        let request: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": tools,
+        }))
+        .unwrap();
+        request.try_into().unwrap()
+    }
+
+    /// A Responses function tool must reach the chat template exactly as the
+    /// same tool sent to Chat Completions, including the `strict: false` every
+    /// Codex tool carries (it rendered as 3 extra K3 prompt tokens per tool).
+    #[test]
+    fn test_responses_function_tools_render_identically_to_chat() {
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        });
+        let names = ["get_weather", "get_time", "get_news"];
+        for strict in [None, Some(false)] {
+            for count in 1..=names.len() {
+                let chat_tools: Vec<_> = names[..count]
+                    .iter()
+                    .map(|name| {
+                        serde_json::json!({"type": "function", "function": {
+                            "name": name, "description": "Look it up", "parameters": params,
+                        }})
+                    })
+                    .collect();
+                let responses_tools: Vec<_> = names[..count]
+                    .iter()
+                    .map(|name| {
+                        let mut tool = serde_json::json!({
+                            "type": "function", "name": name,
+                            "description": "Look it up", "parameters": params,
+                        });
+                        if let Some(strict) = strict {
+                            tool["strict"] = serde_json::json!(strict);
+                        }
+                        tool
+                    })
+                    .collect();
+                let chat = chat_request_with_tools(serde_json::json!(chat_tools));
+                let converted = responses_request_with_tools(serde_json::json!(responses_tools));
+                assert_eq!(
+                    rendered_tools(&converted),
+                    rendered_tools(&chat),
+                    "strict={strict:?} tools={count}"
+                );
+                assert_eq!(
+                    serde_json::to_string(&converted.inner.tools).unwrap(),
+                    serde_json::to_string(&chat.inner.tools).unwrap(),
+                );
+            }
+        }
+    }
+
+    /// `strict: true` is a real constraint request, so it is kept and renders
+    /// exactly like a Chat tool that sets it.
+    #[test]
+    fn test_responses_strict_true_tool_matches_chat_strict_true_tool() {
+        let chat = chat_request_with_tools(serde_json::json!([{"type": "function", "function": {
+            "name": "f", "parameters": {"type": "object", "properties": {}}, "strict": true,
+        }}]));
+        let converted = responses_request_with_tools(serde_json::json!([{
+            "type": "function", "name": "f",
+            "parameters": {"type": "object", "properties": {}}, "strict": true,
+        }]));
+        assert_eq!(rendered_tools(&converted), rendered_tools(&chat));
+        assert_eq!(
+            converted.inner.tools.unwrap()[0].function.strict,
+            Some(true)
+        );
     }
 }

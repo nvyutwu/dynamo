@@ -157,6 +157,17 @@ impl NvCreateChatCompletionRequest {
         self.normalize_reasoning_template_args_inner(DEFAULT_THINKING_EFFORT.as_deref())
     }
 
+    /// Same as [`Self::normalize_reasoning_template_args`] with the serve-time
+    /// default effort passed explicitly (callers pass
+    /// [`default_thinking_effort`]); lets other entry points unit-test their
+    /// use of the default without the process-global env read.
+    pub fn normalize_reasoning_template_args_with_default(
+        &mut self,
+        default_thinking_effort: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.normalize_reasoning_template_args_inner(default_thinking_effort)
+    }
+
     /// Inner impl taking the serve-time default thinking effort explicitly so it
     /// is unit-testable without depending on the process-global `LazyLock` env
     /// read. Production callers go through `normalize_reasoning_template_args`.
@@ -284,6 +295,58 @@ impl NvCreateChatCompletionRequest {
         self.thinking = None;
         Ok(())
     }
+
+    /// Rewrite effort grades the Kimi K3 renderer cannot render onto the
+    /// nearest K3 level (see [`kimi_k3_effort_level`]).
+    ///
+    /// Only values the renderer would otherwise reject are touched: `low`,
+    /// `high`, and `max` pass through, `none` still turns thinking off, and an
+    /// unknown string is left for the renderer to reject. Call after
+    /// [`Self::normalize_reasoning_template_args`], and only for a K3 target
+    /// ([`is_kimi_k3_reasoning_parser`]); other models keep their own grades.
+    pub fn coerce_kimi_k3_reasoning_effort(&mut self) {
+        let Some(args) = self.chat_template_args.as_mut() else {
+            return;
+        };
+        for key in ["thinking_effort", "reasoning_effort"] {
+            let Some(level) = args
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|effort| !VALID_THINKING_EFFORTS.contains(effort))
+                .and_then(kimi_k3_effort_level)
+            else {
+                continue;
+            };
+            args.insert(
+                key.to_string(),
+                serde_json::Value::String(level.to_string()),
+            );
+        }
+    }
+}
+
+/// Map the OpenAI / Anthropic reasoning-effort vocabulary onto the three Kimi
+/// K3 thinking levels: `minimal`/`low` → `low`, `medium`/`high` → `high`,
+/// `xhigh`/`max` → `max`. Any other value (including `none`) has no K3 level.
+pub fn kimi_k3_effort_level(effort: &str) -> Option<&'static str> {
+    match effort {
+        "minimal" | "low" => Some("low"),
+        "medium" | "high" => Some("high"),
+        "xhigh" | "max" => Some("max"),
+        _ => None,
+    }
+}
+
+/// The serve-time default thinking effort
+/// (`DYN_KIMI_K3_DEFAULT_THINKING_EFFORT`), or `None` when unset or invalid.
+pub fn default_thinking_effort() -> Option<&'static str> {
+    DEFAULT_THINKING_EFFORT.as_deref()
+}
+
+/// Whether a configured reasoning parser means the Kimi K3 renderer serves the
+/// model. Matches the parser names the preprocessor treats as K3.
+pub fn is_kimi_k3_reasoning_parser(parser: Option<&str>) -> bool {
+    matches!(parser, Some("kimi_k3" | "kimi-k3"))
 }
 
 /// The two boolean dialects, in precedence order. `thinking_mode` carries the
@@ -2236,5 +2299,64 @@ mod tests {
                 serde_json::from_value(json_str).expect("Failed to deserialize request");
             assert!(request.normalize_reasoning_template_args().is_err());
         }
+    }
+
+    #[test]
+    fn test_kimi_k3_effort_level_mapping() {
+        for (effort, level) in [
+            ("minimal", Some("low")),
+            ("low", Some("low")),
+            ("medium", Some("high")),
+            ("high", Some("high")),
+            ("xhigh", Some("max")),
+            ("max", Some("max")),
+            ("none", None),
+            ("bogus", None),
+        ] {
+            assert_eq!(kimi_k3_effort_level(effort), level, "{effort}");
+        }
+    }
+
+    #[test]
+    fn test_coerce_kimi_k3_reasoning_effort_rewrites_only_unrenderable_grades() {
+        for (effort, expected) in [
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "max"),
+            ("low", "low"),
+            ("high", "high"),
+            ("max", "max"),
+            ("none", "none"),
+            ("bogus", "bogus"),
+        ] {
+            let mut request = request_with(json!({
+                "chat_template_args": {"reasoning_effort": effort, "thinking_effort": effort}
+            }));
+            request.coerce_kimi_k3_reasoning_effort();
+            let args = template_args(&request);
+            assert_eq!(
+                args.get("reasoning_effort"),
+                Some(&json!(expected)),
+                "{effort}"
+            );
+            assert_eq!(
+                args.get("thinking_effort"),
+                Some(&json!(expected)),
+                "{effort}"
+            );
+        }
+        // No args: nothing to do, nothing created.
+        let mut request = request_with(json!({}));
+        request.coerce_kimi_k3_reasoning_effort();
+        assert!(request.chat_template_args.is_none());
+    }
+
+    #[test]
+    fn test_is_kimi_k3_reasoning_parser() {
+        assert!(is_kimi_k3_reasoning_parser(Some("kimi_k3")));
+        assert!(is_kimi_k3_reasoning_parser(Some("kimi-k3")));
+        assert!(!is_kimi_k3_reasoning_parser(Some("kimi_k25")));
+        assert!(!is_kimi_k3_reasoning_parser(Some("qwen3")));
+        assert!(!is_kimi_k3_reasoning_parser(None));
     }
 }

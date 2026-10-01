@@ -1419,6 +1419,23 @@ impl ModelManager {
             .get_chat_engine_with_parsing()
     }
 
+    /// Rust chat preprocessor + parsing options for `model`, for render-only
+    /// work such as Anthropic `count_tokens`. `None` when the model is unknown
+    /// or has no Rust chat preprocessor (e.g. a Python chat processor).
+    pub fn get_chat_preprocessor_with_parsing(
+        &self,
+        model: &str,
+    ) -> Option<(
+        Arc<crate::preprocessor::OpenAIPreprocessor>,
+        crate::protocols::openai::ParsingOptions,
+    )> {
+        self.catalog
+            .load()
+            .models
+            .get(model)?
+            .get_chat_preprocessor_with_parsing()
+    }
+
     pub fn get_completions_engine_with_parsing(
         &self,
         model: &str,

@@ -687,6 +687,7 @@ where
                 let routing = preprocessed_routing.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("chat pipeline requires preprocessed routing")
                 })?;
+                let mut chat_preprocessor = None;
                 let chat_engine = if let Some(ref factory) = self.chat_engine_factory {
                     let routed_engine = routing
                         .build_preprocessed_pipeline(
@@ -707,6 +708,7 @@ where
                     let preprocessor =
                         OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tk.clone())
                             .context("OpenAIPreprocessor.new_with_parts")?;
+                    chat_preprocessor = Some(preprocessor.clone());
                     Some(
                         routing
                             .build_pipeline::<
@@ -736,6 +738,7 @@ where
                 };
                 if let Some(chat_engine) = chat_engine {
                     worker_set.chat_engine = Some(chat_engine);
+                    worker_set.chat_preprocessor = chat_preprocessor;
                     tracing::info!("Chat completions is ready");
                 }
             }

@@ -30,6 +30,116 @@ use http_harness::{
 
 const ENV: [(&str, Option<&str>); 1] = [(DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("0"))];
 
+/// Unsupported client-executed tool definitions return HTTP 400 before backend
+/// dispatch for both unary and streaming requests, including mixed tools and
+/// namespace members.
+#[tokio::test]
+#[serial]
+async fn unsupported_client_tools_fail_before_dispatch_or_streaming() {
+    temp_env::async_with_vars(ENV, async {
+        let svc = HarnessService::start([]).await;
+        for stream in [false, true] {
+            for (tools, tool_type) in [
+                (
+                    json!([{"type": "custom", "name": "apply_patch", "format": {"type": "text"}}]),
+                    "custom",
+                ),
+                (
+                    json!([tool("read_file"), {"type": "local_shell"}]),
+                    "local_shell",
+                ),
+                (
+                    json!([{
+                        "type": "namespace", "name": "custom", "description": "Custom tools",
+                        "tools": [{"type": "custom", "name": "run", "format": {"type": "text"}}]
+                    }]),
+                    "custom",
+                ),
+            ] {
+                let body = json!({
+                    "model": MODEL,
+                    "input": "ping",
+                    "stream": stream,
+                    "tools": tools,
+                });
+                let response = post_responses(&svc, &body).await;
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                let error: Value = response.json().await.unwrap();
+                assert!(error["message"].as_str().unwrap().contains(tool_type));
+            }
+        }
+        assert!(svc.engine.take_requests().await.is_empty());
+        svc.shutdown().await;
+    })
+    .await;
+}
+
+/// Hosted tools (run by the provider, never called by the model) are dropped, not
+/// rejected: Codex declares `web_search` on every request by default. The function
+/// tool next to it is still forwarded.
+#[tokio::test]
+#[serial]
+async fn hosted_tools_are_dropped_and_function_tools_forwarded() {
+    temp_env::async_with_vars(ENV, async {
+        let svc = HarnessService::start([load_agent_fixture("text.sse").await.unwrap()]).await;
+        let response = post_responses(
+            &svc,
+            &json!({
+                "model": MODEL,
+                "input": "ping",
+                "stream": false,
+                "tools": [tool("read_file"), {"type": "web_search"}, {"type": "file_search", "vector_store_ids": ["vs_1"]}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let requests = svc.engine.take_requests().await;
+        assert_eq!(requests.len(), 1);
+        let names: Vec<_> = requests[0]
+            .inner
+            .tools
+            .as_ref()
+            .expect("function tool forwarded")
+            .iter()
+            .map(|tool| serde_json::to_value(tool).unwrap()["function"]["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("read_file")]);
+        svc.shutdown().await;
+    })
+    .await;
+}
+
+/// Unsupported choices return HTTP 400 without dispatch for unary and streaming
+/// requests even when the supplied function tool definitions are valid.
+#[tokio::test]
+#[serial]
+async fn unsupported_tool_choices_fail_before_dispatch_or_streaming() {
+    temp_env::async_with_vars(ENV, async {
+        let svc = HarnessService::start([]).await;
+        for stream in [false, true] {
+            for choice in [
+                json!({"type": "web_search_preview"}),
+                json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "read_file"}]}),
+            ] {
+                let body = json!({
+                    "model": MODEL,
+                    "input": "ping",
+                    "stream": stream,
+                    "tool_choice": choice,
+                    "tools": [tool("read_file")],
+                });
+                let response = post_responses(&svc, &body).await;
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                let error: Value = response.json().await.unwrap();
+                assert!(error["message"].as_str().unwrap().contains("tool_choice"));
+            }
+        }
+        assert!(svc.engine.take_requests().await.is_empty());
+        svc.shutdown().await;
+    })
+    .await;
+}
+
 async fn post_responses(svc: &HarnessService, body: &Value) -> reqwest::Response {
     svc.client
         .post(format!("{}/v1/responses", svc.base_url))

@@ -159,6 +159,12 @@ pub struct WorkerSet {
     pub(crate) realtime_engine: Option<RealtimeBidirectionalEngine>,
     pub(crate) generate_engine: Option<GenerateStreamingEngine>,
 
+    /// The Rust chat preprocessor inside `chat_engine`, kept so requests that
+    /// only need the rendered prompt (e.g. Anthropic `count_tokens`) can
+    /// render and tokenize it without dispatching. `None` when the chat engine
+    /// comes from a Python chat processor or is absent.
+    pub(crate) chat_preprocessor: Option<Arc<crate::preprocessor::OpenAIPreprocessor>>,
+
     /// Owns load monitoring for routed surfaces that do not use `RoutingHost`.
     load_context: Option<Arc<RoutingLoadContext>>,
 
@@ -204,6 +210,7 @@ impl WorkerSet {
             tensor_engine: None,
             realtime_engine: None,
             generate_engine: None,
+            chat_preprocessor: None,
             load_context: None,
             load_thresholds: None,
             prefill_router: None,
@@ -448,6 +455,8 @@ impl WorkerSet {
             // inject the adapter identity. Fail closed instead of serving the base weights.
             realtime_engine: None,
             generate_engine,
+            // An adapter shares the base model's chat template and tokenizer.
+            chat_preprocessor: self.chat_preprocessor.clone(),
             load_context: self.load_context.clone(),
             load_thresholds: self.load_thresholds.clone(),
             prefill_router: self.prefill_router.clone(),
