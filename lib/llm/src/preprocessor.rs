@@ -1099,7 +1099,7 @@ fn apply_tracked_mm_replacements(
 /// `(start, end, mm_hash)` with `end` exclusive. For Kimi-K3 `start` is the position of the
 /// `<|media_begin|>` that opens the item's dimension-bearing media block, which is the offset
 /// vLLM records in the block-hash extra key `(identifier, offset)`.
-#[cfg(feature = "mm-routing")]
+#[allow(dead_code)]
 type MmSpan = (usize, usize, u64);
 
 /// Attach every media span to the blocks it overlaps. The hybrid probe index reproduces
@@ -11607,6 +11607,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mm-routing")]
     #[test]
     fn tracked_video_boundary_uses_native_metadata_only_when_needed() {
         use dynamo_kv_router::protocols::pad_value_for_mm_hash;
