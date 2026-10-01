@@ -1756,21 +1756,6 @@ where
         let seq_hash_elapsed = start.elapsed();
 
         let is_admitted_routing = matches!(admission, FindBestMatchAdmission::WithAdmission { .. });
-        let supports_overlap_refresh = self.scheduler.supports_overlap_refresh();
-        let retain_block_hashes = supports_overlap_refresh || return_routing_hashes;
-        let has_transfer_capable_workers = self.has_transfer_capable_workers();
-        let should_prepare_transfer_hint = is_admitted_routing && has_transfer_capable_workers;
-        let retain_kv_transfer_chain =
-            should_prepare_transfer_hint && self.indexer.supports_kv_transfer_chain_retention();
-        if should_prepare_transfer_hint && !retain_kv_transfer_chain {
-            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-            WARN_ONCE.call_once(|| {
-                tracing::warn!(
-                    "TRANSFER hint chain retention requires a local event-driven indexer with no approximate side indexer and no remote-recorded routing decisions; proceeding without transfer hints"
-                );
-            });
-        }
-
         // Hybrid-attention models route on the engine's own prefix-chain hashes (D3): the
         // radix tree sees only the full-attention group and mis-credits every boundary where
         // the recurrent state is missing. Multimodal prompts are reproduced from the routing
@@ -1792,6 +1777,26 @@ where
             .filter(|_| {
                 lora_name.is_none() && cache_namespace.is_none() && !matches!(hybrid_mm, Some(None))
             });
+        // The overlap refresher only has local block hashes, so hybrid-routed requests keep
+        // their enqueue-time engine-hash estimate; requests that fall back to the radix path
+        // (LoRA, cache namespace, multimodal prompts whose engine tokens could not be
+        // reconstructed) keep the refresh.
+        let supports_overlap_refresh =
+            self.scheduler.supports_overlap_refresh() && hybrid_probe.is_none();
+        let retain_block_hashes = supports_overlap_refresh || return_routing_hashes;
+        let has_transfer_capable_workers = self.has_transfer_capable_workers();
+        let should_prepare_transfer_hint = is_admitted_routing && has_transfer_capable_workers;
+        let retain_kv_transfer_chain =
+            should_prepare_transfer_hint && self.indexer.supports_kv_transfer_chain_retention();
+        if should_prepare_transfer_hint && !retain_kv_transfer_chain {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "TRANSFER hint chain retention requires a local event-driven indexer with no approximate side indexer and no remote-recorded routing decisions; proceeding without transfer hints"
+                );
+            });
+        }
+
         let (
             tiered_matches,
             shared_cache_hits,

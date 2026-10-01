@@ -157,9 +157,10 @@ impl Indexer {
     }
 
     pub(crate) fn supports_overlap_refresh(&self) -> bool {
-        // The refresher only has local block hashes; hybrid-routed requests keep their
-        // enqueue-time engine-hash estimate rather than falling back to the radix view.
-        matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. }) && self.hybrid().is_none()
+        // Capability of the indexer: a local radix view the refresher can re-query. Whether a
+        // given request uses it is decided per request in `KvRouter::find_best_match` (requests
+        // routed on the hybrid probe keep their enqueue-time engine-hash estimate).
+        matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. })
     }
 
     pub(crate) fn supports_kv_transfer_chain_retention(&self) -> bool {
@@ -878,7 +879,9 @@ mod tests {
             dumped.is_empty(),
             "radix dump must not contain hybrid keys: {dumped:?}"
         );
-        assert!(!indexer.supports_overlap_refresh());
+        // The refresher stays available for radix-fallback requests; hybrid-routed requests opt
+        // out per request in find_best_match.
+        assert!(indexer.supports_overlap_refresh());
         assert!(indexer.hybrid().is_some());
         assert!(make_test_indexer().hybrid().is_none());
     }
