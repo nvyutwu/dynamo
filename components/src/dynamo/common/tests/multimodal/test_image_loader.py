@@ -26,7 +26,11 @@ from PIL import Image
 
 from dynamo.common.http import HttpConnectionError, HttpStatusError, HttpTimeoutError
 from dynamo.common.http.url_validator import UrlValidationError, UrlValidationPolicy
-from dynamo.common.multimodal.image_loader import URL_VARIANT_KEY, ImageLoader
+from dynamo.common.multimodal.image_loader import (
+    IMAGE_DECODE_ERROR,
+    URL_VARIANT_KEY,
+    ImageLoader,
+)
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -248,26 +252,27 @@ def _make_svg_bytes() -> bytes:
     return b"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>"
 
 
-async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
+async def test_unsupported_format_url_raises_400(loader: ImageLoader) -> None:
     """Fetching a URL that returns an unsupported image format (e.g. SVG) should raise
-    HttpStatusError with status 415, not 500."""
+    HttpStatusError with status 400 (client error), not 500."""
     mock_fetch = _mock_fetch_bytes(content=_make_svg_bytes())
     with patch(_FETCH_BYTES_PATH, mock_fetch):
         with pytest.raises(HttpStatusError) as exc_info:
             await loader.load_image("https://example.com/image.svg")
-        assert exc_info.value.status == 415
+        assert exc_info.value.status == 400
 
 
-async def test_unsupported_format_data_url_raises_415(loader: ImageLoader) -> None:
-    """A data: URL carrying an SVG payload should raise HttpStatusError 415."""
+async def test_unsupported_format_data_url_raises_400(loader: ImageLoader) -> None:
+    """A data: URL carrying an SVG payload should raise HttpStatusError 400."""
     svg_b64 = base64.b64encode(_make_svg_bytes()).decode()
     with pytest.raises(HttpStatusError) as exc_info:
         await loader.load_image(f"data:image/svg+xml;base64,{svg_b64}")
-    assert exc_info.value.status == 415
+    assert exc_info.value.status == 400
+    assert exc_info.value.message == IMAGE_DECODE_ERROR
 
 
-async def test_unsupported_format_batch_url_raises_415(loader: ImageLoader) -> None:
-    """The batch path must preserve the 415 status instead of collapsing it into a
+async def test_unsupported_format_batch_url_raises_400(loader: ImageLoader) -> None:
+    """The batch path must preserve the 400 status instead of collapsing it into a
     generic Exception. This is the path the frontend actually drives, so the status
     has to survive load_image_batch's exception aggregation."""
     mock_fetch = _mock_fetch_bytes(content=_make_svg_bytes())
@@ -276,7 +281,7 @@ async def test_unsupported_format_batch_url_raises_415(loader: ImageLoader) -> N
             await loader.load_image_batch(
                 [{URL_VARIANT_KEY: "https://example.com/image.svg"}]
             )
-        assert exc_info.value.status == 415
+        assert exc_info.value.status == 400
 
 
 async def test_uuid_only_image_slots_preserve_batch_alignment(
@@ -333,16 +338,16 @@ async def test_frontend_decoded_grayscale_image_is_converted_to_rgb(
     assert image.getpixel((0, 0)) == (127, 127, 127)
 
 
-async def test_unsupported_format_batch_data_url_raises_415(
+async def test_unsupported_format_batch_data_url_raises_400(
     loader: ImageLoader,
 ) -> None:
-    """The batch path must preserve the 415 status for data: URLs as well."""
+    """The batch path must preserve the 400 status for data: URLs as well."""
     svg_b64 = base64.b64encode(_make_svg_bytes()).decode()
     with pytest.raises(HttpStatusError) as exc_info:
         await loader.load_image_batch(
             [{URL_VARIANT_KEY: f"data:image/svg+xml;base64,{svg_b64}"}]
         )
-    assert exc_info.value.status == 415
+    assert exc_info.value.status == 400
 
 
 # --- SSRF / URL-validation error contract ---

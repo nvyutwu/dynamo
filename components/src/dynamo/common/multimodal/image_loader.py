@@ -62,6 +62,15 @@ async def read_decoded_media_via_nixl(*args: Any, **kwargs: Any) -> Any:
     return await _read_decoded_media_via_nixl(*args, **kwargs)
 
 
+# An image whose bytes cannot be decoded is a client error: answer 400 like the OpenAI and
+# Anthropic APIs (415 is about the request's own Content-Type, and clients retry 5xx).
+# The message does not echo the URL: a data: URL can be megabytes of base64.
+IMAGE_DECODE_ERROR = (
+    "Invalid image: the image data could not be decoded "
+    "(corrupt or unsupported image format)"
+)
+
+
 class ImageLoader:
     CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "8"))
 
@@ -171,7 +180,7 @@ class ImageLoader:
             raise
         except Image.UnidentifiedImageError as e:
             logger.error(f"Unsupported image format loading: '{image_url}'")
-            raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
+            raise HttpStatusError(400, IMAGE_DECODE_ERROR, image_url) from e
         except UrlValidationError as e:
             # Keep the type (must precede ValueError, its base) so the batch
             # caller can still map this client error to a 4xx, not a 500.
@@ -180,7 +189,7 @@ class ImageLoader:
         except ValueError as e:
             if "Unsupported image format" in str(e):
                 logger.error(f"Unsupported image format loading: '{image_url}'")
-                raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
+                raise HttpStatusError(400, IMAGE_DECODE_ERROR, image_url) from e
             logger.error(f"{type(e).__name__} loading image: '{image_url}': {e}")
             raise ValueError(f"Failed to load image: '{image_url}': {e}") from e
         except Exception as e:
@@ -253,13 +262,11 @@ class ImageLoader:
                 return await self._open_image(image_data)
             except Image.UnidentifiedImageError as e:
                 logger.error(f"Unsupported image format decoding: '{image_url}'")
-                raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
+                raise HttpStatusError(400, IMAGE_DECODE_ERROR, image_url) from e
             except Exception as e:
                 if "Unsupported image format" in str(e):
                     logger.error(f"Unsupported image format decoding: '{image_url}'")
-                    raise HttpStatusError(
-                        415, "Unsupported Media Type", image_url
-                    ) from e
+                    raise HttpStatusError(400, IMAGE_DECODE_ERROR, image_url) from e
                 logger.error(f"{type(e).__name__} decoding image: '{image_url}': {e}")
                 raise ValueError(f"Failed to decoding image: '{image_url}': {e}") from e
 
@@ -272,8 +279,7 @@ class ImageLoader:
         image_mm_items: List[Dict[str, Any]],
         *,
         preserve_uuid_slots: Literal[False] = False,
-    ) -> list[Image.Image]:
-        ...
+    ) -> list[Image.Image]: ...
 
     @overload
     async def load_image_batch(
@@ -281,8 +287,7 @@ class ImageLoader:
         image_mm_items: List[Dict[str, Any]],
         *,
         preserve_uuid_slots: Literal[True],
-    ) -> list[Image.Image | None]:
-        ...
+    ) -> list[Image.Image | None]: ...
 
     async def load_image_batch(
         self,
@@ -309,7 +314,7 @@ class ImageLoader:
 
         Raises:
             HttpStatusError: If any image fails with an HTTP status error
-                (e.g. 415 Unsupported Media Type), or with a transport error
+                (e.g. 400 for an undecodable image), or with a transport error
                 (timeout mapped to 408, connection error mapped to 400); the
                 status is preserved so the frontend returns the correct
                 client-error code instead of 500.
@@ -379,7 +384,7 @@ class ImageLoader:
                 collective_exceptions += (
                     f"Failed to load image from {source[:80]}...: {result}\n"
                 )
-                # Preserve HTTP status semantics (e.g. 415 Unsupported Media Type).
+                # Preserve HTTP status semantics (e.g. 400 for an undecodable image).
                 # Folding an HttpStatusError into a generic Exception below would
                 # strip the status and force the frontend back to a 500. Surface
                 # the first one so single-item batches keep their client-error code.
