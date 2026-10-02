@@ -134,7 +134,12 @@ pub(super) fn get_body_limit() -> usize {
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Error body of the OpenAI-compatible endpoints.
+///
+/// Serialized with the OpenAI error object, `{"error": {"message", "type", "param", "code"}}`,
+/// which the OpenAI SDKs parse. The legacy top-level `message` / `type` / `code` (and `details`)
+/// fields are kept alongside it so existing consumers keep working.
+#[derive(Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
@@ -144,6 +149,100 @@ pub(crate) struct ErrorMessage {
     details: Option<Box<serde_json::Value>>,
     #[serde(skip)]
     metric_error_type: Option<ErrorType>,
+}
+
+const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+
+/// Remove Claude Code's `x-anthropic-billing-header: …` line from the start of the first
+/// system message of a Chat request. The line varies per conversation, so leaving it first in
+/// the prompt defeats prefix caching across conversations. A text part that is only the header
+/// (OpenRouter sends each Anthropic system block as its own part) is removed entirely.
+/// Returns whether anything was stripped.
+fn strip_chat_billing_preamble(
+    messages: &mut [dynamo_protocols::types::ChatCompletionRequestMessage],
+) -> bool {
+    use dynamo_protocols::types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestSystemMessageContentPart,
+    };
+
+    // Some(rest) when `text` starts with the header: rest is what follows its line ("" if none).
+    fn after_header(text: &str) -> Option<String> {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with(ANTHROPIC_BILLING_HEADER_PREFIX) {
+            return None;
+        }
+        Some(match trimmed.find('\n') {
+            Some(pos) => trimmed[pos + 1..].to_string(),
+            None => String::new(),
+        })
+    }
+
+    let Some(ChatCompletionRequestMessage::System(system)) = messages.first_mut() else {
+        return false;
+    };
+    match &mut system.content {
+        ChatCompletionRequestSystemMessageContent::Text(text) => match after_header(text) {
+            Some(rest) => {
+                *text = rest;
+                true
+            }
+            None => false,
+        },
+        ChatCompletionRequestSystemMessageContent::Array(parts) => {
+            let Some(ChatCompletionRequestSystemMessageContentPart::Text(first)) =
+                parts.first_mut()
+            else {
+                return false;
+            };
+            match after_header(&first.text) {
+                Some(rest) if rest.trim().is_empty() => {
+                    parts.remove(0);
+                    true
+                }
+                Some(rest) => {
+                    first.text = rest;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// OpenAI `error.type` for an HTTP status, using the same names as `/generate`.
+fn openai_error_object_type(code: u16) -> &'static str {
+    match code {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found",
+        429 => "rate_limit_error",
+        501 => "not_implemented",
+        c if (400..500).contains(&c) => "invalid_request_error",
+        _ => "server_error",
+    }
+}
+
+impl Serialize for ErrorMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let error = serde_json::json!({
+            "message": self.message,
+            "type": openai_error_object_type(self.code),
+            "param": serde_json::Value::Null,
+            "code": self.code,
+        });
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("error", &error)?;
+        map.serialize_entry("message", &self.message)?;
+        map.serialize_entry("type", &self.error_type)?;
+        map.serialize_entry("code", &self.code)?;
+        if let Some(details) = &self.details {
+            map.serialize_entry("details", details)?;
+        }
+        map.end()
+    }
 }
 
 impl ErrorMessage {
@@ -2059,6 +2158,12 @@ async fn handler_chat_completions(
     }
     request.nvext =
         apply_frontend_nvext_policy(request.nvext.take(), &headers, state.nvext_enabled());
+
+    // Claude Code traffic translated to Chat (OpenRouter, relays) keeps the per-conversation
+    // billing header at the start of the system prompt; same strip as /v1/messages.
+    if state.strip_anthropic_preamble_enabled() {
+        strip_chat_billing_preamble(&mut request.inner.messages);
+    }
 
     // create the context for the request
     let request_id = get_or_create_request_id(&headers);
@@ -5232,6 +5337,114 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn error_body_has_openai_error_object_and_legacy_fields() {
+        let (status, Json(body)) = ErrorMessage::model_not_found();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["message"], "Model not found");
+        assert_eq!(json["error"]["type"], "not_found");
+        assert_eq!(json["error"]["param"], serde_json::Value::Null);
+        assert_eq!(json["error"]["code"], 404);
+        // legacy top-level fields are kept
+        assert_eq!(json["message"], "Model not found");
+        assert_eq!(json["type"], "Not Found");
+        assert_eq!(json["code"], 404);
+        // and the body still deserializes
+        let back: ErrorMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(back.message(), "Model not found");
+    }
+
+    fn system_then_user(
+        system: dynamo_protocols::types::ChatCompletionRequestSystemMessageContent,
+    ) -> Vec<ChatCompletionRequestMessage> {
+        vec![
+            ChatCompletionRequestMessage::System(
+                dynamo_protocols::types::ChatCompletionRequestSystemMessage {
+                    content: system,
+                    ..Default::default()
+                },
+            ),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text("hi".into()),
+                name: None,
+            }),
+        ]
+    }
+
+    fn system_text(messages: &[ChatCompletionRequestMessage]) -> String {
+        use dynamo_protocols::types::{
+            ChatCompletionRequestSystemMessageContent as C,
+            ChatCompletionRequestSystemMessageContentPart as P,
+        };
+        let ChatCompletionRequestMessage::System(s) = &messages[0] else {
+            panic!("expected system message");
+        };
+        match &s.content {
+            C::Text(t) => t.clone(),
+            C::Array(parts) => parts
+                .iter()
+                .map(|P::Text(t)| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join("|"),
+        }
+    }
+
+    #[test]
+    fn chat_billing_preamble_stripped_from_text_system() {
+        use dynamo_protocols::types::ChatCompletionRequestSystemMessageContent as C;
+        let mut msgs = system_then_user(C::Text(
+            "x-anthropic-billing-header: cc_version=2.1.285.39e; cch=ab12;\nYou are Claude Code."
+                .into(),
+        ));
+        assert!(strip_chat_billing_preamble(&mut msgs));
+        assert_eq!(system_text(&msgs), "You are Claude Code.");
+    }
+
+    #[test]
+    fn chat_billing_preamble_part_removed_from_array_system() {
+        use dynamo_protocols::types::{
+            ChatCompletionRequestMessageContentPartText as T,
+            ChatCompletionRequestSystemMessageContent as C,
+            ChatCompletionRequestSystemMessageContentPart as P,
+        };
+        let mut msgs = system_then_user(C::Array(vec![
+            P::Text(T {
+                text: "x-anthropic-billing-header: cc_version=2.1.285.39e; cch=ab12;".into(),
+            }),
+            P::Text(T {
+                text: "You are Claude Code.".into(),
+            }),
+        ]));
+        assert!(strip_chat_billing_preamble(&mut msgs));
+        assert_eq!(system_text(&msgs), "You are Claude Code.");
+    }
+
+    #[test]
+    fn chat_without_billing_preamble_is_untouched() {
+        use dynamo_protocols::types::ChatCompletionRequestSystemMessageContent as C;
+        let mut msgs = system_then_user(C::Text(
+            "You are helpful.\nx-anthropic-billing-header: later".into(),
+        ));
+        assert!(!strip_chat_billing_preamble(&mut msgs));
+        assert_eq!(
+            system_text(&msgs),
+            "You are helpful.\nx-anthropic-billing-header: later"
+        );
+        // no system message at all
+        let mut only_user = vec![msgs.remove(1)];
+        assert!(!strip_chat_billing_preamble(&mut only_user));
+    }
+
+    #[test]
+    fn openai_error_object_type_by_status() {
+        assert_eq!(openai_error_object_type(400), "invalid_request_error");
+        assert_eq!(openai_error_object_type(413), "invalid_request_error");
+        assert_eq!(openai_error_object_type(429), "rate_limit_error");
+        assert_eq!(openai_error_object_type(500), "server_error");
+        assert_eq!(openai_error_object_type(529), "server_error");
+    }
 
     fn binary_pooling_response() -> NvCreatePoolingResponse {
         NvCreatePoolingResponse {

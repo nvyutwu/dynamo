@@ -1026,28 +1026,34 @@ fn validate_kimi_k3_immutable_params_with_gate(
         && !(0.0..=1.0).contains(&t)
     {
         anyhow::bail!(
-            "`temperature` is immutable for this model and must be between 0.0 and 1.0, got {t}"
+            "`temperature` must be between 0.0 and 1.0 for Kimi K3; values outside that range are not supported (got {t})"
         );
     }
     if let Some(p) = top_p
         && p != 0.95
     {
-        anyhow::bail!("`top_p` is immutable for this model and must be 0.95, got {p}");
+        anyhow::bail!(
+            "`top_p` is fixed at 0.95 for Kimi K3; overriding it is not supported (got {p})"
+        );
     }
     if let Some(v) = presence_penalty
         && v != 0.0
     {
-        anyhow::bail!("`presence_penalty` is immutable for this model and must be 0, got {v}");
+        anyhow::bail!(
+            "`presence_penalty` is fixed at 0 for Kimi K3; overriding it is not supported (got {v})"
+        );
     }
     if let Some(v) = frequency_penalty
         && v != 0.0
     {
-        anyhow::bail!("`frequency_penalty` is immutable for this model and must be 0, got {v}");
+        anyhow::bail!(
+            "`frequency_penalty` is fixed at 0 for Kimi K3; overriding it is not supported (got {v})"
+        );
     }
     if let Some(v) = n
         && v != 1
     {
-        anyhow::bail!("`n` is immutable for this model and must be 1, got {v}");
+        anyhow::bail!("`n` is fixed at 1 for Kimi K3; overriding it is not supported (got {v})");
     }
     Ok(())
 }
@@ -1269,6 +1275,11 @@ mod tests {
         }
         let err = immutable(None, Some(0.8), None, None, None, true).unwrap_err();
         assert!(err.to_string().contains("`top_p`"), "{err}");
+        // Clients and test harnesses key on the model name and "not supported".
+        assert_eq!(
+            err.to_string(),
+            "`top_p` is fixed at 0.95 for Kimi K3; overriding it is not supported (got 0.8)"
+        );
         let err = immutable(None, None, Some(0.5), None, None, true).unwrap_err();
         assert!(err.to_string().contains("`presence_penalty`"), "{err}");
         let err = immutable(None, None, None, Some(0.5), None, true).unwrap_err();
