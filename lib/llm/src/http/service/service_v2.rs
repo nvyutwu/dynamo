@@ -2086,9 +2086,12 @@ mod tests {
             openai_body["message"],
             "Route not found: GET /v1/messages_beta/missing"
         );
-        assert!(
-            openai_body.get("error").is_none(),
-            "sibling paths must use the OpenAI error envelope"
+        // Sibling paths use the OpenAI envelope, not the Anthropic one.
+        assert_ne!(openai_body["type"], "error");
+        assert_eq!(openai_body["error"]["type"], "not_found");
+        assert_eq!(
+            openai_body["error"]["message"],
+            "Route not found: GET /v1/messages_beta/missing"
         );
 
         handle.abort();

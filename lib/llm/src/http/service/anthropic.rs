@@ -256,12 +256,61 @@ fn validate_anthropic_tools(
     Ok(())
 }
 
+/// Anthropic accepts `{"type":"url","url":"https://..."}` image sources, but the
+/// shared `AnthropicImageSource` type requires `media_type` and `data`. Rewrite
+/// URL sources into that shape (`data` carries the URL) before deserializing,
+/// in message content and inside `tool_result` content.
+fn normalize_url_image_sources(body: &mut serde_json::Value) {
+    fn visit_blocks(blocks: &mut serde_json::Value) {
+        let Some(blocks) = blocks.as_array_mut() else {
+            return;
+        };
+        for block in blocks {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("image") => {
+                    if let Some(source) = block.get_mut("source").and_then(|s| s.as_object_mut())
+                        && source.get("type").and_then(|t| t.as_str()) == Some("url")
+                        && !source.contains_key("data")
+                        && let Some(url) = source.remove("url")
+                    {
+                        source.insert("data".to_string(), url);
+                        source
+                            .entry("media_type")
+                            .or_insert_with(|| serde_json::Value::String(String::new()));
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(content) = block.get_mut("content") {
+                        visit_blocks(content);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                visit_blocks(content);
+            }
+        }
+    }
+}
+
 /// Top-level HTTP handler for POST /v1/messages.
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<AnthropicCreateMessageRequest>,
+    Json(mut raw): Json<serde_json::Value>,
 ) -> Result<Response, Response> {
+    normalize_url_image_sources(&mut raw);
+    let mut request: AnthropicCreateMessageRequest = serde_json::from_value(raw).map_err(|e| {
+        anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("Failed to deserialize the JSON body into the target type: {e}"),
+        )
+    })?;
     let request_id = get_or_create_request_id(&headers);
     let streaming = request.stream;
     let resolved_model = resolve_request_model(&request.model, template.as_ref());
@@ -444,10 +493,10 @@ async fn anthropic_messages(
     let model_for_resp = orig_request.model.clone();
 
     // Anthropic exposes input usage in `message_start`, before the backend's
-    // authoritative count is available. Seed the stream with the same
-    // best-effort estimate as `/count_tokens`; the converter replaces it when
-    // the backend reports final usage.
-    let estimated_input_tokens = if streaming {
+    // authoritative count is available. Below, the converted request is counted
+    // exactly (same render + tokenizer as generation); this estimate is the
+    // fallback. The converter replaces it when the backend reports final usage.
+    let mut estimated_input_tokens = if streaming {
         estimate_input_tokens(&orig_request)
     } else {
         0
@@ -483,6 +532,7 @@ async fn anthropic_messages(
     let anthropic_ctx = unified_request.anthropic_context().cloned();
     let mut chat_request = unified_request.into_inner();
     apply_anthropic_nvext_policy(&mut chat_request, &headers, state.nvext_enabled());
+    request_stop_reason_for_stop_sequences(&mut chat_request);
     if let Err(error) = chat_request.validate() {
         inflight_guard.mark_error(ErrorType::Validation);
         let error = invalid_argument(error.to_string());
@@ -507,6 +557,22 @@ async fn anthropic_messages(
             "invalid_request_error",
             &error.to_string(),
         ));
+    }
+
+    // Exact prompt size for `message_start` (the chat request exactly as it will be
+    // rendered); keeps the estimate when the model has no Rust chat preprocessor.
+    if streaming
+        && let Some((preprocessor, _)) = state.manager().get_chat_preprocessor_with_parsing(&model)
+    {
+        match preprocessor
+            .count_chat_prompt_tokens(chat_request.clone())
+            .await
+        {
+            Ok(tokens) => estimated_input_tokens = tokens,
+            Err(e) => {
+                tracing::debug!(error = %e, "message_start: exact prompt count failed; using the estimate")
+            }
+        }
     }
 
     let request = context.map(|_req| chat_request);
@@ -634,7 +700,7 @@ async fn anthropic_messages(
             inflight_guard.mark_error(super::openai::extract_error_type_from_response(
                 &error_response,
             ));
-            anthropic_backend_error(error_response.0)
+            anthropic_backend_error(error_response)
         })?;
 
         stream_handle.arm();
@@ -746,7 +812,7 @@ async fn anthropic_messages(
         let check = BackendErrorCheck::UntilFirstEvent;
         let stream_with_check = super::openai::check_for_backend_error(engine_stream, check)
             .await
-            .map_err(|(status, _json_err)| anthropic_backend_error(status))?;
+            .map_err(anthropic_backend_error)?;
 
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream_with_check.inspect(move |response| {
@@ -1147,6 +1213,24 @@ async fn get_model(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// With `stop_sequences`, ask the backend to report which stop string ended generation
+/// (the response `nvext.stop_reason`), so the reply can say `stop_reason: "stop_sequence"`
+/// and name the matched `stop_sequence`. Added after the client-`nvext` gating on purpose:
+/// this is a frontend-internal field request, not a client one.
+fn request_stop_reason_for_stop_sequences(chat_request: &mut NvCreateChatCompletionRequest) {
+    if chat_request.inner.stop.is_none() {
+        return;
+    }
+    let fields = chat_request
+        .nvext
+        .get_or_insert_with(Default::default)
+        .extra_fields
+        .get_or_insert_with(Vec::new);
+    if !fields.iter().any(|f| f == "stop_reason") {
+        fields.push("stop_reason".to_string());
+    }
+}
+
 /// Strip the Claude Code billing preamble from the system prompt.
 ///
 /// Claude Code prepends `x-anthropic-billing-header: cc_version=...; cch=...;\n`
@@ -1312,12 +1396,15 @@ fn apply_anthropic_reasoning_controls(
 /// Re-wrap a backend-error status from
 /// [`super::openai::check_for_backend_error`] in Anthropic's error format.
 ///
-/// The helper has already sanitized the body and logged the backend detail, so
-/// only the status carries over. Classification is delegated to
+/// The helper has already sanitized the body and logged the backend detail.
+/// 5xx and classified errors carry over by status only; a forwarded 4xx keeps
+/// the helper's message, matching the OpenAI surfaces (for example an image
+/// that fails to decode reports why). Classification is delegated to
 /// [`SanitizedError::for_backend_status`] so the OpenAI and Anthropic surfaces
 /// answer the same backend failure the same way, whether the request streams or
 /// not.
-fn anthropic_backend_error(status: StatusCode) -> Response {
+fn anthropic_backend_error(error_response: super::openai::ErrorResponse) -> Response {
+    let (status, Json(error)) = error_response;
     // Fork adaptation of upstream 90c8842ceb: this fork predates upstream's
     // `AnthropicHandlerError` (4dd64df9ee), so build the response directly with
     // the same helpers the non-streaming path already used. Callers mark the
@@ -1325,18 +1412,19 @@ fn anthropic_backend_error(status: StatusCode) -> Response {
     let details = format!("backend error event (status {})", status.as_u16());
     match SanitizedError::for_backend_status(status) {
         Some(variant) => anthropic_sanitized_error_with_details(variant, details),
-        // 4xx (non-499): preserve the client-error status; the message is the
-        // canonical reason so we don't smuggle backend text through. The
+        // 4xx (non-499): preserve the client-error status and the message
+        // `check_for_backend_error` forwards for it. The
         // "invalid_request_error" argument is a fallback — anthropic_error
         // remaps 401/403/404/429 to their spec-correct types from the status
         // code itself.
         None => {
             tracing::error!(%status, "Anthropic backend error event");
-            anthropic_error(
-                status,
-                "invalid_request_error",
-                status.canonical_reason().unwrap_or("Client error"),
-            )
+            let message = if error.message().is_empty() {
+                status.canonical_reason().unwrap_or("Client error")
+            } else {
+                error.message()
+            };
+            anthropic_error(status, "invalid_request_error", message)
         }
     }
 }
@@ -1434,6 +1522,57 @@ pub(crate) fn unmatched_route_response(method: &Method, uri: &Uri) -> Response {
 mod tests {
     use super::*;
     use crate::protocols::common::extensions::parse_nvext;
+
+    #[test]
+    fn url_image_sources_deserialize_and_convert() {
+        let mut raw = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                    {"type": "text", "text": "describe"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "view", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/b.png"}}
+                    ]}
+                ]}
+            ]
+        });
+        normalize_url_image_sources(&mut raw);
+        assert_eq!(
+            raw["messages"][0]["content"][0]["source"]["data"],
+            "https://example.com/a.png"
+        );
+        assert!(
+            raw["messages"][0]["content"][0]["source"]
+                .get("url")
+                .is_none()
+        );
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(raw).unwrap();
+        let chat = NvCreateChatCompletionRequest::try_from(request).unwrap();
+        let text = serde_json::to_string(&chat.inner.messages).unwrap();
+        assert!(text.contains("https://example.com/a.png"), "{text}");
+        assert!(text.contains("https://example.com/b.png"), "{text}");
+    }
+
+    #[test]
+    fn url_image_source_rejects_non_http_scheme() {
+        let mut raw = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "url", "url": "file:///etc/passwd"}}
+            ]}]
+        });
+        normalize_url_image_sources(&mut raw);
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(raw).unwrap();
+        assert!(NvCreateChatCompletionRequest::try_from(request).is_err());
+    }
 
     fn request_with_nvext() -> AnthropicCreateMessageRequest {
         serde_json::from_value(serde_json::json!({

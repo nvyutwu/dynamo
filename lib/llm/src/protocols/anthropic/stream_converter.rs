@@ -50,6 +50,8 @@ pub struct AnthropicStreamConverter {
     next_block_index: u32,
     // Stop reason
     stop_reason: Option<AnthropicStopReason>,
+    /// The stop sequence that ended generation (`stop_reason: stop_sequence`).
+    stop_sequence: Option<String>,
 }
 
 struct ToolCallState {
@@ -98,6 +100,7 @@ impl AnthropicStreamConverter {
             tool_blocks_flushed: false,
             next_block_index: 0,
             stop_reason: None,
+            stop_sequence: None,
         }
     }
 
@@ -439,6 +442,14 @@ impl AnthropicStreamConverter {
                         AnthropicStopReason::ToolUse
                     }
                 });
+                if matches!(fr, dynamo_protocols::types::FinishReason::Stop)
+                    && let Some(seq) = crate::protocols::anthropic::types::matched_stop_sequence(
+                        chunk.nvext.as_ref(),
+                    )
+                {
+                    self.stop_reason = Some(AnthropicStopReason::StopSequence);
+                    self.stop_sequence = Some(seq);
+                }
             }
 
             // Handle reasoning/thinking content deltas
@@ -617,7 +628,7 @@ impl AnthropicStreamConverter {
         let message_delta = AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
                 stop_reason: self.stop_reason.clone(),
-                stop_sequence: None,
+                stop_sequence: self.stop_sequence.clone(),
             },
             usage: self.usage.clone(),
         };
@@ -746,6 +757,14 @@ impl AnthropicStreamConverter {
                         AnthropicStopReason::ToolUse
                     }
                 });
+                if matches!(fr, dynamo_protocols::types::FinishReason::Stop)
+                    && let Some(seq) = crate::protocols::anthropic::types::matched_stop_sequence(
+                        chunk.nvext.as_ref(),
+                    )
+                {
+                    self.stop_reason = Some(AnthropicStopReason::StopSequence);
+                    self.stop_sequence = Some(seq);
+                }
             }
 
             // Handle reasoning/thinking content deltas
@@ -903,7 +922,7 @@ impl AnthropicStreamConverter {
         let ev = AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
                 stop_reason: self.stop_reason.clone(),
-                stop_sequence: None,
+                stop_sequence: self.stop_sequence.clone(),
             },
             usage: self.usage.clone(),
         };
