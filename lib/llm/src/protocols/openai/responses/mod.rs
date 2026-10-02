@@ -1336,11 +1336,19 @@ pub struct ResponseParams {
 }
 
 impl ResponseParams {
+    /// Reasoning is returned when the client asks for it: a `reasoning.summary`,
+    /// or `include: ["reasoning.encrypted_content"]`, which is how Codex asks
+    /// for reasoning items it can replay on the next turn (it never sets a
+    /// summary for models without summary metadata).
     fn reasoning_summary_requested(&self) -> bool {
         self.reasoning
             .as_ref()
             .and_then(|reasoning| reasoning.summary)
             .is_some()
+            || self
+                .include
+                .as_ref()
+                .is_some_and(|inc| inc.contains(&IncludeEnum::ReasoningEncryptedContent))
     }
 
     fn namespace_for_function(&self, name: &str) -> Option<String> {
@@ -4032,6 +4040,28 @@ thinking
             .expect("requested reasoning output");
         assert!(reasoning.summary.is_empty());
         assert_eq!(reasoning_text(reasoning), "summary");
+    }
+
+    #[test]
+    fn test_reasoning_returned_for_include_encrypted_content() {
+        // Codex sends include=["reasoning.encrypted_content"] and no summary.
+        let params = ResponseParams {
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
+            ..Default::default()
+        };
+        let response =
+            chat_completion_to_response(make_chat_resp_with_reasoning("thought"), &params, None)
+                .unwrap();
+        let reasoning = response
+            .inner
+            .output
+            .iter()
+            .find_map(|item| match item {
+                OutputItem::Reasoning(reasoning) => Some(reasoning),
+                _ => None,
+            })
+            .expect("reasoning output for include=reasoning.encrypted_content");
+        assert_eq!(reasoning_text(reasoning), "thought");
     }
 
     #[test]

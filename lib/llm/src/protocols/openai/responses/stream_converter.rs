@@ -1793,6 +1793,21 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_streams_for_include_encrypted_content() {
+        use dynamo_protocols::types::responses::IncludeEnum;
+
+        let params = ResponseParams {
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
+            ..default_params()
+        };
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+
+        let events = conv.process_chunk(&reasoning_chunk("thought"));
+
+        assert!(!events.is_empty());
+    }
+
+    #[test]
     fn test_reasoning_text_ignores_updates_after_visible_output() {
         use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
 
