@@ -105,6 +105,9 @@ struct DecoderParams {
     include_stop_str_in_output: bool,
     tracker: Option<Arc<RequestTracker>>,
     n: u32,
+    /// The rendered prompt opened a reasoning section (the preprocessor forwards
+    /// `extra_args.reasoning_ended = false`), so generation starts mid-reasoning.
+    starts_in_reasoning: bool,
 }
 
 impl DecoderParams {
@@ -124,6 +127,12 @@ impl DecoderParams {
                 .unwrap_or(false),
             tracker: request.tracker.clone(),
             n: request.sampling_options.n.unwrap_or(1) as u32,
+            starts_in_reasoning: request
+                .extra_args
+                .as_ref()
+                .and_then(|args| args.get("reasoning_ended"))
+                .and_then(|v| v.as_bool())
+                == Some(false),
         }
     }
 }
@@ -168,7 +177,8 @@ impl Backend {
                 params.stop_conditions.clone(),
                 params.include_stop_str_in_output,
                 params.tracker.clone(),
-            );
+            )
+            .with_reasoning_start(params.starts_in_reasoning);
             decoders.insert(idx, decoder);
         }
 
@@ -496,7 +506,18 @@ pub struct Decoder {
 
     // the number of bytes currently jailed
     jailed_bytes: usize,
+
+    // generation is inside a reasoning section: stop sequences apply to the answer only,
+    // so string matching starts after the reasoning end marker
+    in_reasoning: bool,
+
+    // recent reasoning text, kept to find an end marker split across tokens
+    reasoning_tail: String,
 }
+
+/// Reasoning end markers of the parsers whose prompts can open a reasoning section
+/// (Kimi K3, MiniMax M3, and the generic `<think>` form).
+const REASONING_END_MARKERS: [&str; 3] = ["<|close|>think<|sep|>", "</mm:think>", "</think>"];
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -595,7 +616,68 @@ impl Decoder {
             jail: String::new(),
             jail_max_bytes,
             jailed_bytes: 0,
+            in_reasoning: false,
+            reasoning_tail: String::new(),
         }
+    }
+
+    /// Generation starts inside a reasoning section (the prompt opened it). Stop sequences
+    /// are then matched only after the reasoning end marker, so a stop string that occurs
+    /// while the model thinks cannot end the request before it answers.
+    pub fn with_reasoning_start(mut self, starts_in_reasoning: bool) -> Self {
+        self.in_reasoning = starts_in_reasoning && self.jail_max_bytes > 0;
+        self
+    }
+
+    /// Byte offset just past the earliest reasoning end marker in `text`, if any.
+    fn reasoning_end(text: &str) -> Option<usize> {
+        REASONING_END_MARKERS
+            .iter()
+            .filter_map(|marker| text.find(marker).map(|pos| pos + marker.len()))
+            .min()
+    }
+
+    /// Append `new_text` to the jail and check the stop sequences. Returns the part of
+    /// `new_text` to emit and the trigger when a stop sequence is found.
+    fn match_stop_sequences(&mut self, new_text: &str) -> Option<(String, StopTrigger)> {
+        let pre_append = self.jail.len();
+        self.jail.push_str(new_text);
+
+        // Check hidden stop sequences first (excluded from output)
+        for seq in &self.hidden_stop_sequences {
+            if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes()) {
+                // return only new bytes after pre_append .. offset (excluding stop sequence);
+                // a match that started in previously returned text returns ""
+                let partial = if offset >= pre_append {
+                    self.jail[pre_append..offset].to_string()
+                } else {
+                    String::new()
+                };
+                return Some((
+                    partial,
+                    StopTrigger::HiddenStopSequenceDetected(seq.to_string()),
+                ));
+            }
+        }
+
+        // Check visible stop sequences (included in output)
+        for seq in &self.visible_stop_sequences {
+            if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes()) {
+                let stop_end = offset + seq.len();
+                let with_stop = if stop_end > pre_append {
+                    self.jail[pre_append..stop_end].to_string()
+                } else {
+                    String::new()
+                };
+                return Some((
+                    with_stop,
+                    StopTrigger::VisibleStopSequenceDetected(seq.to_string()),
+                ));
+            }
+        }
+
+        Self::maybe_drain_to_max_bytes(&mut self.jail, self.jail_max_bytes);
+        None
     }
 
     /// Minimum amount of work to determine if a given generated/decoded sequence should be stopped
@@ -642,58 +724,44 @@ impl Decoder {
             return Ok(StepResult::with_stop_trigger(None, trigger));
         }
 
+        // While the model is still reasoning, stop sequences do not apply; start matching
+        // on the text after the reasoning end marker.
+        if self.in_reasoning
+            && let Some(token) = &token
+        {
+            let tail_start = self.reasoning_tail.len();
+            self.reasoning_tail.push_str(token);
+            let Some(end) = Self::reasoning_end(&self.reasoning_tail) else {
+                let keep = REASONING_END_MARKERS
+                    .iter()
+                    .map(|m| m.len())
+                    .max()
+                    .unwrap_or(0);
+                Self::maybe_drain_to_max_bytes(&mut self.reasoning_tail, keep);
+                return Ok(StepResult::ok(Some(token.clone())));
+            };
+            self.in_reasoning = false;
+            // the answer part of this token (after the marker), if the marker ended in it
+            let answer_start = end.saturating_sub(tail_start).min(token.len());
+            let answer = self.reasoning_tail[end..].to_string();
+            self.reasoning_tail.clear();
+            if !answer.is_empty()
+                && let Some((emitted, trigger)) = self.match_stop_sequences(&answer)
+            {
+                let mut out = token[..answer_start].to_string();
+                out.push_str(&emitted);
+                return Ok(StepResult::with_stop_trigger(Some(out), trigger));
+            }
+            return Ok(StepResult::ok(Some(token.clone())));
+        }
+
         // check stop sequences - the jail will always hold at least the largest stop sequence
         // if jail_max_bytes is 0, then there are no stop sequences
         if self.jail_max_bytes > 0
             && let Some(token) = &token
+            && let Some((emitted, trigger)) = self.match_stop_sequences(token)
         {
-            let pre_append = self.jail.len();
-            self.jail.push_str(token);
-
-            // Check hidden stop sequences first (excluded from output)
-            for seq in &self.hidden_stop_sequences {
-                if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
-                {
-                    // return only new bytes after pre_append .. offset (excluding stop sequence)
-                    // example: seq = "ox", token = "boxes", return "b"
-                    // note: this changes when we start jailing tokens for partial matches
-                    // on the suffix of the jail with prefixes of the stop sequences
-                    //
-                    // we might have returned a partial match, if so, then offset < pre_append
-                    // in that case, we return the empty string
-                    let partial_token = if offset >= pre_append {
-                        self.jail[pre_append..offset].to_string()
-                    } else {
-                        "".to_string()
-                    };
-                    return Ok(StepResult::with_stop_trigger(
-                        Some(partial_token),
-                        StopTrigger::HiddenStopSequenceDetected(seq.to_string()),
-                    ));
-                }
-            }
-
-            // Check visible stop sequences (included in output)
-            for seq in &self.visible_stop_sequences {
-                if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
-                {
-                    // For visible stop sequences, include the stop string in the output
-                    // Return all text from pre_append up to and including the stop sequence
-                    let stop_end = offset + seq.len();
-                    let token_with_stop = if stop_end > pre_append {
-                        self.jail[pre_append..stop_end].to_string()
-                    } else {
-                        // Stop sequence was entirely in previously returned text
-                        "".to_string()
-                    };
-                    return Ok(StepResult::with_stop_trigger(
-                        Some(token_with_stop),
-                        StopTrigger::VisibleStopSequenceDetected(seq.to_string()),
-                    ));
-                }
-            }
-
-            Self::maybe_drain_to_max_bytes(&mut self.jail, self.jail_max_bytes);
+            return Ok(StepResult::with_stop_trigger(Some(emitted), trigger));
         }
 
         Ok(StepResult::ok(token))
@@ -839,6 +907,111 @@ mod tests {
     }
 
     impl traits::Tokenizer for CandidateDecoder {}
+
+    /// Test tokenizer: each id decodes to a fixed piece; a sequence decodes to the concatenation.
+    struct PieceDecoder(&'static [&'static str]);
+
+    impl traits::Encoder for PieceDecoder {
+        fn encode(&self, _input: &str) -> anyhow::Result<crate::tokenizers::Encoding> {
+            Ok(crate::tokenizers::Encoding::Sp(vec![]))
+        }
+        fn encode_batch(
+            &self,
+            _inputs: &[&str],
+        ) -> anyhow::Result<Vec<crate::tokenizers::Encoding>> {
+            Ok(vec![])
+        }
+    }
+
+    impl traits::Decoder for PieceDecoder {
+        fn decode(
+            &self,
+            token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> anyhow::Result<traits::DecodeResult> {
+            Ok(traits::DecodeResult::Complete(
+                token_ids.iter().map(|id| self.0[*id as usize]).collect(),
+            ))
+        }
+    }
+
+    impl traits::Tokenizer for PieceDecoder {}
+
+    /// Run `ids` through a decoder with hidden stop sequence "7"; returns the emitted text
+    /// and whether a stop sequence fired.
+    fn run_stop_7(
+        pieces: &'static [&'static str],
+        ids: &[TokenIdType],
+        in_reasoning: bool,
+    ) -> (String, bool) {
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(PieceDecoder(pieces));
+        let decode_stream = crate::tokenizers::DecodeStream::new(tokenizer, &[], false);
+        let stop_conditions = StopConditions {
+            stop: Some(vec!["7".to_string()]),
+            ..Default::default()
+        };
+        let mut decoder = Decoder::new(decode_stream, stop_conditions, false, None)
+            .with_reasoning_start(in_reasoning);
+        let mut out = String::new();
+        for id in ids {
+            let step = decoder.step(*id).unwrap();
+            if let Some(t) = step.token {
+                out.push_str(&t);
+            }
+            if step.stop_trigger.is_some() {
+                return (out, true);
+            }
+        }
+        (out, false)
+    }
+
+    const K3_PIECES: &[&str] = &[
+        "Count: 1 2 3",                // 0
+        " 4 5 6 7",                    // 1
+        "<|close|>think<|sep|>",       // 2
+        "1 2 3",                       // 3
+        " 6 7 8",                      // 4
+        "<|close|>th",                 // 5
+        "ink<|sep|>6 7",               // 6
+        "x<|close|>think<|sep|>A 7 B", // 7
+    ];
+
+    #[test]
+    fn stop_sequence_does_not_fire_inside_reasoning() {
+        // "7" in the reasoning is ignored; the stop fires in the answer.
+        let (out, stopped) = run_stop_7(K3_PIECES, &[0, 1, 2, 3, 4], true);
+        assert!(stopped);
+        assert_eq!(out, "Count: 1 2 3 4 5 6 7<|close|>think<|sep|>1 2 3 6 ");
+    }
+
+    #[test]
+    fn stop_sequence_fires_in_reasoning_without_the_flag() {
+        // previous behaviour, kept when the prompt did not open a reasoning section
+        let (out, stopped) = run_stop_7(K3_PIECES, &[0, 1, 2, 3, 4], false);
+        assert!(stopped);
+        assert_eq!(out, "Count: 1 2 3 4 5 6 ");
+    }
+
+    #[test]
+    fn reasoning_end_marker_split_across_tokens() {
+        let (out, stopped) = run_stop_7(K3_PIECES, &[0, 5, 6], true);
+        assert!(stopped);
+        assert_eq!(out, "Count: 1 2 3<|close|>think<|sep|>6 ");
+    }
+
+    #[test]
+    fn stop_in_the_same_token_as_the_reasoning_end() {
+        let (out, stopped) = run_stop_7(K3_PIECES, &[7], true);
+        assert!(stopped);
+        assert_eq!(out, "x<|close|>think<|sep|>A ");
+    }
+
+    #[test]
+    fn reasoning_never_ends_no_stop() {
+        let (out, stopped) = run_stop_7(K3_PIECES, &[0, 1], true);
+        assert!(!stopped);
+        assert_eq!(out, "Count: 1 2 3 4 5 6 7");
+    }
 
     struct SyntheticSglangEngine {
         engine_decodes_text: bool,

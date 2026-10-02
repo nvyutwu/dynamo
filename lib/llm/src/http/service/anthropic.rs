@@ -256,12 +256,61 @@ fn validate_anthropic_tools(
     Ok(())
 }
 
+/// Anthropic accepts `{"type":"url","url":"https://..."}` image sources, but the
+/// shared `AnthropicImageSource` type requires `media_type` and `data`. Rewrite
+/// URL sources into that shape (`data` carries the URL) before deserializing,
+/// in message content and inside `tool_result` content.
+fn normalize_url_image_sources(body: &mut serde_json::Value) {
+    fn visit_blocks(blocks: &mut serde_json::Value) {
+        let Some(blocks) = blocks.as_array_mut() else {
+            return;
+        };
+        for block in blocks {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("image") => {
+                    if let Some(source) = block.get_mut("source").and_then(|s| s.as_object_mut())
+                        && source.get("type").and_then(|t| t.as_str()) == Some("url")
+                        && !source.contains_key("data")
+                        && let Some(url) = source.remove("url")
+                    {
+                        source.insert("data".to_string(), url);
+                        source
+                            .entry("media_type")
+                            .or_insert_with(|| serde_json::Value::String(String::new()));
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(content) = block.get_mut("content") {
+                        visit_blocks(content);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                visit_blocks(content);
+            }
+        }
+    }
+}
+
 /// Top-level HTTP handler for POST /v1/messages.
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<AnthropicCreateMessageRequest>,
+    Json(mut raw): Json<serde_json::Value>,
 ) -> Result<Response, Response> {
+    normalize_url_image_sources(&mut raw);
+    let mut request: AnthropicCreateMessageRequest = serde_json::from_value(raw).map_err(|e| {
+        anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("Failed to deserialize the JSON body into the target type: {e}"),
+        )
+    })?;
     let request_id = get_or_create_request_id(&headers);
     let streaming = request.stream;
     let resolved_model = resolve_request_model(&request.model, template.as_ref());
@@ -444,10 +493,10 @@ async fn anthropic_messages(
     let model_for_resp = orig_request.model.clone();
 
     // Anthropic exposes input usage in `message_start`, before the backend's
-    // authoritative count is available. Seed the stream with the same
-    // best-effort estimate as `/count_tokens`; the converter replaces it when
-    // the backend reports final usage.
-    let estimated_input_tokens = if streaming {
+    // authoritative count is available. Below, the converted request is counted
+    // exactly (same render + tokenizer as generation); this estimate is the
+    // fallback. The converter replaces it when the backend reports final usage.
+    let mut estimated_input_tokens = if streaming {
         estimate_input_tokens(&orig_request)
     } else {
         0
@@ -483,6 +532,7 @@ async fn anthropic_messages(
     let anthropic_ctx = unified_request.anthropic_context().cloned();
     let mut chat_request = unified_request.into_inner();
     apply_anthropic_nvext_policy(&mut chat_request, &headers, state.nvext_enabled());
+    request_stop_reason_for_stop_sequences(&mut chat_request);
     if let Err(error) = chat_request.validate() {
         inflight_guard.mark_error(ErrorType::Validation);
         let error = invalid_argument(error.to_string());
@@ -507,6 +557,22 @@ async fn anthropic_messages(
             "invalid_request_error",
             &error.to_string(),
         ));
+    }
+
+    // Exact prompt size for `message_start` (the chat request exactly as it will be
+    // rendered); keeps the estimate when the model has no Rust chat preprocessor.
+    if streaming
+        && let Some((preprocessor, _)) = state.manager().get_chat_preprocessor_with_parsing(&model)
+    {
+        match preprocessor
+            .count_chat_prompt_tokens(chat_request.clone())
+            .await
+        {
+            Ok(tokens) => estimated_input_tokens = tokens,
+            Err(e) => {
+                tracing::debug!(error = %e, "message_start: exact prompt count failed; using the estimate")
+            }
+        }
     }
 
     let request = context.map(|_req| chat_request);
@@ -1147,6 +1213,24 @@ async fn get_model(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// With `stop_sequences`, ask the backend to report which stop string ended generation
+/// (the response `nvext.stop_reason`), so the reply can say `stop_reason: "stop_sequence"`
+/// and name the matched `stop_sequence`. Added after the client-`nvext` gating on purpose:
+/// this is a frontend-internal field request, not a client one.
+fn request_stop_reason_for_stop_sequences(chat_request: &mut NvCreateChatCompletionRequest) {
+    if chat_request.inner.stop.is_none() {
+        return;
+    }
+    let fields = chat_request
+        .nvext
+        .get_or_insert_with(Default::default)
+        .extra_fields
+        .get_or_insert_with(Vec::new);
+    if !fields.iter().any(|f| f == "stop_reason") {
+        fields.push("stop_reason".to_string());
+    }
+}
+
 /// Strip the Claude Code billing preamble from the system prompt.
 ///
 /// Claude Code prepends `x-anthropic-billing-header: cc_version=...; cch=...;\n`
@@ -1434,6 +1518,57 @@ pub(crate) fn unmatched_route_response(method: &Method, uri: &Uri) -> Response {
 mod tests {
     use super::*;
     use crate::protocols::common::extensions::parse_nvext;
+
+    #[test]
+    fn url_image_sources_deserialize_and_convert() {
+        let mut raw = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                    {"type": "text", "text": "describe"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "view", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/b.png"}}
+                    ]}
+                ]}
+            ]
+        });
+        normalize_url_image_sources(&mut raw);
+        assert_eq!(
+            raw["messages"][0]["content"][0]["source"]["data"],
+            "https://example.com/a.png"
+        );
+        assert!(
+            raw["messages"][0]["content"][0]["source"]
+                .get("url")
+                .is_none()
+        );
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(raw).unwrap();
+        let chat = NvCreateChatCompletionRequest::try_from(request).unwrap();
+        let text = serde_json::to_string(&chat.inner.messages).unwrap();
+        assert!(text.contains("https://example.com/a.png"), "{text}");
+        assert!(text.contains("https://example.com/b.png"), "{text}");
+    }
+
+    #[test]
+    fn url_image_source_rejects_non_http_scheme() {
+        let mut raw = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "url", "url": "file:///etc/passwd"}}
+            ]}]
+        });
+        normalize_url_image_sources(&mut raw);
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(raw).unwrap();
+        assert!(NvCreateChatCompletionRequest::try_from(request).is_err());
+    }
 
     fn request_with_nvext() -> AnthropicCreateMessageRequest {
         serde_json::from_value(serde_json::json!({

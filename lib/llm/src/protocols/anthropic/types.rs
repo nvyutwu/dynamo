@@ -316,9 +316,21 @@ fn convert_user_blocks(
 fn convert_image(
     source: &AnthropicImageSource,
 ) -> Result<dynamo_protocols::types::ChatCompletionRequestMessageContentPartImage, anyhow::Error> {
+    if source.source_type == "url" {
+        // The HTTP layer maps `{"type":"url","url":U}` to `data: U`.
+        let url =
+            url::Url::parse(&source.data).map_err(|e| anyhow::anyhow!("invalid image URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            anyhow::bail!("image URL must use http or https, got {:?}", url.scheme());
+        }
+        let image = ChatCompletionRequestMessageContentPartImageArgs::default()
+            .image_url(ImageUrl::from(url.to_string()))
+            .build()?;
+        return Ok(image);
+    }
     if source.source_type != "base64" {
         anyhow::bail!(
-            "unsupported image source type {:?}; only base64 is supported",
+            "unsupported image source type {:?}; only base64 and url are supported",
             source.source_type
         );
     }
@@ -796,6 +808,13 @@ fn ends_on_a_finished_value(trimmed: &str) -> bool {
 }
 
 /// Convert a completed chat completion response into an Anthropic Messages response.
+/// The stop sequence that ended generation, if any: the backend reports a user stop
+/// sequence as a string `stop_reason` in the response `nvext` (requested by the Messages
+/// handler when the request has `stop_sequences`). Token-id stops report a number.
+pub(crate) fn matched_stop_sequence(nvext: Option<&serde_json::Value>) -> Option<String> {
+    nvext?.get("stop_reason")?.as_str().map(str::to_string)
+}
+
 pub fn chat_completion_to_anthropic_response(
     chat_resp: NvCreateChatCompletionResponse,
     model: &str,
@@ -803,6 +822,7 @@ pub fn chat_completion_to_anthropic_response(
 ) -> AnthropicMessageResponse {
     let _ = api_context; // Available for future enrichment (service_tier, etc.)
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+    let matched_stop = matched_stop_sequence(chat_resp.nvext.as_ref());
 
     let choice = chat_resp.inner.choices.into_iter().next();
     let mut content = Vec::new();
@@ -895,6 +915,13 @@ pub fn chat_completion_to_anthropic_response(
         });
     }
 
+    let (stop_reason, stop_sequence) = match (stop_reason, matched_stop) {
+        (Some(AnthropicStopReason::EndTurn), Some(seq)) => {
+            (Some(AnthropicStopReason::StopSequence), Some(seq))
+        }
+        (reason, _) => (reason, None),
+    };
+
     // Keep the cache-creation key present when the backend omits usage entirely.
     let usage = chat_resp
         .inner
@@ -913,7 +940,7 @@ pub fn chat_completion_to_anthropic_response(
         content,
         model: model.to_string(),
         stop_reason,
-        stop_sequence: None,
+        stop_sequence,
         usage,
     }
 }
@@ -1371,6 +1398,66 @@ mod tests {
             }
             _ => panic!("expected text block"),
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_stop_sequence_reported_from_nvext_stop_reason() {
+        let chat_resp = NvCreateChatCompletionResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionResponse {
+                id: "chatcmpl-xyz".into(),
+                choices: vec![dynamo_protocols::types::ChatChoice {
+                    index: 0,
+                    message: dynamo_protocols::types::ChatCompletionResponseMessage {
+                        content: Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                            "1 2 3 4 5 6 ".to_string(),
+                        )),
+                        refusal: None,
+                        tool_calls: None,
+                        role: dynamo_protocols::types::Role::Assistant,
+                        function_call: None,
+                        audio: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(dynamo_protocols::types::FinishReason::Stop),
+                    logprobs: None,
+                }],
+                created: 1726000000,
+                model: "test-model".into(),
+                service_tier: None,
+                system_fingerprint: None,
+                object: "chat.completion".to_string(),
+                usage: Some(dynamo_protocols::types::CompletionUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                }),
+            },
+            nvext: Some(serde_json::json!({"stop_reason": "7"})),
+        };
+
+        let response = chat_completion_to_anthropic_response(chat_resp, "test-model", None);
+        assert_eq!(
+            response.stop_reason,
+            Some(AnthropicStopReason::StopSequence)
+        );
+        assert_eq!(response.stop_sequence.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn test_matched_stop_sequence_only_for_string_stop_reason() {
+        assert_eq!(
+            matched_stop_sequence(Some(&serde_json::json!({"stop_reason": "END"}))).as_deref(),
+            Some("END")
+        );
+        // a stop token id (number) is not a stop sequence
+        assert_eq!(
+            matched_stop_sequence(Some(&serde_json::json!({"stop_reason": 163586}))),
+            None
+        );
+        assert_eq!(matched_stop_sequence(None), None);
     }
 
     #[allow(deprecated)]
