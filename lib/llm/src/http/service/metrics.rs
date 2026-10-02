@@ -2234,6 +2234,9 @@ fn annotated_to_sse_event<T: Serialize>(
 
     if let Some(ref msg) = annotated.event {
         if msg == "error" {
+            if let Some(classified) = super::openai::classify_backend_error_event(&annotated) {
+                return Err(axum::Error::new(classified));
+            }
             let error_message = if let Some(ref dynamo_err) = annotated.error
                 && !dynamo_err.message().is_empty()
             {
@@ -2417,6 +2420,30 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_error_event_becomes_classified_stream_error() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        let event = crate::types::Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"BackendInvalidArgument: {"message":"At most 8 image(s) may be provided in one prompt.","code":400}"#
+                    .to_string(),
+            ]),
+            error: None,
+        };
+        let err = annotated_to_sse_event(event).expect_err("error event");
+        let classified = std::error::Error::source(&err)
+            .and_then(|e| e.downcast_ref::<super::super::openai::ClassifiedBackendError>())
+            .expect("classified backend error");
+        assert_eq!(classified.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            classified.message(),
+            "At most 8 image(s) may be provided in one prompt."
+        );
+    }
 
     fn model_ready_value_with_name(
         registry: &Registry,

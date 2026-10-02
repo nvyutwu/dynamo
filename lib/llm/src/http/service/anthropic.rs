@@ -727,6 +727,7 @@ async fn anthropic_messages(
             }
 
             let mut saw_error = false;
+            let mut stream_error: Option<super::openai::ClassifiedBackendError> = None;
             let mut cancelled = false;
 
             // Keep a single cancellation future alive across chunks — recreating
@@ -753,6 +754,10 @@ async fn anthropic_messages(
                         let Some(stream_resp) = annotated_chunk.data else {
                             if annotated_chunk.event.as_deref() == Some("error") {
                                 saw_error = true;
+                                if stream_error.is_none() {
+                                    stream_error =
+                                        super::openai::classify_backend_error_event(&annotated_chunk);
+                                }
                             }
                             continue;
                         };
@@ -774,7 +779,16 @@ async fn anthropic_messages(
             }
 
             if saw_error {
-                converter.append_error_events(&mut events);
+                match stream_error.as_ref() {
+                    // A backend client error keeps its type and message, as it
+                    // would have before the stream started.
+                    Some(error) => converter.append_error_events_with(
+                        anthropic_error_type_for_status(error.status(), "invalid_request_error"),
+                        error.message(),
+                        &mut events,
+                    ),
+                    None => converter.append_error_events(&mut events),
+                }
             } else {
                 converter.append_end_events(&mut events);
             }
@@ -1483,17 +1497,22 @@ fn find_invalid_argument_in_chain<'a>(
 
 /// Build an Anthropic-formatted error response.
 /// Maps HTTP status codes to Anthropic error types following the Anthropic API spec.
-fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Response {
-    let mapped_type = match status.as_u16() {
+/// Anthropic `error.type` for an HTTP status; `fallback` for codes without a
+/// fixed type (e.g. 500 → "api_error").
+fn anthropic_error_type_for_status(status: StatusCode, fallback: &str) -> &str {
+    match status.as_u16() {
         400 => "invalid_request_error",
         401 => "authentication_error",
         403 => "permission_error",
         404 => "not_found_error",
         429 => "rate_limit_error",
         503 | 529 => "overloaded_error",
-        // Use the caller-provided type for other codes (e.g. 500 → "api_error")
-        _ => error_type,
-    };
+        _ => fallback,
+    }
+}
+
+fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Response {
+    let mapped_type = anthropic_error_type_for_status(status, error_type);
 
     (
         status,

@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 
 use crate::http::service::error::SanitizedError;
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
+use crate::http::service::openai::ClassifiedBackendError;
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
 
@@ -306,7 +307,18 @@ struct StreamMonitorOptions {
     error_signal: Option<StreamErrorSignal>,
 }
 
-fn openai_stream_error(_error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
+/// Formats the terminal SSE error frame. A backend error classified upstream
+/// ([`ClassifiedBackendError`]) keeps its status and, for a client error, its
+/// message, matching what the pre-commit check would have returned; anything
+/// else is reported as a sanitized internal error.
+fn openai_stream_error(error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if let Some(classified) = e.downcast_ref::<ClassifiedBackendError>() {
+            return (classified.error_type(), classified.openai_frame());
+        }
+        current = e.source();
+    }
     let error = SanitizedError::Internal;
     let body = serde_json::json!({
         "error": {
@@ -1158,5 +1170,80 @@ mod tests {
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    fn backend_error_stream(
+        data_chunks: usize,
+        backend_comment: &'static str,
+    ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>> {
+        use crate::types::Annotated;
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        let event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![backend_comment.to_string()]),
+            error: None,
+        };
+        let classified = crate::http::service::openai::classify_backend_error_event(&event)
+            .expect("backend error event is classified");
+        async_stream::try_stream! {
+            for i in 0..data_chunks {
+                yield axum::response::sse::Event::default().data(format!("chunk-{i}"));
+            }
+            Err(axum::Error::new(classified))?;
+        }
+    }
+
+    fn error_frame(body: &str) -> serde_json::Value {
+        body.lines()
+            .find_map(|line| {
+                let v: serde_json::Value =
+                    serde_json::from_str(line.strip_prefix("data: ")?).ok()?;
+                v.get("error").cloned()
+            })
+            .unwrap_or_else(|| panic!("no error frame in body:\n{body}"))
+    }
+
+    /// A backend client error (vLLM rejecting too many images) that arrives
+    /// after the stream committed keeps its message and 400, as it would have
+    /// before the commit.
+    #[tokio::test]
+    async fn test_mid_stream_backend_client_error_keeps_status_and_message() {
+        let (_metrics, guard, ctx, handle) = setup_test("model", "req-4xx");
+        let stream = backend_error_stream(
+            2,
+            r#"BackendInvalidArgument: {"message":"At most 8 image(s) may be provided in one prompt.","code":400}"#,
+        );
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        let error = error_frame(&body);
+        assert_eq!(
+            error["message"],
+            "At most 8 image(s) may be provided in one prompt."
+        );
+        assert_eq!(error["type"], "invalid_request_error");
+        assert_eq!(error["code"], 400);
+        assert!(body.find("chunk-1").unwrap() < body.find("At most 8").unwrap());
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+    }
+
+    /// Backend 5xx errors are not carried as client errors; they stay on the
+    /// sanitized path (covered by `test_mid_stream_error_does_not_leak_internal_details`).
+    #[test]
+    fn test_backend_server_error_is_not_classified_as_client_error() {
+        use crate::types::Annotated;
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        let event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"{"message":"panicked at /opt/dynamo/worker.py:512 secret tensor","code":500}"#
+                    .to_string(),
+            ]),
+            error: None,
+        };
+        assert!(crate::http::service::openai::classify_backend_error_event(&event).is_none());
     }
 }
