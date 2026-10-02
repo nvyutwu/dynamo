@@ -25,6 +25,13 @@
 //! instance parameters defaulting to that router's values, so an instance with no `parameters`
 //! mapping reproduces it exactly.
 //!
+//! `ratio_denominator` chooses what the cache tier divides the overlap by. `blocks_ceil` (the
+//! default) is the request's block count rounded up: a 12,289-token prompt counts as two
+//! 12,288-token blocks, so a sub-block credit is halved against it and a 3–5k-token opening can
+//! never clear the threshold on a two-block prompt. `tokens` divides by the exact prompt length in
+//! blocks, so the ratio is the share of prompt tokens the best worker can reuse, independent of
+//! where the prompt ends on the block grid. The two agree on block-aligned prompts.
+//!
 //! `host_cache_weight` defaults to [`KvRouterConfig::host_cache_hit_weight`], which
 //! `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` sets (0.75 by default) and which Dynamo's built-in selector
 //! already applies to the same quantity — so the two tiers agree on what a CPU hit is worth unless
@@ -56,6 +63,27 @@ const DEFAULT_CACHE_THRESHOLD: f64 = 0.5;
 const DEFAULT_BALANCE_ABS_THRESHOLD: usize = 32;
 const DEFAULT_BALANCE_REL_THRESHOLD: f64 = 1.1;
 
+/// What the cache ratio divides the best worker's effective overlap by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RatioDenominator {
+    /// `isl_tokens.div_ceil(block_size)`: whole blocks, rounded up. The behaviour this policy
+    /// shipped with; a partial trailing block counts as a full one.
+    BlocksCeil,
+    /// `isl_tokens / block_size` as a fraction: the ratio becomes the share of prompt tokens the
+    /// overlap covers, so a token-precise sub-block credit is not diluted by the rounding.
+    Tokens,
+}
+
+impl RatioDenominator {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BlocksCeil => "blocks_ceil",
+            Self::Tokens => "tokens",
+        }
+    }
+}
+
 /// Tunables for [`POLICY_TYPE`], named after their `sgl-router` counterparts.
 ///
 /// Every field is optional and keeps the upstream default when omitted. Unknown keys are rejected
@@ -76,6 +104,8 @@ struct Parameters {
     /// `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` is set to. Set explicitly only when this policy must
     /// value CPU residency differently from the built-in selector.
     host_cache_weight: Option<f64>,
+    /// Denominator of the cache ratio: `blocks_ceil` (default) or `tokens`. See the module docs.
+    ratio_denominator: RatioDenominator,
 }
 
 impl Default for Parameters {
@@ -85,6 +115,7 @@ impl Default for Parameters {
             balance_abs_threshold: DEFAULT_BALANCE_ABS_THRESHOLD,
             balance_rel_threshold: DEFAULT_BALANCE_REL_THRESHOLD,
             host_cache_weight: None,
+            ratio_denominator: RatioDenominator::BlocksCeil,
         }
     }
 }
@@ -135,6 +166,32 @@ fn parse_cache_threshold_override(
     })
 }
 
+/// Environment variable that overrides the policy file's `ratio_denominator`
+/// (`blocks_ceil` or `tokens`). Same role as [`CACHE_THRESHOLD_ENV`]: an A/B knob on a baked
+/// policy file.
+pub const RATIO_DENOMINATOR_ENV: &str = "DYN_ROUTER_TWO_TIER_RATIO_DENOMINATOR";
+
+fn ratio_denominator_override()
+-> Result<Option<RatioDenominator>, WorkerSelectionPolicyProviderError> {
+    let raw = std::env::var_os(RATIO_DENOMINATOR_ENV).map(|v| v.to_string_lossy().into_owned());
+    parse_ratio_denominator_override(raw.as_deref())
+}
+
+fn parse_ratio_denominator_override(
+    raw: Option<&str>,
+) -> Result<Option<RatioDenominator>, WorkerSelectionPolicyProviderError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "blocks_ceil" => Ok(Some(RatioDenominator::BlocksCeil)),
+        "tokens" => Ok(Some(RatioDenominator::Tokens)),
+        _ => Err(WorkerSelectionPolicyProviderError::new(format!(
+            "{RATIO_DENOMINATOR_ENV} must be `blocks_ceil` or `tokens`, got {raw:?}"
+        ))),
+    }
+}
+
 fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> Option<usize> {
     rows.min_by_key(|&row| load[row].active_requests())
 }
@@ -145,6 +202,16 @@ fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> 
 /// rather than max. A weight of 0.0 reproduces the device-only ranking this policy shipped with.
 fn effective_overlap(cache: &WorkerCacheInput, host_cache_weight: f64) -> f64 {
     cache.device_overlap_blocks() + host_cache_weight * cache.host_overlap_blocks()
+}
+
+/// The cache ratio's denominator for this request, in blocks, per `ratio_denominator`.
+fn request_blocks_for(parameters: &Parameters, context: &WorkerSelectionContext<'_>) -> f64 {
+    match parameters.ratio_denominator {
+        RatioDenominator::BlocksCeil => context.request_blocks() as f64,
+        RatioDenominator::Tokens => {
+            context.request_tokens() as f64 / f64::from(context.block_size().max(1))
+        }
+    }
 }
 
 /// Branch names reported in the routing-decision trace. Stable strings; dashboards key on them.
@@ -160,6 +227,8 @@ struct Decision {
     max_overlap_row: usize,
     max_overlap: f64,
     cache_ratio: f64,
+    /// Denominator of `cache_ratio`, in blocks, as selected by `ratio_denominator`.
+    request_blocks: f64,
     min_load: usize,
     max_load: usize,
     /// Two-tier effective overlap per input row, in blocks.
@@ -170,7 +239,7 @@ fn decide(
     parameters: &Parameters,
     cache: &[WorkerCacheInput],
     load: &[WorkerLoadInput],
-    request_blocks: u64,
+    request_blocks: f64,
     host_cache_weight: f64,
 ) -> Option<Decision> {
     if cache.is_empty() || cache.len() != load.len() {
@@ -184,10 +253,10 @@ fn decide(
     let max_overlap_row =
         (0..row_overlap.len()).max_by(|a, b| row_overlap[*a].total_cmp(&row_overlap[*b]))?;
     let max_overlap = row_overlap[max_overlap_row];
-    let cache_ratio = if request_blocks == 0 {
+    let cache_ratio = if request_blocks <= 0.0 {
         0.0
     } else {
-        max_overlap / request_blocks as f64
+        max_overlap / request_blocks
     };
     let min_load = load.iter().map(|item| item.active_requests()).min()?;
     let max_load = load.iter().map(|item| item.active_requests()).max()?;
@@ -197,6 +266,7 @@ fn decide(
         max_overlap_row,
         max_overlap,
         cache_ratio,
+        request_blocks,
         min_load,
         max_load,
         row_overlap: row_overlap.clone(),
@@ -224,7 +294,7 @@ fn select_row(
     parameters: &Parameters,
     cache: &[WorkerCacheInput],
     load: &[WorkerLoadInput],
-    request_blocks: u64,
+    request_blocks: f64,
     host_cache_weight: f64,
 ) -> Option<usize> {
     decide(parameters, cache, load, request_blocks, host_cache_weight).map(|d| d.row)
@@ -257,7 +327,7 @@ impl WorkerPicker for TwoTierCostFnPicker {
             &self.parameters,
             cache,
             load,
-            context.request_blocks(),
+            request_blocks_for(&self.parameters, context),
             self.host_cache_weight,
         )
         .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
@@ -275,7 +345,7 @@ impl WorkerPicker for TwoTierCostFnPicker {
             &self.parameters,
             input.cache()?,
             input.load()?,
-            context.request_blocks(),
+            request_blocks_for(&self.parameters, context),
             self.host_cache_weight,
         )?;
         // `pick` and `explain_pick` see the same input, so the branch must agree with the row
@@ -302,6 +372,14 @@ impl WorkerPicker for TwoTierCostFnPicker {
                 ),
                 ("host_cache_weight".into(), self.host_cache_weight),
                 ("cache_ratio".into(), decision.cache_ratio),
+                ("request_blocks_denominator".into(), decision.request_blocks),
+                (
+                    "ratio_denominator_tokens".into(),
+                    match self.parameters.ratio_denominator {
+                        RatioDenominator::BlocksCeil => 0.0,
+                        RatioDenominator::Tokens => 1.0,
+                    },
+                ),
                 ("max_effective_overlap_blocks".into(), decision.max_overlap),
                 ("min_active_requests".into(), decision.min_load as f64),
                 ("max_active_requests".into(), decision.max_load as f64),
@@ -322,6 +400,9 @@ fn provider(
     if let Some(value) = cache_threshold_override()? {
         parameters.cache_threshold = value;
     }
+    if let Some(value) = ratio_denominator_override()? {
+        parameters.ratio_denominator = value;
+    }
     parameters.validate()?;
 
     // Announce the RESOLVED parameters, not the file contents: every field is optional and
@@ -340,6 +421,7 @@ fn provider(
         balance_abs_threshold = parameters.balance_abs_threshold,
         balance_rel_threshold = parameters.balance_rel_threshold,
         host_cache_weight = ?parameters.host_cache_weight,
+        ratio_denominator = parameters.ratio_denominator.as_str(),
         "Two-tier worker-selection policy enabled"
     );
 
@@ -445,10 +527,19 @@ mod tests {
         parameters: Parameters,
         workers: [(u64, usize, usize, usize); 2],
     ) -> WorkerWithDpRank {
+        select_tiers_isl(parameters, TEN_BLOCKS, workers)
+    }
+
+    /// Like `select_tiers`, with an explicit prompt length in tokens.
+    fn select_tiers_isl(
+        parameters: Parameters,
+        isl_tokens: usize,
+        workers: [(u64, usize, usize, usize); 2],
+    ) -> WorkerWithDpRank {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
             token_seq: None,
-            isl_tokens: TEN_BLOCKS,
+            isl_tokens,
             lora_name: None,
             expected_output_tokens: None,
             affinity_target: None,
@@ -642,5 +733,99 @@ mod tests {
         // straddles the ratio boundary: 705 would clear it and take the load tier.
         assert_eq!(select([(A, 0, 640), (B, 10, 704)]), worker(B));
         assert_eq!(select([(A, 0, 640), (B, 10, 705)]), worker(A));
+    }
+
+    #[test]
+    fn blocks_ceil_is_the_default_denominator() {
+        assert_eq!(
+            Parameters::default().ratio_denominator,
+            RatioDenominator::BlocksCeil
+        );
+    }
+
+    #[test]
+    fn tokens_denominator_does_not_round_a_partial_block_against_the_credit() {
+        // One block held in CPU (weight 1.0) for a prompt of one block plus one token. Rounded up,
+        // the prompt is two blocks and the ratio is exactly 0.5, which the strict comparison
+        // rejects, so load decides and the idle worker A takes it. Divided by the exact length
+        // (17/16 blocks) the ratio is 0.94 and B's credit wins. This is the K3 case: a 4,096-token
+        // opening credited on the CPU tier against a 13k prompt is 0.17 of two rounded blocks but
+        // 0.32 of the 1.06 blocks the prompt actually is.
+        let one_block_plus_one = BLOCK_SIZE as usize + 1;
+        let weight_one = Parameters {
+            host_cache_weight: Some(1.0),
+            ..Parameters::default()
+        };
+        assert_eq!(
+            select_tiers_isl(weight_one, one_block_plus_one, [(A, 0, 0, 0), (B, 0, 1, 4)]),
+            worker(A)
+        );
+        let tokens = Parameters {
+            ratio_denominator: RatioDenominator::Tokens,
+            ..weight_one
+        };
+        assert_eq!(
+            select_tiers_isl(tokens, one_block_plus_one, [(A, 0, 0, 0), (B, 0, 1, 4)]),
+            worker(B)
+        );
+    }
+
+    #[test]
+    fn denominators_agree_on_block_aligned_prompts() {
+        // Ten exact blocks: both denominators are 10.0, so every existing decision is unchanged.
+        let tokens = Parameters {
+            ratio_denominator: RatioDenominator::Tokens,
+            ..Parameters::default()
+        };
+        for workers in [[(A, 0, 0), (B, 6, 4)], [(A, 0, 0), (B, 5, 4)], [(A, 0, 0), (B, 3, 4)]] {
+            assert_eq!(select(workers), select_with(tokens, workers));
+        }
+    }
+
+    #[test]
+    fn tokens_denominator_shares_the_strict_threshold() {
+        // Three device blocks of a ten-block prompt is 0.3 under both denominators; at a 0.3
+        // threshold the strict comparison fails either way, and 0.29 admits it either way.
+        let workers = [(A, 0, 0), (B, 3, 4)];
+        for denominator in [RatioDenominator::BlocksCeil, RatioDenominator::Tokens] {
+            let at = Parameters {
+                cache_threshold: 0.3,
+                ratio_denominator: denominator,
+                ..Parameters::default()
+            };
+            assert_eq!(select_with(at, workers), worker(A));
+            let below = Parameters {
+                cache_threshold: 0.29,
+                ..at
+            };
+            assert_eq!(select_with(below, workers), worker(B));
+        }
+    }
+
+    #[test]
+    fn ratio_denominator_env_override_parses_or_fails_loudly() {
+        assert_eq!(parse_ratio_denominator_override(None).unwrap(), None);
+        assert_eq!(parse_ratio_denominator_override(Some("")).unwrap(), None);
+        assert_eq!(
+            parse_ratio_denominator_override(Some(" tokens ")).unwrap(),
+            Some(RatioDenominator::Tokens)
+        );
+        assert_eq!(
+            parse_ratio_denominator_override(Some("BLOCKS_CEIL")).unwrap(),
+            Some(RatioDenominator::BlocksCeil)
+        );
+        assert!(parse_ratio_denominator_override(Some("blocks")).is_err());
+    }
+
+    #[test]
+    fn ratio_denominator_parses_from_policy_parameters() {
+        // The host hands the YAML `parameters` mapping to the plugin as a generic value, so
+        // JSON exercises the same serde path (snake_case variant names, unknown names rejected).
+        let parsed: Parameters =
+            serde_json::from_str(r#"{"ratio_denominator": "tokens", "cache_threshold": 0.3}"#)
+                .unwrap();
+        assert_eq!(parsed.ratio_denominator, RatioDenominator::Tokens);
+        assert_eq!(parsed.cache_threshold, 0.3);
+        assert!(serde_json::from_str::<Parameters>(r#"{"ratio_denominator": "blocks"}"#).is_err());
     }
 }

@@ -202,6 +202,12 @@ impl WorkerSelectionContext<'_> {
         self.block_size
     }
 
+    /// Return the incoming prompt size in tokens: the un-rounded quantity behind
+    /// [`Self::request_blocks`], for policies that must not round a prompt up to whole blocks.
+    pub fn request_tokens(&self) -> usize {
+        self.request.isl_tokens
+    }
+
     /// Return whether this request contributes to prefill-load tracking.
     pub fn tracks_prefill_tokens(&self) -> bool {
         self.track_prefill_tokens
