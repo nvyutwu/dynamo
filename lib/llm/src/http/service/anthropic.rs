@@ -700,7 +700,7 @@ async fn anthropic_messages(
             inflight_guard.mark_error(super::openai::extract_error_type_from_response(
                 &error_response,
             ));
-            anthropic_backend_error(error_response.0)
+            anthropic_backend_error(error_response)
         })?;
 
         stream_handle.arm();
@@ -812,7 +812,7 @@ async fn anthropic_messages(
         let check = BackendErrorCheck::UntilFirstEvent;
         let stream_with_check = super::openai::check_for_backend_error(engine_stream, check)
             .await
-            .map_err(|(status, _json_err)| anthropic_backend_error(status))?;
+            .map_err(anthropic_backend_error)?;
 
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream_with_check.inspect(move |response| {
@@ -1396,12 +1396,15 @@ fn apply_anthropic_reasoning_controls(
 /// Re-wrap a backend-error status from
 /// [`super::openai::check_for_backend_error`] in Anthropic's error format.
 ///
-/// The helper has already sanitized the body and logged the backend detail, so
-/// only the status carries over. Classification is delegated to
+/// The helper has already sanitized the body and logged the backend detail.
+/// 5xx and classified errors carry over by status only; a forwarded 4xx keeps
+/// the helper's message, matching the OpenAI surfaces (for example an image
+/// that fails to decode reports why). Classification is delegated to
 /// [`SanitizedError::for_backend_status`] so the OpenAI and Anthropic surfaces
 /// answer the same backend failure the same way, whether the request streams or
 /// not.
-fn anthropic_backend_error(status: StatusCode) -> Response {
+fn anthropic_backend_error(error_response: super::openai::ErrorResponse) -> Response {
+    let (status, Json(error)) = error_response;
     // Fork adaptation of upstream 90c8842ceb: this fork predates upstream's
     // `AnthropicHandlerError` (4dd64df9ee), so build the response directly with
     // the same helpers the non-streaming path already used. Callers mark the
@@ -1409,18 +1412,19 @@ fn anthropic_backend_error(status: StatusCode) -> Response {
     let details = format!("backend error event (status {})", status.as_u16());
     match SanitizedError::for_backend_status(status) {
         Some(variant) => anthropic_sanitized_error_with_details(variant, details),
-        // 4xx (non-499): preserve the client-error status; the message is the
-        // canonical reason so we don't smuggle backend text through. The
+        // 4xx (non-499): preserve the client-error status and the message
+        // `check_for_backend_error` forwards for it. The
         // "invalid_request_error" argument is a fallback — anthropic_error
         // remaps 401/403/404/429 to their spec-correct types from the status
         // code itself.
         None => {
             tracing::error!(%status, "Anthropic backend error event");
-            anthropic_error(
-                status,
-                "invalid_request_error",
-                status.canonical_reason().unwrap_or("Client error"),
-            )
+            let message = if error.message().is_empty() {
+                status.canonical_reason().unwrap_or("Client error")
+            } else {
+                error.message()
+            };
+            anthropic_error(status, "invalid_request_error", message)
         }
     }
 }
