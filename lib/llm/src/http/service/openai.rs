@@ -2751,6 +2751,75 @@ pub(super) fn log_pre_commit_error(request_id: &str, error_response: &ErrorRespo
 /// from the status: the status alone cannot distinguish a capacity rejection
 /// from an outage once `DYN_HTTP_OVERLOAD_STATUS_CODE` is set outside the 5xx
 /// range.
+/// A backend client error (4xx) that arrived after the HTTP status was
+/// committed, classified exactly like the pre-commit check
+/// ([`backend_error_response`]).
+///
+/// Streaming handlers carry it to the in-stream error frame so the client gets
+/// the backend's message and status (e.g. vLLM's 400 "At most 8 image(s) may be
+/// provided in one prompt") instead of a generic 500. Only errors the pre-commit
+/// check would forward are carried; everything else stays on the sanitized path.
+#[derive(Debug)]
+pub(crate) struct ClassifiedBackendError(ErrorResponse);
+
+impl ClassifiedBackendError {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.0.0
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        self.0.1.message()
+    }
+
+    pub(crate) fn error_type(&self) -> ErrorType {
+        extract_error_type_from_response(&self.0)
+    }
+
+    /// The OpenAI streaming error frame: `{"error": {message, type, param, code}}`.
+    pub(crate) fn openai_frame(&self) -> String {
+        let code = self.status().as_u16();
+        serde_json::json!({
+            "error": {
+                "message": self.message(),
+                "type": openai_error_object_type(code),
+                "param": serde_json::Value::Null,
+                "code": code,
+            }
+        })
+        .to_string()
+    }
+}
+
+impl std::fmt::Display for ClassifiedBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend error (status {}): {}",
+            self.status().as_u16(),
+            self.message()
+        )
+    }
+}
+
+impl std::error::Error for ClassifiedBackendError {}
+
+/// Classify a backend `event: "error"` frame for an already-committed stream.
+/// Returns `Some` only for a client error the pre-commit check forwards as is.
+pub(crate) fn classify_backend_error_event<T: serde::Serialize>(
+    event: &Annotated<T>,
+) -> Option<ClassifiedBackendError> {
+    let info = extract_backend_error_if_present(event)?;
+    if info.sanitized.is_some()
+        || !matches!(
+            BackendStatusAction::triage(info.status),
+            BackendStatusAction::ForwardClientError
+        )
+    {
+        return None;
+    }
+    Some(ClassifiedBackendError(backend_error_response(info)))
+}
+
 fn backend_error_response(backend_error: BackendErrorInfo) -> ErrorResponse {
     let BackendErrorInfo {
         message,

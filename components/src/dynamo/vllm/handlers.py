@@ -3520,7 +3520,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         routing = request.get("routing") or {}
         if self._first_token_source is not None:
             self._first_token_source.bind(context, routing.get("dp_rank"))
-        self._multimodal_request_processor.validate_multimodal_request(request)
+        try:
+            self._multimodal_request_processor.validate_multimodal_request(request)
+        except ValueError as exc:
+            # Images sent to a worker without --enable-multimodal: the request
+            # is at fault, so answer 400 rather than a generic server error.
+            raise InvalidArgument(str(exc)) from exc
         first_token = True
         first_token_output_seen = False
         with time_and_log_code_section(
@@ -4425,7 +4430,9 @@ class EmbeddingWorkerHandler:
                 if tokenization_kwargs and isinstance(encode_arg, str):
                     encode_kwargs["tokenization_kwargs"] = tokenization_kwargs
 
-                async for out in self.engine_client.encode(**encode_kwargs):
+                async for out in _translate_vllm_client_errors(
+                    self.engine_client.encode(**encode_kwargs)
+                ):
                     final_output = out
             if final_output is None:
                 raise RuntimeError(

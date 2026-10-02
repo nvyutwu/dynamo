@@ -648,10 +648,25 @@ impl AnthropicStreamConverter {
 
     /// Append error events when the stream ends due to a backend error.
     pub fn append_error_events(&mut self, events: &mut Vec<Result<Event, anyhow::Error>>) {
+        self.append_error_events_with(
+            "api_error",
+            "An internal error occurred during generation.",
+            events,
+        );
+    }
+
+    /// Emit the terminal `error` event with a caller-classified type and message
+    /// (e.g. a backend client error that arrived after the stream started).
+    pub fn append_error_events_with(
+        &mut self,
+        error_type: &str,
+        message: &str,
+        events: &mut Vec<Result<Event, anyhow::Error>>,
+    ) {
         let error_event = AnthropicStreamEvent::Error {
             error: AnthropicErrorBody {
-                error_type: "api_error".to_string(),
-                message: "An internal error occurred during generation.".to_string(),
+                error_type: error_type.to_string(),
+                message: message.to_string(),
             },
         };
         events.push(make_sse_event("error", &error_event));
@@ -1078,6 +1093,20 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events.capacity(), capacity);
         assert!(events.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn test_classified_error_event_keeps_type_and_message() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut events = Vec::new();
+        conv.append_error_events_with(
+            "invalid_request_error",
+            "At most 8 image(s) may be provided in one prompt.",
+            &mut events,
+        );
+        let event = format!("{:?}", events.pop().unwrap().unwrap());
+        assert!(event.contains("invalid_request_error"), "{event}");
+        assert!(event.contains("At most 8 image(s)"), "{event}");
     }
 
     /// A chunk carrying engine usage (typically the final chunk).
