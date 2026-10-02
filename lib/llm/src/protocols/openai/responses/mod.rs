@@ -99,6 +99,7 @@ impl TryFrom<serde_json::Value> for NvCreateResponse {
     /// `reasoning.effort` on the response is then null.
     fn try_from(mut value: serde_json::Value) -> Result<Self, Self::Error> {
         let extended_effort = take_extended_reasoning_effort(&mut value);
+        let chat_extras = take_chat_only_fields(&mut value)?;
         let fields: NvCreateResponseFields = serde_json::from_value(value)?;
         let mut chat_template_args = fields.chat_template_args;
         if let Some(effort) = extended_effort {
@@ -109,10 +110,145 @@ impl TryFrom<serde_json::Value> for NvCreateResponse {
                     serde_json::Value::String(effort),
                 );
         }
+        if let Some(extras) = chat_extras {
+            chat_template_args
+                .get_or_insert_with(Default::default)
+                .insert(RESPONSES_CHAT_EXTRAS_KEY.to_string(), extras);
+        }
         Ok(Self {
             inner: fields.inner,
             nvext: fields.nvext,
             chat_template_args,
+        })
+    }
+}
+
+/// Reserved `chat_template_args` key that carries Chat-only request fields lifted off a raw
+/// Responses request by [`take_chat_only_fields`]. The Responses -> Chat conversion removes it
+/// again, so it never reaches the chat template; a client-supplied value is discarded.
+const RESPONSES_CHAT_EXTRAS_KEY: &str = "__dynamo_responses_chat_extras";
+
+/// Lift Chat-only fields that `CreateResponse` has no slot for off the raw request, so they
+/// are applied (and validated) like on Chat Completions instead of being silently dropped:
+///
+/// - `presence_penalty` / `frequency_penalty`: carried to the chat request, where the same
+///   validation applies (e.g. Kimi K3 immutable parameters reject non-default values).
+/// - `n`: the Responses API returns one output, so `n` other than 1 is rejected.
+/// - Kimi-style message-level `tools` on `system` / `developer` input items: carried to the
+///   matching chat system message (Chat's dynamic-tool path). On any other role they are
+///   rejected, as on Chat. A tools-only message may omit `content`.
+fn take_chat_only_fields(
+    value: &mut serde_json::Value,
+) -> Result<Option<serde_json::Value>, serde_json::Error> {
+    use serde::de::Error as _;
+
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    for key in ["chat_template_args", "chat_template_kwargs"] {
+        if let Some(args) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+            args.remove(RESPONSES_CHAT_EXTRAS_KEY);
+        }
+    }
+    let mut extras = serde_json::Map::new();
+    if let Some(n) = obj.remove("n")
+        && !(n.is_null() || n.as_u64() == Some(1))
+    {
+        return Err(serde_json::Error::custom(format!(
+            "`n` is not supported on the Responses API, which returns one output (got {n})"
+        )));
+    }
+    for key in ["presence_penalty", "frequency_penalty"] {
+        if let Some(v) = obj.remove(key)
+            && !v.is_null()
+        {
+            extras.insert(key.to_string(), v);
+        }
+    }
+    if let Some(items) = obj.get_mut("input").and_then(|v| v.as_array_mut()) {
+        let mut message_tools = Vec::new();
+        for (index, item) in items.iter_mut().enumerate() {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            let Some(tools) = item.remove("tools") else {
+                continue;
+            };
+            let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if !matches!(role, "system" | "developer") {
+                return Err(serde_json::Error::custom(format!(
+                    "input[{index}]: message-level `tools` are only allowed on system or \
+                     developer messages (got role {role:?})"
+                )));
+            }
+            item.entry("content")
+                .or_insert_with(|| serde_json::Value::String(String::new()));
+            message_tools.push(serde_json::json!([index, tools]));
+        }
+        if !message_tools.is_empty() {
+            extras.insert(
+                "message_tools".to_string(),
+                serde_json::Value::Array(message_tools),
+            );
+        }
+    }
+    Ok((!extras.is_empty()).then_some(serde_json::Value::Object(extras)))
+}
+
+/// Chat-only fields recovered from [`RESPONSES_CHAT_EXTRAS_KEY`] during conversion.
+#[derive(Default)]
+struct ResponsesChatExtras {
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    /// Input item index -> Kimi-style tools declared on that system/developer message.
+    message_tools: HashMap<usize, Vec<serde_json::Value>>,
+}
+
+impl ResponsesChatExtras {
+    fn take(
+        chat_template_args: &mut Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<Self, anyhow::Error> {
+        let Some(args) = chat_template_args.as_mut() else {
+            return Ok(Self::default());
+        };
+        let Some(raw) = args.remove(RESPONSES_CHAT_EXTRAS_KEY) else {
+            return Ok(Self::default());
+        };
+        if args.is_empty() {
+            *chat_template_args = None;
+        }
+        let penalty = |key: &str| -> Result<Option<f32>, anyhow::Error> {
+            match raw.get(key) {
+                None => Ok(None),
+                Some(v) => v.as_f64().map(|f| Some(f as f32)).ok_or_else(|| {
+                    ResponsesConversionError::InvalidArgument(format!("`{key}` must be a number"))
+                        .into()
+                }),
+            }
+        };
+        let mut message_tools = HashMap::new();
+        for entry in raw
+            .get("message_tools")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let (Some(index), Some(tools)) = (entry.get(0).and_then(|v| v.as_u64()), entry.get(1))
+            else {
+                continue;
+            };
+            let Some(tools) = tools.as_array() else {
+                return Err(ResponsesConversionError::InvalidArgument(format!(
+                    "input[{index}].tools must be an array"
+                ))
+                .into());
+            };
+            message_tools.insert(index as usize, tools.clone());
+        }
+        Ok(Self {
+            presence_penalty: penalty("presence_penalty")?,
+            frequency_penalty: penalty("frequency_penalty")?,
+            message_tools,
         })
     }
 }
@@ -577,11 +713,12 @@ impl PendingAssistant {
 /// Convert InputParam::Items to a Vec of ChatCompletionRequestMessages.
 fn convert_input_items_to_messages(
     items: &[InputItem],
+    message_tools: &HashMap<usize, Vec<serde_json::Value>>,
 ) -> Result<Vec<ChatCompletionRequestMessage>, anyhow::Error> {
     let mut messages = Vec::with_capacity(items.len());
     let mut pending = PendingAssistant::default();
 
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         match item {
             InputItem::Item(inner_item) => match inner_item {
                 Item::Message(msg_item) => match msg_item {
@@ -596,7 +733,7 @@ fn convert_input_items_to_messages(
                                             text,
                                         ),
                                         name: None,
-                                        tools: None,
+                                        tools: message_tools.get(&index).cloned(),
                                     },
                                 )
                             }
@@ -712,7 +849,7 @@ fn convert_input_items_to_messages(
                             ChatCompletionRequestSystemMessage {
                                 content: ChatCompletionRequestSystemMessageContent::Text(text),
                                 name: None,
-                                tools: None,
+                                tools: message_tools.get(&index).cloned(),
                             },
                         ));
                     }
@@ -928,7 +1065,8 @@ fn convert_service_tier(tier: &ServiceTier) -> ChatServiceTier {
 impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
     type Error = anyhow::Error;
 
-    fn try_from(resp: NvCreateResponse) -> Result<Self, Self::Error> {
+    fn try_from(mut resp: NvCreateResponse) -> Result<Self, Self::Error> {
+        let extras = ResponsesChatExtras::take(&mut resp.chat_template_args)?;
         let mut messages = Vec::new();
 
         // Prepend instructions as system message if present
@@ -953,7 +1091,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 ));
             }
             InputParam::Items(items) => {
-                let item_messages = convert_input_items_to_messages(items)?;
+                let item_messages = convert_input_items_to_messages(items, &extras.message_tools)?;
                 messages.extend(item_messages);
             }
         }
@@ -970,7 +1108,12 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 .iter()
                 .take_while(|m| matches!(m, ChatCompletionRequestMessage::System(_)))
                 .count();
-            if leading_system_count > 1 {
+            // Kimi-style tools-only system messages must stay separate (their renderer
+            // requires `content` and `tools` to be exclusive), so never merge those.
+            let any_tools = messages[..leading_system_count]
+                .iter()
+                .any(|m| matches!(m, ChatCompletionRequestMessage::System(s) if s.tools.is_some()));
+            if leading_system_count > 1 && !any_tools {
                 let combined: String = messages[..leading_system_count]
                     .iter()
                     .map(|m| match m {
@@ -1048,6 +1191,8 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 model: resp.inner.model.unwrap_or_default(),
                 temperature: resp.inner.temperature,
                 top_p: resp.inner.top_p,
+                presence_penalty: extras.presence_penalty,
+                frequency_penalty: extras.frequency_penalty,
                 max_completion_tokens: resp.inner.max_output_tokens,
                 store: resp.inner.store,
                 parallel_tool_calls: resp.inner.parallel_tool_calls,
@@ -2112,6 +2257,86 @@ mod tests {
             image.image_url.as_ref().unwrap().url.as_str(),
             "data:image/png;base64,aGVsbG8="
         );
+    }
+
+    fn chat_from_raw(raw: serde_json::Value) -> Result<NvCreateChatCompletionRequest, String> {
+        let resp = NvCreateResponse::try_from(raw).map_err(|e| e.to_string())?;
+        NvCreateChatCompletionRequest::try_from(resp).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_penalties_are_carried_to_chat() {
+        let chat = chat_from_raw(serde_json::json!({
+            "model": "m", "input": "hi", "presence_penalty": 0.5, "frequency_penalty": 0.25
+        }))
+        .unwrap();
+        assert_eq!(chat.inner.presence_penalty, Some(0.5));
+        assert_eq!(chat.inner.frequency_penalty, Some(0.25));
+        assert!(
+            chat.chat_template_args.is_none(),
+            "internal key must not leak"
+        );
+    }
+
+    #[test]
+    fn test_n_other_than_one_is_rejected() {
+        let err =
+            chat_from_raw(serde_json::json!({"model": "m", "input": "hi", "n": 2})).unwrap_err();
+        assert!(
+            err.contains("`n` is not supported on the Responses API"),
+            "{err}"
+        );
+        chat_from_raw(serde_json::json!({"model": "m", "input": "hi", "n": 1})).unwrap();
+    }
+
+    #[test]
+    fn test_message_level_tools_reach_the_system_message() {
+        let tool = serde_json::json!({"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}});
+        let chat = chat_from_raw(serde_json::json!({
+            "model": "m",
+            "instructions": "Be brief.",
+            "input": [
+                {"role": "system", "tools": [tool.clone()]},
+                {"role": "user", "content": "Weather in Paris?"}
+            ]
+        }))
+        .unwrap();
+        let msgs = &chat.inner.messages;
+        // instructions + tools-only system message stay separate (not merged)
+        assert_eq!(msgs.len(), 3);
+        let ChatCompletionRequestMessage::System(sys) = &msgs[1] else {
+            panic!("expected system message");
+        };
+        assert_eq!(sys.tools.as_deref(), Some(&[tool][..]));
+        assert!(matches!(
+            &sys.content,
+            ChatCompletionRequestSystemMessageContent::Text(t) if t.is_empty()
+        ));
+        assert!(chat.chat_template_args.is_none());
+    }
+
+    #[test]
+    fn test_message_level_tools_on_user_are_rejected() {
+        let err = chat_from_raw(serde_json::json!({
+            "model": "m",
+            "input": [{"role": "user", "content": "hi", "tools": []}]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("only allowed on system or developer messages"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_client_cannot_set_the_internal_extras_key() {
+        let chat = chat_from_raw(serde_json::json!({
+            "model": "m", "input": "hi",
+            "chat_template_args": {"__dynamo_responses_chat_extras": {"presence_penalty": 1.5}}
+        }))
+        .unwrap();
+        assert_eq!(chat.inner.presence_penalty, None);
     }
 
     #[test]
