@@ -1570,6 +1570,43 @@ def test_vllm_client_error_preserves_http_status(error_type, expected_status):
     assert vllm_client_error_to_http_error(error).code == expected_status
 
 
+@pytest.mark.asyncio
+async def test_translate_vllm_client_errors_keeps_status_and_message():
+    """A vLLM request error raised while streaming becomes an HttpError with
+    vLLM's status and message (the frontend forwards it as a 4xx)."""
+    from vllm.exceptions import VLLMValidationError
+
+    from dynamo.llm.exceptions import HttpError
+    from dynamo.vllm.handlers import _translate_vllm_client_errors
+
+    async def gen():
+        yield "first"
+        raise VLLMValidationError(
+            "At most 8 image(s) may be provided in one prompt.", parameter="image"
+        )
+
+    seen = []
+    with pytest.raises(HttpError) as excinfo:
+        async for chunk in _translate_vllm_client_errors(gen()):
+            seen.append(chunk)
+    assert seen == ["first"]
+    assert excinfo.value.code == 400
+    assert "At most 8 image(s)" in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_translate_vllm_client_errors_leaves_server_errors_alone():
+    from dynamo.vllm.handlers import _translate_vllm_client_errors
+
+    async def gen():
+        raise RuntimeError("engine fault")
+        yield  # pragma: no cover
+
+    with pytest.raises(RuntimeError):
+        async for _ in _translate_vllm_client_errors(gen()):
+            pass
+
+
 def test_build_sampling_params_accepts_productive_recursive_guided_json():
     from dynamo.vllm.handlers import build_sampling_params
 
