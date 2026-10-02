@@ -21,12 +21,13 @@ use dynamo_protocols::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImageArgs,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType,
-    CreateChatCompletionRequest, FunctionName, FunctionObject, FunctionType,
-    ImageDetail as ChatImageDetail, ImageUrl, ReasoningContent,
-    ReasoningEffort as ChatReasoningEffort, ResponseFormat, ServiceTier as ChatServiceTier,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest,
+    FunctionName, FunctionObject, FunctionType, ImageDetail as ChatImageDetail, ImageUrl,
+    ReasoningContent, ReasoningEffort as ChatReasoningEffort, ResponseFormat,
+    ServiceTier as ChatServiceTier,
 };
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
 use serde::{Deserialize, Serialize};
@@ -421,6 +422,49 @@ fn convert_input_content_to_user_content(
     Ok(ChatCompletionRequestUserMessageContent::Array(chat_parts))
 }
 
+/// Convert `function_call_output` content parts to a Chat tool message.
+///
+/// Text-only output stays a plain string. Output that carries images (e.g. Codex's
+/// `view_image` tool returns an `input_image`) becomes an array of text and image parts,
+/// the same shape the Anthropic path builds for `tool_result` images; flattening it to
+/// text would silently drop the image.
+fn convert_function_call_output_content(
+    content: &[InputContent],
+) -> Result<ChatCompletionRequestToolMessageContent, anyhow::Error> {
+    if !content
+        .iter()
+        .any(|p| matches!(p, InputContent::InputImage(_)))
+    {
+        return Ok(ChatCompletionRequestToolMessageContent::Text(
+            convert_input_content_to_text(content),
+        ));
+    }
+    let parts = match convert_input_content_to_user_content(content)? {
+        ChatCompletionRequestUserMessageContent::Array(parts) => parts,
+        ChatCompletionRequestUserMessageContent::Text(text) => {
+            return Ok(ChatCompletionRequestToolMessageContent::Text(text));
+        }
+    };
+    let mut tool_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            ChatCompletionRequestUserMessageContentPart::Text(text) => {
+                tool_parts.push(ChatCompletionRequestToolMessageContentPart::Text(text));
+            }
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(image) => {
+                tool_parts.push(ChatCompletionRequestToolMessageContentPart::ImageUrl(image));
+            }
+            _ => {
+                return Err(ResponsesConversionError::UnsupportedContent(
+                    "function_call_output supports only text and image content".to_string(),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(ChatCompletionRequestToolMessageContent::Array(tool_parts))
+}
+
 /// Convert a slice of InputContent to a plain text string (for system/developer/assistant messages).
 fn convert_input_content_to_text(content: &[InputContent]) -> String {
     content
@@ -600,13 +644,17 @@ fn convert_input_items_to_messages(
                 }
                 Item::FunctionCallOutput(fco) => {
                     std::mem::take(&mut pending).flush_into(&mut messages);
-                    let output_text = match &fco.output {
-                        FunctionCallOutput::Text(text) => text.clone(),
-                        FunctionCallOutput::Content(parts) => convert_input_content_to_text(parts),
+                    let content = match &fco.output {
+                        FunctionCallOutput::Text(text) => {
+                            ChatCompletionRequestToolMessageContent::Text(text.clone())
+                        }
+                        FunctionCallOutput::Content(parts) => {
+                            convert_function_call_output_content(parts)?
+                        }
                     };
                     messages.push(ChatCompletionRequestMessage::Tool(
                         ChatCompletionRequestToolMessage {
-                            content: ChatCompletionRequestToolMessageContent::Text(output_text),
+                            content,
                             tool_call_id: fco.call_id.clone(),
                         },
                     ));
@@ -2004,6 +2052,78 @@ mod tests {
             ChatCompletionRequestMessage::Assistant(_)
         ));
         assert!(matches!(messages[2], ChatCompletionRequestMessage::Tool(_)));
+    }
+
+    #[test]
+    fn test_function_call_output_image_is_preserved() {
+        // Codex's view_image tool returns the image as function_call_output content;
+        // it must reach the model as an image part, not be flattened away.
+        let req = NvCreateResponse {
+            inner: CreateResponse {
+                input: InputParam::Items(vec![
+                    InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                        arguments: r#"{"path":"badge.png"}"#.into(),
+                        call_id: "call_img".into(),
+                        namespace: None,
+                        name: "view_image".into(),
+                        id: None,
+                        status: None,
+                    })),
+                    InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
+                        call_id: "call_img".into(),
+                        output: FunctionCallOutput::Content(vec![
+                            InputContent::InputText(InputTextContent {
+                                text: "badge.png".into(),
+                            }),
+                            InputContent::InputImage(InputImageContent {
+                                detail: Default::default(),
+                                file_id: None,
+                                image_url: Some("data:image/png;base64,aGVsbG8=".into()),
+                            }),
+                        ]),
+                        id: None,
+                        status: None,
+                    })),
+                ]),
+                model: Some("test-model".into()),
+                ..Default::default()
+            },
+            nvext: None,
+            chat_template_args: None,
+        };
+
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        let ChatCompletionRequestMessage::Tool(tool) = &chat_req.inner.messages[1] else {
+            panic!("expected tool message");
+        };
+        assert_eq!(tool.tool_call_id, "call_img");
+        let ChatCompletionRequestToolMessageContent::Array(parts) = &tool.content else {
+            panic!("expected array content, got {:?}", tool.content);
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            ChatCompletionRequestToolMessageContentPart::Text(t) if t.text == "badge.png"
+        ));
+        let ChatCompletionRequestToolMessageContentPart::ImageUrl(image) = &parts[1] else {
+            panic!("expected image_url part");
+        };
+        assert_eq!(
+            image.image_url.as_ref().unwrap().url.as_str(),
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn test_function_call_output_text_parts_stay_text() {
+        let content = vec![InputContent::InputText(InputTextContent {
+            text: r#"{"ok":true}"#.into(),
+        })];
+        let out = convert_function_call_output_content(&content).unwrap();
+        assert!(matches!(
+            out,
+            ChatCompletionRequestToolMessageContent::Text(ref t) if t == r#"{"ok":true}"#
+        ));
     }
 
     #[test]
