@@ -12,8 +12,8 @@ use dynamo_protocols::types::responses::{
     OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
     PromptCacheRetention, Reasoning, ReasoningItem, ReasoningItemContent, ReasoningTextContent,
     Response, ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status,
-    SummaryPart, TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam,
-    Truncation,
+    SummaryPart, TextResponseFormatConfiguration, Tool, ToolChoiceAllowedMode, ToolChoiceOptions,
+    ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
@@ -285,6 +285,9 @@ pub struct NvResponse {
     pub frequency_penalty: f32,
     #[serde(default)]
     pub store: bool,
+    /// Echo of the request's `max_tool_calls` (absent from upstream `Response`).
+    #[serde(default)]
+    pub max_tool_calls: Option<u32>,
 }
 
 /// Patch an already-serialized `Response` JSON object to match the
@@ -340,6 +343,9 @@ impl Serialize for NvResponse {
             self.store,
         );
 
+        if let Some(max_tool_calls) = self.max_tool_calls {
+            obj.insert("max_tool_calls".into(), serde_json::json!(max_tool_calls));
+        }
         if let Some(nvext) = &self.nvext {
             obj.insert("nvext".into(), nvext.clone());
         }
@@ -1027,6 +1033,11 @@ fn convert_tool_choice(tc: &ToolChoiceParam) -> anyhow::Result<ChatCompletionToo
             ToolChoiceOptions::Auto => ChatCompletionToolChoiceOption::Auto,
             ToolChoiceOptions::Required => ChatCompletionToolChoiceOption::Required,
         },
+        // The tool list itself is narrowed in `TryFrom` (see `allowed_function_names`).
+        ToolChoiceParam::AllowedTools(allowed) => match allowed.mode {
+            ToolChoiceAllowedMode::Auto => ChatCompletionToolChoiceOption::Auto,
+            ToolChoiceAllowedMode::Required => ChatCompletionToolChoiceOption::Required,
+        },
         ToolChoiceParam::Function(f) => {
             ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
                 r#type: ChatCompletionToolType::Function,
@@ -1037,6 +1048,24 @@ fn convert_tool_choice(tc: &ToolChoiceParam) -> anyhow::Result<ChatCompletionToo
         }
         _ => return unsupported_tool(tc, "tool_choice"),
     })
+}
+
+/// Function names allowed by `tool_choice: {type: "allowed_tools", tools: [...]}`.
+/// Hosted entries are ignored (hosted tools are dropped by the adapter).
+fn allowed_function_names(
+    tc: Option<&ToolChoiceParam>,
+) -> Option<std::collections::HashSet<String>> {
+    let Some(ToolChoiceParam::AllowedTools(allowed)) = tc else {
+        return None;
+    };
+    Some(
+        allowed
+            .tools
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"))
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect(),
+    )
 }
 
 /// Convert Responses API `text.format` to Chat Completions `response_format`.
@@ -1148,6 +1177,15 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         }
 
         let top_logprobs = convert_top_logprobs(resp.inner.top_logprobs);
+        // Responses returns token logprobs only for
+        // `include: ["message.output_text.logprobs"]`; Chat needs `logprobs: true`
+        // for the backend to compute them at all.
+        let logprobs = resp
+            .inner
+            .include
+            .as_ref()
+            .is_some_and(|inc| inc.contains(&IncludeEnum::MessageOutputTextLogprobs))
+            .then_some(true);
 
         // Convert tools if present
         let tools = resp
@@ -1158,13 +1196,38 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             .transpose()?
             .filter(|t: &Vec<_>| !t.is_empty());
 
+        // `allowed_tools`: expose only the named function tools to the model.
+        let tools = match allowed_function_names(resp.inner.tool_choice.as_ref()) {
+            Some(allowed) => {
+                let narrowed: Vec<_> = tools
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| allowed.contains(&t.function.name))
+                    .collect();
+                if narrowed.is_empty() {
+                    return Err(ResponsesConversionError::InvalidArgument(
+                        "tool_choice.allowed_tools names no function tool declared in `tools`"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                Some(narrowed)
+            }
+            None => tools,
+        };
+
         // Convert tool_choice if present
-        let tool_choice = resp
+        let mut tool_choice = resp
             .inner
             .tool_choice
             .as_ref()
             .map(convert_tool_choice)
             .transpose()?;
+        // `max_tool_calls: 0` forbids tool calls outright; larger limits are
+        // enforced on the output (`ResponseParams::max_tool_calls`).
+        if resp.inner.max_tool_calls == Some(0) && tools.is_some() {
+            tool_choice = Some(ChatCompletionToolChoiceOption::None);
+        }
 
         // Determine stream setting: respect caller's preference, default to true for aggregation
         let stream = resp.inner.stream.or(Some(true));
@@ -1196,6 +1259,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 max_completion_tokens: resp.inner.max_output_tokens,
                 store: resp.inner.store,
                 parallel_tool_calls: resp.inner.parallel_tool_calls,
+                logprobs,
                 top_logprobs,
                 metadata: resp
                     .inner
@@ -1218,6 +1282,105 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             unsupported_fields: Default::default(),
         })
     }
+}
+
+/// Place reasoning text in the item's `summary` (explicit `reasoning.summary`) or
+/// in its raw `reasoning_text` content (see [`ResponseParams::reasoning_as_summary`]).
+pub(crate) fn reasoning_item_parts(
+    params: &ResponseParams,
+    text: String,
+) -> (
+    Vec<dynamo_protocols::types::responses::SummaryPart>,
+    Option<Vec<ReasoningItemContent>>,
+) {
+    use dynamo_protocols::types::responses::{SummaryPart, SummaryTextContent};
+    if params.reasoning_as_summary() {
+        (
+            vec![SummaryPart::SummaryText(SummaryTextContent { text })],
+            None,
+        )
+    } else {
+        (
+            vec![],
+            Some(vec![ReasoningItemContent::ReasoningText(
+                ReasoningTextContent { text },
+            )]),
+        )
+    }
+}
+
+/// Chat token logprobs → Responses output-text logprobs.
+pub(crate) fn chat_logprobs_to_output(
+    tokens: &[dynamo_protocols::types::ChatCompletionTokenLogprob],
+) -> Vec<dynamo_protocols::types::responses::LogProb> {
+    use dynamo_protocols::types::responses::{LogProb, TopLogProb};
+    tokens
+        .iter()
+        .map(|t| LogProb {
+            bytes: t
+                .bytes
+                .clone()
+                .unwrap_or_else(|| t.token.as_bytes().to_vec()),
+            logprob: f64::from(t.logprob),
+            token: t.token.clone(),
+            top_logprobs: t
+                .top_logprobs
+                .iter()
+                .map(|top| TopLogProb {
+                    bytes: top
+                        .bytes
+                        .clone()
+                        .unwrap_or_else(|| top.token.as_bytes().to_vec()),
+                    logprob: f64::from(top.logprob),
+                    token: top.token.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Output-text logprobs → the `response.output_text.done` event's shape.
+pub(crate) fn output_logprobs_to_event(
+    logprobs: &[dynamo_protocols::types::responses::LogProb],
+) -> Vec<dynamo_protocols::types::responses::ResponseLogProb> {
+    use dynamo_protocols::types::responses::{ResponseLogProb, ResponseTopLobProb};
+    logprobs
+        .iter()
+        .map(|l| ResponseLogProb {
+            logprob: l.logprob,
+            token: l.token.clone(),
+            top_logprobs: l
+                .top_logprobs
+                .iter()
+                .map(|t| ResponseTopLobProb {
+                    logprob: t.logprob,
+                    token: t.token.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Chat token logprobs → Responses `response.output_text.delta` logprobs.
+pub(crate) fn chat_logprobs_to_delta(
+    tokens: &[dynamo_protocols::types::ChatCompletionTokenLogprob],
+) -> Vec<dynamo_protocols::types::responses::ResponseLogProb> {
+    use dynamo_protocols::types::responses::{ResponseLogProb, ResponseTopLobProb};
+    tokens
+        .iter()
+        .map(|t| ResponseLogProb {
+            logprob: f64::from(t.logprob),
+            token: t.token.clone(),
+            top_logprobs: t
+                .top_logprobs
+                .iter()
+                .map(|top| ResponseTopLobProb {
+                    logprob: f64::from(top.logprob),
+                    token: top.token.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn convert_top_logprobs(input: Option<u8>) -> Option<u8> {
@@ -1317,6 +1480,12 @@ pub struct ResponseParams {
     pub service_tier: Option<ServiceTier>,
     pub include: Option<Vec<IncludeEnum>>,
     pub truncation: Option<Truncation>,
+    /// `max_tool_calls`: at most this many function calls are returned (the
+    /// adapter executes no tools itself); echoed on the response.
+    pub max_tool_calls: Option<u32>,
+    /// Requested `top_logprobs`, echoed on the response (the spec field is
+    /// always present; 0 when the caller did not ask).
+    pub top_logprobs: Option<u8>,
     /// OpenResponses spec requires these fields on the response body. Upstream
     /// `CreateResponse` doesn't model them on the request yet, so for now they
     /// pass through as `None`; the response serializer defaults to 0.0 (the
@@ -1336,6 +1505,26 @@ pub struct ResponseParams {
 }
 
 impl ResponseParams {
+    /// An explicit `reasoning.summary` (auto/concise/detailed): the reasoning text
+    /// is returned as the item's `summary` and streamed as
+    /// `response.reasoning_summary_*` events, as OpenAI does. Without it (e.g.
+    /// Codex's `include: ["reasoning.encrypted_content"]`) the text is returned
+    /// as raw `reasoning_text` content.
+    pub(crate) fn reasoning_as_summary(&self) -> bool {
+        self.reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary)
+            .is_some()
+    }
+
+    /// Output-text logprobs are returned only when the caller includes
+    /// `message.output_text.logprobs` (OpenAI Responses semantics).
+    pub(crate) fn output_logprobs_requested(&self) -> bool {
+        self.include
+            .as_ref()
+            .is_some_and(|inc| inc.contains(&IncludeEnum::MessageOutputTextLogprobs))
+    }
+
     /// Reasoning is returned when the client asks for it: a `reasoning.summary`,
     /// or `include: ["reasoning.encrypted_content"]`, which is how Codex asks
     /// for reasoning items it can replay on the next turn (it never sets a
@@ -1451,23 +1640,22 @@ pub fn chat_completion_to_response(
     let mut output = Vec::new();
     let mut output_limit_reached = false;
 
+    let mut chat_logprobs = None;
     if let Some(choice) = choice {
         output_limit_reached =
             choice.finish_reason == Some(dynamo_protocols::types::FinishReason::Length);
+        chat_logprobs = choice.logprobs.as_ref().and_then(|l| l.content.clone());
 
         // Reasoning precedes tool calls so output order matches the decoded turn.
         if let Some(reasoning_text) = choice.message.reasoning_content
             && !reasoning_text.is_empty()
             && params.reasoning_summary_requested()
         {
+            let (summary, content) = reasoning_item_parts(params, reasoning_text);
             output.push(OutputItem::Reasoning(ReasoningItem {
                 id: Some(format!("rs_{}", Uuid::new_v4().simple())),
-                summary: vec![],
-                content: Some(vec![ReasoningItemContent::ReasoningText(
-                    ReasoningTextContent {
-                        text: reasoning_text,
-                    },
-                )]),
+                summary,
+                content,
                 encrypted_content: None,
                 status: Some(OutputStatus::Completed),
             }));
@@ -1533,13 +1721,28 @@ pub fn chat_completion_to_response(
         .include
         .as_ref()
         .is_some_and(|inc| inc.contains(&IncludeEnum::MessageOutputTextLogprobs));
+    if let Some(max) = params.max_tool_calls {
+        let mut calls = 0u32;
+        output.retain(|item| {
+            if !matches!(item, OutputItem::FunctionCall(_)) {
+                return true;
+            }
+            calls += 1;
+            calls <= max
+        });
+    }
+
+    let mut chat_logprobs = keep_logprobs.then_some(chat_logprobs).flatten();
     for item in &mut output {
         if let OutputItem::Message(msg) = item {
             for content in &mut msg.content {
-                if let OutputMessageContent::OutputText(text) = content
-                    && (!keep_logprobs || text.logprobs.is_none())
-                {
-                    text.logprobs = Some(Vec::new());
+                if let OutputMessageContent::OutputText(text) = content {
+                    // The backend's token logprobs belong to the (single) text part.
+                    if let Some(tokens) = chat_logprobs.take() {
+                        text.logprobs = Some(chat_logprobs_to_output(&tokens));
+                    } else if !keep_logprobs || text.logprobs.is_none() {
+                        text.logprobs = Some(Vec::new());
+                    }
                 }
             }
         }
@@ -1625,7 +1828,7 @@ pub fn chat_completion_to_response(
         reasoning: params.reasoning.clone(),
         safety_identifier: params.safety_identifier.clone(),
         service_tier: Some(params.service_tier.unwrap_or(ServiceTier::Auto)),
-        top_logprobs: Some(0),
+        top_logprobs: Some(params.top_logprobs.unwrap_or(0)),
         usage: chat_resp.usage.map(|u| ResponseUsage {
             input_tokens: u.prompt_tokens,
             input_tokens_details: InputTokenDetails {
@@ -1651,6 +1854,7 @@ pub fn chat_completion_to_response(
         presence_penalty: params.presence_penalty.unwrap_or(0.0),
         frequency_penalty: params.frequency_penalty.unwrap_or(0.0),
         store: params.store.unwrap_or(false),
+        max_tool_calls: params.max_tool_calls,
     })
 }
 
@@ -1688,7 +1892,16 @@ mod tests {
         }
     }
 
+    /// Raw reasoning text is returned (Codex's request form).
     fn requested_reasoning_params() -> ResponseParams {
+        ResponseParams {
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
+            ..Default::default()
+        }
+    }
+
+    /// An explicit `reasoning.summary` returns the text as a summary.
+    fn summary_reasoning_params() -> ResponseParams {
         use dynamo_protocols::types::responses::ReasoningSummary;
 
         ResponseParams {
@@ -3686,6 +3899,170 @@ thinking
 
         let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
         assert_eq!(chat.inner.parallel_tool_calls, Some(false));
+    }
+
+    fn two_tool_request(extra: serde_json::Value) -> NvCreateResponse {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "input": "weather?",
+            "tools": [
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}},
+                {"type": "function", "name": "get_time", "parameters": {"type": "object", "properties": {}}}
+            ]
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        NvCreateResponse::try_from(body).unwrap()
+    }
+
+    #[test]
+    fn test_allowed_tools_narrows_tools_and_maps_mode() {
+        let req = two_tool_request(serde_json::json!({
+            "tool_choice": {"type": "allowed_tools", "mode": "required",
+                            "tools": [{"type": "function", "name": "get_time"}, {"type": "web_search"}]}
+        }));
+        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        let names: Vec<_> = chat
+            .inner
+            .tools
+            .unwrap()
+            .into_iter()
+            .map(|t| t.function.name)
+            .collect();
+        assert_eq!(names, vec!["get_time".to_string()]);
+        assert!(matches!(
+            chat.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+        ));
+    }
+
+    #[test]
+    fn test_allowed_tools_without_a_declared_function_is_rejected() {
+        let req = two_tool_request(serde_json::json!({
+            "tool_choice": {"type": "allowed_tools", "mode": "auto",
+                            "tools": [{"type": "function", "name": "not_declared"}]}
+        }));
+        let err = NvCreateChatCompletionRequest::try_from(req).unwrap_err();
+        assert!(err.to_string().contains("allowed_tools"), "{err}");
+    }
+
+    #[test]
+    fn test_max_tool_calls_zero_disables_tool_calls() {
+        let req = two_tool_request(serde_json::json!({"max_tool_calls": 0}));
+        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert!(matches!(
+            chat.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::None)
+        ));
+    }
+
+    #[test]
+    fn test_max_tool_calls_caps_returned_calls_and_is_echoed() {
+        let params = ResponseParams {
+            max_tool_calls: Some(1),
+            ..Default::default()
+        };
+        let resp = chat_completion_to_response(
+            make_chat_resp_with_tool_calls(
+                dynamo_protocols::types::FinishReason::ToolCalls,
+                &["{}", "{}", "{}"],
+            ),
+            &params,
+            None,
+        )
+        .unwrap();
+        let calls = resp
+            .inner
+            .output
+            .iter()
+            .filter(|i| matches!(i, OutputItem::FunctionCall(_)))
+            .count();
+        assert_eq!(calls, 1);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["max_tool_calls"], 1);
+    }
+
+    #[test]
+    fn test_reasoning_summary_returned_as_summary() {
+        let resp = chat_completion_to_response(
+            make_chat_resp_with_reasoning("thought"),
+            &summary_reasoning_params(),
+            None,
+        )
+        .unwrap();
+        let reasoning = resp
+            .inner
+            .output
+            .iter()
+            .find_map(|i| match i {
+                OutputItem::Reasoning(r) => Some(r),
+                _ => None,
+            })
+            .expect("reasoning item");
+        assert!(reasoning.content.is_none());
+        let json = serde_json::to_value(&reasoning.summary).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{"type": "summary_text", "text": "thought"}])
+        );
+    }
+
+    #[test]
+    fn test_output_text_logprobs_returned_when_included() {
+        use dynamo_protocols::types::{
+            ChatChoiceLogprobs, ChatCompletionTokenLogprob, TopLogprobs,
+        };
+        let mut chat_resp = make_chat_resp_with_text("hi");
+        chat_resp.inner.choices[0].logprobs = Some(ChatChoiceLogprobs {
+            content: Some(vec![ChatCompletionTokenLogprob {
+                token: "hi".into(),
+                logprob: -0.25,
+                token_id: None,
+                bytes: None,
+                top_logprobs: vec![TopLogprobs {
+                    token: "hey".into(),
+                    logprob: -1.5,
+                    bytes: None,
+                }],
+            }]),
+            refusal: None,
+        });
+        let with = ResponseParams {
+            include: Some(vec![IncludeEnum::MessageOutputTextLogprobs]),
+            top_logprobs: Some(1),
+            ..Default::default()
+        };
+        let resp = chat_completion_to_response(chat_resp.clone(), &with, None).unwrap();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["top_logprobs"], 1);
+        let lp = &json["output"][0]["content"][0]["logprobs"];
+        assert_eq!(lp[0]["token"], "hi");
+        assert_eq!(lp[0]["logprob"], -0.25);
+        assert_eq!(lp[0]["top_logprobs"][0]["token"], "hey");
+
+        let without =
+            chat_completion_to_response(chat_resp, &ResponseParams::default(), None).unwrap();
+        let json = serde_json::to_value(&without).unwrap();
+        assert_eq!(
+            json["output"][0]["content"][0]["logprobs"],
+            serde_json::json!([])
+        );
+        assert_eq!(json["top_logprobs"], 0);
+    }
+
+    #[test]
+    fn test_logprobs_requested_from_backend_only_when_included() {
+        let mut req = make_response_with_input("hi");
+        req.inner.include = Some(vec![IncludeEnum::MessageOutputTextLogprobs]);
+        req.inner.top_logprobs = Some(3);
+        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert_eq!(chat.inner.logprobs, Some(true));
+        assert_eq!(chat.inner.top_logprobs, Some(3));
+
+        let chat: NvCreateChatCompletionRequest =
+            make_response_with_input("hi").try_into().unwrap();
+        assert_eq!(chat.inner.logprobs, None);
     }
 
     #[test]

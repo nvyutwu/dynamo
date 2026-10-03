@@ -21,10 +21,13 @@ use dynamo_protocols::types::responses::{
     ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseFailedEvent,
     ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent,
     ResponseInProgressEvent, ResponseIncompleteEvent, ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent, ResponseReasoningTextDoneEvent,
-    ResponseStreamEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseTextParam,
-    ResponseUsage, ServiceTier, Status, TextResponseFormatConfiguration, ToolChoiceOptions,
-    ToolChoiceParam, Truncation,
+    ResponseOutputItemDoneEvent, ResponseReasoningSummaryPartAddedEvent,
+    ResponseReasoningSummaryPartDoneEvent, ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningSummaryTextDoneEvent, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+    ResponseTextDoneEvent, ResponseTextParam, ResponseUsage, ServiceTier, Status, SummaryPart,
+    SummaryTextContent, TextResponseFormatConfiguration, ToolChoiceOptions, ToolChoiceParam,
+    Truncation,
 };
 use serde::{
     Serialize,
@@ -53,6 +56,8 @@ pub struct ResponseStreamConverter {
     message_output_index: u32,
     message_output_status: Option<OutputStatus>,
     accumulated_text: String,
+    // Output-text logprobs, collected only when the caller included them.
+    accumulated_logprobs: Vec<dynamo_protocols::types::responses::LogProb>,
     // Ordered reasoning spans; a new item opens when reasoning resumes after
     // a tool call.
     reasoning_items: Vec<ReasoningState>,
@@ -72,18 +77,34 @@ struct ReasoningState {
     accumulated_text: String,
     output_index: u32,
     output_status: Option<OutputStatus>,
+    /// Stream and return the text as a reasoning summary (explicit
+    /// `reasoning.summary`) rather than raw `reasoning_text` content.
+    as_summary: bool,
 }
 
 impl ReasoningState {
     fn completed_item(&self, output_status: OutputStatus) -> ReasoningItem {
+        let (summary, content) = if self.as_summary {
+            (
+                vec![SummaryPart::SummaryText(SummaryTextContent {
+                    text: self.accumulated_text.clone(),
+                })],
+                None,
+            )
+        } else {
+            (
+                vec![],
+                Some(vec![ReasoningItemContent::ReasoningText(
+                    ReasoningTextContent {
+                        text: self.accumulated_text.clone(),
+                    },
+                )]),
+            )
+        };
         ReasoningItem {
             id: Some(self.item_id.clone()),
-            summary: vec![],
-            content: Some(vec![ReasoningItemContent::ReasoningText(
-                ReasoningTextContent {
-                    text: self.accumulated_text.clone(),
-                },
-            )]),
+            summary,
+            content,
             encrypted_content: None,
             status: Some(self.output_status.unwrap_or(output_status)),
         }
@@ -127,6 +148,7 @@ impl ResponseStreamConverter {
             message_output_index: 0,
             message_output_status: None,
             accumulated_text: String::new(),
+            accumulated_logprobs: Vec::new(),
             reasoning_items: Vec::new(),
             active_reasoning_index: None,
             function_call_items: Vec::new(),
@@ -163,11 +185,13 @@ impl ResponseStreamConverter {
                 let output_index = self.next_output_index;
                 self.next_output_index += 1;
                 let item_id = format!("rs_{}", Uuid::new_v4().simple());
+                let as_summary = self.params.reasoning_as_summary();
                 self.reasoning_items.push(ReasoningState {
                     item_id: item_id.clone(),
                     accumulated_text: String::new(),
                     output_index,
                     output_status: None,
+                    as_summary,
                 });
                 let state_index = self.reasoning_items.len() - 1;
                 self.active_reasoning_index = Some(state_index);
@@ -179,14 +203,26 @@ impl ResponseStreamConverter {
                         item: OutputItem::Reasoning(ReasoningItem {
                             id: Some(item_id.clone()),
                             summary: vec![],
-                            content: Some(vec![]),
+                            content: (!as_summary).then(Vec::new),
                             encrypted_content: None,
                             status: Some(OutputStatus::InProgress),
                         }),
                     });
                 events.push(self.make_sse_event(&item_added));
 
-                let part_added =
+                let part_added = if as_summary {
+                    ResponseStreamEvent::ResponseReasoningSummaryPartAdded(
+                        ResponseReasoningSummaryPartAddedEvent {
+                            sequence_number: self.next_seq(),
+                            item_id,
+                            output_index,
+                            summary_index: 0,
+                            part: SummaryPart::SummaryText(SummaryTextContent {
+                                text: String::new(),
+                            }),
+                        },
+                    )
+                } else {
                     ResponseStreamEvent::ResponseContentPartAdded(ResponseContentPartAddedEvent {
                         sequence_number: self.next_seq(),
                         item_id,
@@ -195,26 +231,38 @@ impl ResponseStreamConverter {
                         part: OutputContent::ReasoningText(ReasoningTextContent {
                             text: String::new(),
                         }),
-                    });
+                    })
+                };
                 events.push(self.make_sse_event(&part_added));
 
                 state_index
             }
         };
 
-        let (item_id, output_index) = {
+        let (item_id, output_index, as_summary) = {
             let state = &mut self.reasoning_items[state_index];
             state.accumulated_text.push_str(reasoning);
-            (state.item_id.clone(), state.output_index)
+            (state.item_id.clone(), state.output_index, state.as_summary)
         };
-        let delta =
+        let delta = if as_summary {
+            ResponseStreamEvent::ResponseReasoningSummaryTextDelta(
+                ResponseReasoningSummaryTextDeltaEvent {
+                    sequence_number: self.next_seq(),
+                    item_id,
+                    output_index,
+                    summary_index: 0,
+                    delta: reasoning.to_string(),
+                },
+            )
+        } else {
             ResponseStreamEvent::ResponseReasoningTextDelta(ResponseReasoningTextDeltaEvent {
                 sequence_number: self.next_seq(),
                 item_id,
                 output_index,
                 content_index: 0,
                 delta: reasoning.to_string(),
-            });
+            })
+        };
         events.push(self.make_sse_event(&delta));
     }
 
@@ -226,7 +274,7 @@ impl ResponseStreamConverter {
         let Some(state_index) = self.active_reasoning_index.take() else {
             return;
         };
-        let (item_id, output_index, text, item) = {
+        let (item_id, output_index, text, item, as_summary) = {
             let state = &mut self.reasoning_items[state_index];
             if state.output_status.is_some() {
                 return;
@@ -237,8 +285,40 @@ impl ResponseStreamConverter {
                 state.output_index,
                 state.accumulated_text.clone(),
                 state.completed_item(output_status),
+                state.as_summary,
             )
         };
+
+        if as_summary {
+            let text_done = ResponseStreamEvent::ResponseReasoningSummaryTextDone(
+                ResponseReasoningSummaryTextDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: item_id.clone(),
+                    output_index,
+                    summary_index: 0,
+                    text: text.clone(),
+                },
+            );
+            events.push(self.make_sse_event(&text_done));
+            let part_done = ResponseStreamEvent::ResponseReasoningSummaryPartDone(
+                ResponseReasoningSummaryPartDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: item_id.clone(),
+                    output_index,
+                    summary_index: 0,
+                    part: SummaryPart::SummaryText(SummaryTextContent { text }),
+                },
+            );
+            events.push(self.make_sse_event(&part_done));
+            let item_done =
+                ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+                    sequence_number: self.next_seq(),
+                    output_index,
+                    item: OutputItem::Reasoning(item),
+                });
+            events.push(self.make_sse_event(&item_done));
+            return;
+        }
 
         let text_done =
             ResponseStreamEvent::ResponseReasoningTextDone(ResponseReasoningTextDoneEvent {
@@ -330,7 +410,7 @@ impl ResponseStreamConverter {
             reasoning: self.params.reasoning.clone(),
             safety_identifier: self.params.safety_identifier.clone(),
             service_tier: Some(self.params.service_tier.unwrap_or(ServiceTier::Auto)),
-            top_logprobs: Some(0),
+            top_logprobs: Some(self.params.top_logprobs.unwrap_or(0)),
             usage: self.usage.clone(),
         }
     }
@@ -469,6 +549,18 @@ impl ResponseStreamConverter {
 
                 // Emit text delta
                 self.accumulated_text.push_str(content);
+                let delta_logprobs = if self.params.output_logprobs_requested() {
+                    let tokens = choice
+                        .logprobs
+                        .as_ref()
+                        .and_then(|l| l.content.as_deref())
+                        .unwrap_or_default();
+                    self.accumulated_logprobs
+                        .extend(super::chat_logprobs_to_output(tokens));
+                    super::chat_logprobs_to_delta(tokens)
+                } else {
+                    vec![]
+                };
                 let text_delta =
                     ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
                         sequence_number: self.next_seq(),
@@ -476,7 +568,7 @@ impl ResponseStreamConverter {
                         output_index: self.message_output_index,
                         content_index: 0,
                         delta: content.to_string(),
-                        logprobs: Some(vec![]),
+                        logprobs: Some(delta_logprobs),
                     });
                 events.push(self.make_sse_event(&text_delta));
             }
@@ -489,9 +581,11 @@ impl ResponseStreamConverter {
                 // allocating converter state so suppressed calls cannot emit
                 // any Responses API events at finish or EOF.
                 let enforce_single_tool_call = self.params.parallel_tool_calls == Some(false);
+                let max_tool_calls = self.params.max_tool_calls;
                 let mut tool_calls = tool_calls
                     .iter()
                     .filter(|tc| !enforce_single_tool_call || tc.index == 0)
+                    .filter(|tc| max_tool_calls.is_none_or(|max| tc.index < max))
                     .peekable();
                 if tool_calls.peek().is_some() {
                     // Starting a tool call is also an explicit reasoning phase
@@ -723,7 +817,7 @@ impl ResponseStreamConverter {
             content: vec![OutputMessageContent::OutputText(OutputTextContent {
                 text: self.accumulated_text.clone(),
                 annotations: vec![],
-                logprobs: Some(vec![]),
+                logprobs: Some(self.accumulated_logprobs.clone()),
             })],
             role: AssistantRole::Assistant,
             phase: None,
@@ -779,7 +873,7 @@ impl ResponseStreamConverter {
             output_index: self.message_output_index,
             content_index: 0,
             text: self.accumulated_text.clone(),
-            logprobs: Some(vec![]),
+            logprobs: Some(super::output_logprobs_to_event(&self.accumulated_logprobs)),
         });
         events.push(self.make_sse_event(&text_done));
 
@@ -792,7 +886,7 @@ impl ResponseStreamConverter {
                 part: OutputContent::OutputText(OutputTextContent {
                     text: self.accumulated_text.clone(),
                     annotations: vec![],
-                    logprobs: Some(vec![]),
+                    logprobs: Some(self.accumulated_logprobs.clone()),
                 }),
             });
         events.push(self.make_sse_event(&part_done));
@@ -890,6 +984,7 @@ impl ResponseStreamConverter {
             presence_penalty: self.params.presence_penalty.unwrap_or(0.0),
             frequency_penalty: self.params.frequency_penalty.unwrap_or(0.0),
             store: self.params.store.unwrap_or(false),
+            max_tool_calls: self.params.max_tool_calls,
         };
 
         match event {
@@ -951,6 +1046,7 @@ struct ResponseSpecFields {
     presence_penalty: f32,
     frequency_penalty: f32,
     store: bool,
+    max_tool_calls: Option<u32>,
 }
 
 struct ResponseEventForSpec<'a> {
@@ -1014,7 +1110,7 @@ impl Serialize for ResponseForSpec<'_> {
         map.serialize_entry("incomplete_details", &response.incomplete_details)?;
         map.serialize_entry("instructions", &response.instructions)?;
         map.serialize_entry("max_output_tokens", &response.max_output_tokens)?;
-        map.serialize_entry("max_tool_calls", &None::<u32>)?;
+        map.serialize_entry("max_tool_calls", &self.spec.max_tool_calls)?;
         serialize_optional_entry(&mut map, "metadata", &response.metadata)?;
         map.serialize_entry("model", &response.model)?;
         map.serialize_entry("object", &response.object)?;
@@ -1185,13 +1281,10 @@ mod tests {
     }
 
     fn reasoning_params() -> ResponseParams {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         }
     }
@@ -1597,13 +1690,10 @@ mod tests {
 
     #[test]
     fn test_length_finish_reason_marks_reasoning_item_incomplete() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1620,13 +1710,10 @@ mod tests {
 
     #[test]
     fn test_completed_reasoning_stays_complete_when_text_is_truncated() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1649,13 +1736,10 @@ mod tests {
 
     #[test]
     fn test_same_chunk_text_and_length_complete_reasoning_only() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1697,13 +1781,10 @@ mod tests {
 
     #[test]
     fn test_same_chunk_tool_call_and_length_complete_reasoning_only() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1738,13 +1819,10 @@ mod tests {
 
     #[test]
     fn test_requested_reasoning_text_streams_complete_event_sequence() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1808,14 +1886,103 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_text_ignores_updates_after_visible_output() {
+    fn test_reasoning_summary_streams_summary_events() {
         use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
-
         let params = ResponseParams {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
             }),
+            ..default_params()
+        };
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+        let first = event_types(&conv.process_chunk(&reasoning_chunk("think")));
+        assert_eq!(
+            first,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta"
+            ]
+        );
+        let done = event_types(&conv.process_chunk(&text_chunk("answer")));
+        assert_eq!(
+            &done[..3],
+            &[
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done"
+            ]
+        );
+        let OutputItem::Reasoning(item) = &conv.completed_output()[0] else {
+            panic!("expected reasoning item");
+        };
+        assert!(item.content.is_none());
+        assert_eq!(
+            serde_json::to_value(&item.summary).unwrap(),
+            serde_json::json!([{"type": "summary_text", "text": "think"}])
+        );
+    }
+
+    #[test]
+    fn test_output_text_delta_carries_logprobs_when_included() {
+        use dynamo_protocols::types::responses::IncludeEnum;
+        use dynamo_protocols::types::{ChatChoiceLogprobs, ChatCompletionTokenLogprob};
+        let params = ResponseParams {
+            include: Some(vec![IncludeEnum::MessageOutputTextLogprobs]),
+            top_logprobs: Some(2),
+            ..default_params()
+        };
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+        let mut chunk = text_chunk("hi");
+        chunk.inner.choices[0].logprobs = Some(ChatChoiceLogprobs {
+            content: Some(vec![ChatCompletionTokenLogprob {
+                token: "hi".into(),
+                logprob: -0.5,
+                token_id: None,
+                bytes: None,
+                top_logprobs: vec![],
+            }]),
+            refusal: None,
+        });
+        let events = conv.process_chunk(&chunk);
+        let delta = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .find(|e| e.contains("response.output_text.delta"))
+            .expect("text delta");
+        assert!(delta.contains("\\\"logprob\\\":-0.5"), "{delta}");
+        let OutputItem::Message(msg) = &conv.completed_output()[0] else {
+            panic!("expected message");
+        };
+        let json = serde_json::to_value(&msg.content[0]).unwrap();
+        assert_eq!(json["logprobs"][0]["token"], "hi");
+    }
+
+    #[test]
+    fn test_max_tool_calls_filters_streamed_calls() {
+        let params = ResponseParams {
+            max_tool_calls: Some(1),
+            ..default_params()
+        };
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+        let _ = conv.process_chunk(&tool_call_chunk(0, Some("call-0"), Some("a"), Some("{}")));
+        let second = conv.process_chunk(&tool_call_chunk(1, Some("call-1"), Some("b"), Some("{}")));
+        assert!(second.is_empty(), "{:?}", event_types(&second));
+        let calls = conv
+            .completed_output()
+            .into_iter()
+            .filter(|i| matches!(i, OutputItem::FunctionCall(_)))
+            .count();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn test_reasoning_text_ignores_updates_after_visible_output() {
+        use dynamo_protocols::types::responses::IncludeEnum;
+
+        let params = ResponseParams {
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1833,13 +2000,10 @@ mod tests {
 
     #[test]
     fn test_reasoning_text_finishes_before_tool_call() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);
@@ -1860,13 +2024,10 @@ mod tests {
 
     #[test]
     fn test_reasoning_text_does_not_start_after_visible_output() {
-        use dynamo_protocols::types::responses::{Reasoning, ReasoningSummary};
+        use dynamo_protocols::types::responses::IncludeEnum;
 
         let params = ResponseParams {
-            reasoning: Some(Reasoning {
-                effort: None,
-                summary: Some(ReasoningSummary::Auto),
-            }),
+            include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             ..default_params()
         };
         let mut conv = ResponseStreamConverter::new("test-model".into(), params);

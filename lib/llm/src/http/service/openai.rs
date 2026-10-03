@@ -3528,13 +3528,52 @@ pub fn validate_completion_fields_generic(
 /// send routing names this frontend does not serve, and a pre-flight estimate
 /// does not need a live model.
 async fn handler_responses_input_tokens(
-    State((_state, _template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
     let request: CountInputTokensRequest = parse_json_request("responses input_tokens", &body)?;
-    Ok(Json(CountInputTokensResponse::new(request.estimate_tokens())).into_response())
+    let tokens = match count_responses_input_tokens(&state, template.as_ref(), &body).await {
+        Some(tokens) => tokens,
+        None => request.estimate_tokens(),
+    };
+    Ok(Json(CountInputTokensResponse::new(tokens)).into_response())
+}
+
+/// Count a Responses body exactly as `/v1/responses` would bill it: the same
+/// Responses→Chat conversion, reasoning normalization and Kimi-K3 effort mapping,
+/// then the model's chat preprocessor (template + tokenizer, incl. the server
+/// default effort). `None` → no exact count available (unknown model, a body
+/// that is not a full Responses request, or a conversion the endpoint itself
+/// would reject); the caller falls back to the estimate.
+async fn count_responses_input_tokens(
+    state: &service_v2::State,
+    template: Option<&RequestTemplate>,
+    body: &[u8],
+) -> Option<u32> {
+    let request: NvCreateResponse = serde_json::from_slice(body).ok()?;
+    let raw_model = request.inner.model.clone().unwrap_or_default();
+    let model = state
+        .manager()
+        .resolve_canonical_name(resolve_request_model(&raw_model, template));
+    let (preprocessor, parsing_options) =
+        state.manager().get_chat_preprocessor_with_parsing(&model)?;
+    let unified: UnifiedRequest = request.try_into().ok()?;
+    let mut chat_request = unified.into_inner();
+    normalize_chat_reasoning_template_args(&mut chat_request).ok()?;
+    if crate::protocols::openai::chat_completions::is_kimi_k3_reasoning_parser(
+        parsing_options.reasoning_parser.as_deref(),
+    ) {
+        chat_request.coerce_kimi_k3_reasoning_effort();
+    }
+    match preprocessor.count_chat_prompt_tokens(chat_request).await {
+        Ok(tokens) => Some(tokens),
+        Err(e) => {
+            tracing::warn!(model, error = %e, "responses input_tokens: rendering failed; returning the estimate");
+            None
+        }
+    }
 }
 
 /// OpenAI Responses Request Handler
@@ -3705,6 +3744,8 @@ async fn responses(
         service_tier: request.inner.service_tier,
         include: request.inner.include.clone(),
         truncation: request.inner.truncation,
+        top_logprobs: request.inner.top_logprobs,
+        max_tool_calls: request.inner.max_tool_calls,
         // Upstream `CreateResponse` doesn't carry these yet; plumbed through so
         // the response serializer can default to 0.0 without hardcoding at the
         // build site. When upstream (or our shadow) adds the fields, sourcing
@@ -4060,11 +4101,9 @@ pub fn validate_response_unsupported_fields(
     // `prompt_cache_key` on every request — and the OpenResponses spec
     // includes them on the response body, so echoing the caller's value
     // makes receipt observable without needing a real backend.
-    if inner.max_tool_calls.is_some() {
-        return Some(ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string() + "`max_tool_calls` is not supported.",
-        ));
-    }
+    // `max_tool_calls` is accepted: the adapter runs no tools itself, so the
+    // limit caps the function calls returned (0 forbids tool calls) and is
+    // echoed on the response.
     None
 }
 
@@ -6777,7 +6816,6 @@ mod tests {
                     })
                 }),
             ),
-            ("max_tool_calls", Box::new(|r| r.max_tool_calls = Some(5))),
         ];
 
         for (field, set_field) in unsupported_cases {

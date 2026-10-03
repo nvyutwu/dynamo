@@ -881,6 +881,32 @@ pub fn validate_suffix(suffix: Option<&str>) -> Result<(), anyhow::Error> {
 
 const MAX_OUTPUT_TOKENS: u32 = 1_048_576;
 
+/// Environment variable that sets the deployment's maximum output length. It is
+/// advertised as `max_output_tokens` on `/v1/models` and enforced on every
+/// generation API. (The default for requests that omit `max_tokens` is the
+/// engine's, e.g. vLLM `--override-generation-config '{"max_new_tokens": N}'`.)
+pub const MAX_OUTPUT_TOKENS_ENV: &str = "DYN_MAX_OUTPUT_TOKENS";
+
+fn parse_max_output_tokens(value: Option<&str>) -> Option<u32> {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(MAX_OUTPUT_TOKENS))
+}
+
+/// The configured maximum output length (`DYN_MAX_OUTPUT_TOKENS`), if set.
+pub fn configured_max_output_tokens() -> Option<u32> {
+    static CONFIGURED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        parse_max_output_tokens(std::env::var(MAX_OUTPUT_TOKENS_ENV).ok().as_deref())
+    })
+}
+
+/// Largest accepted `max_tokens` / `max_completion_tokens` / `max_output_tokens`.
+pub fn max_output_tokens_limit() -> u32 {
+    configured_max_output_tokens().unwrap_or(MAX_OUTPUT_TOKENS)
+}
+
 /// Validates max_tokens parameter
 pub fn validate_max_tokens(max_tokens: Option<u32>) -> Result<(), anyhow::Error> {
     if let Some(tokens) = max_tokens
@@ -888,14 +914,11 @@ pub fn validate_max_tokens(max_tokens: Option<u32>) -> Result<(), anyhow::Error>
     {
         anyhow::bail!("Max tokens must be greater than 0, got {}", tokens);
     }
+    let limit = max_output_tokens_limit();
     if let Some(tokens) = max_tokens
-        && tokens > MAX_OUTPUT_TOKENS
+        && tokens > limit
     {
-        anyhow::bail!(
-            "Max tokens must not exceed {}, got {}",
-            MAX_OUTPUT_TOKENS,
-            tokens
-        );
+        anyhow::bail!("Max tokens must not exceed {}, got {}", limit, tokens);
     }
     Ok(())
 }
@@ -912,12 +935,13 @@ pub fn validate_max_completion_tokens(
             tokens
         );
     }
+    let limit = max_output_tokens_limit();
     if let Some(tokens) = max_completion_tokens
-        && tokens > MAX_OUTPUT_TOKENS
+        && tokens > limit
     {
         anyhow::bail!(
             "Max completion tokens must not exceed {}, got {}",
-            MAX_OUTPUT_TOKENS,
+            limit,
             tokens
         );
     }
@@ -1065,6 +1089,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn max_output_tokens_env_parsing() {
+        assert_eq!(parse_max_output_tokens(Some("131072")), Some(131072));
+        assert_eq!(parse_max_output_tokens(Some(" 131072 ")), Some(131072));
+        assert_eq!(parse_max_output_tokens(Some("0")), None);
+        assert_eq!(parse_max_output_tokens(Some("abc")), None);
+        assert_eq!(parse_max_output_tokens(None), None);
+        // never above the protocol ceiling
+        assert_eq!(
+            parse_max_output_tokens(Some("99999999")),
+            Some(MAX_OUTPUT_TOKENS)
+        );
+    }
 
     fn unknown_fields() -> HashMap<String, serde_json::Value> {
         HashMap::from([("experimental_field".to_string(), json!("value"))])

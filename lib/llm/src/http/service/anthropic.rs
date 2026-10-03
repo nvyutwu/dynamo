@@ -350,6 +350,18 @@ async fn handler_anthropic_messages(
             "max_tokens: must be greater than 0",
         ));
     }
+    let max_output_tokens = crate::protocols::openai::validate::max_output_tokens_limit();
+    if request.max_tokens > max_output_tokens {
+        inflight_guard.mark_error(ErrorType::Validation);
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!(
+                "max_tokens: {} > {}, which is the maximum allowed number of output tokens for {}",
+                request.max_tokens, max_output_tokens, request.model
+            ),
+        ));
+    }
     if let Err(error) = gate_anthropic_nvext(&mut request, &headers, state.nvext_enabled()) {
         inflight_guard.mark_error(ErrorType::Validation);
         return Err(anthropic_error(
