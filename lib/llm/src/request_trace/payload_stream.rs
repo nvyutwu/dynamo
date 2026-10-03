@@ -124,6 +124,18 @@ where
 
     let single_chunk_stream = async move {
         let chunks: Vec<_> = stream.collect().await;
+        // A backend error event fails aggregation. Forward the original events
+        // so the unary handler's backend-error check still sees it and answers
+        // with the backend's status (e.g. 400) — as it does with request payload
+        // tracing off. The payload record is emitted with `response = None`.
+        if chunks
+            .iter()
+            .any(|chunk| chunk.event.as_deref() == Some("error"))
+        {
+            tracing::debug!("request payload: backend error event; forwarding it unaggregated");
+            drop(tx);
+            return Box::pin(futures::stream::iter(chunks)) as PayloadStream;
+        }
         let chunks_stream = futures::stream::iter(chunks);
         let parsing_options = ParsingOptions::default();
 
@@ -597,6 +609,28 @@ mod tests {
         let function = tool_call.function.as_ref().expect("function preserved");
         assert_eq!(function.name.as_deref(), Some("get_weather"));
         assert_eq!(function.arguments.as_deref(), Some("{\"city\":\"Tokyo\"}"));
+    }
+
+    #[tokio::test]
+    async fn test_fold_forwards_backend_error_event() {
+        // A backend 4xx (e.g. vLLM "At most 8 image(s)") must reach the unary
+        // handler's error check instead of being replaced by an empty 200 body.
+        let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"BackendInvalidArgument: {"message":"At most 8 image(s) may be provided in one prompt.","code":400}"#
+                    .to_string(),
+            ]),
+            error: None,
+        };
+        let (out, future) = fold_aggregate_with_future(stream::iter(vec![error_event]));
+        let results: Vec<_> = out.collect().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event.as_deref(), Some("error"));
+        assert!(results[0].data.is_none());
+        assert!(future.await.is_none(), "payload record carries no response");
     }
 
     #[tokio::test]
