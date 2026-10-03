@@ -119,7 +119,8 @@ async fn unsupported_tool_choices_fail_before_dispatch_or_streaming() {
         for stream in [false, true] {
             for choice in [
                 json!({"type": "web_search_preview"}),
-                json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "read_file"}]}),
+                // allowed_tools naming no declared function tool
+                json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "not_declared"}]}),
             ] {
                 let body = json!({
                     "model": MODEL,
