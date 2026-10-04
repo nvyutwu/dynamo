@@ -79,7 +79,7 @@ use crate::protocols::openai::{
     },
     responses::{
         NvCreateResponse, NvResponse, ResponseParams, ResponsesConversionError,
-        chat_completion_to_response,
+        chat_completion_to_response, retain_output_text_logprobs,
     },
     videos::{NvCreateVideoRequest, NvVideosResponse},
 };
@@ -4006,13 +4006,22 @@ async fn responses(
                 })?;
 
         let mut http_queue_guard = Some(http_queue_guard);
-        let stream = stream_with_check.inspect(move |response| {
-            process_chat_response_and_observe_metrics(
-                response,
-                &mut response_collector,
-                &mut http_queue_guard,
-            );
-        });
+        let text_logprobs_only = response_params.output_logprobs_requested();
+        let stream = stream_with_check
+            .inspect(move |response| {
+                process_chat_response_and_observe_metrics(
+                    response,
+                    &mut response_collector,
+                    &mut http_queue_guard,
+                );
+            })
+            .map(move |mut response| {
+                // Reasoning and tool-call tokens must not reach the message's logprobs.
+                if text_logprobs_only && let Some(chunk) = response.data.as_mut() {
+                    retain_output_text_logprobs(chunk);
+                }
+                response
+            });
 
         let response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
