@@ -550,14 +550,15 @@ impl ResponseStreamConverter {
                 // Emit text delta
                 self.accumulated_text.push_str(content);
                 let delta_logprobs = if self.params.output_logprobs_requested() {
+                    let top_k = self.params.output_top_logprobs();
                     let tokens = choice
                         .logprobs
                         .as_ref()
                         .and_then(|l| l.content.as_deref())
                         .unwrap_or_default();
                     self.accumulated_logprobs
-                        .extend(super::chat_logprobs_to_output(tokens));
-                    super::chat_logprobs_to_delta(tokens)
+                        .extend(super::chat_logprobs_to_output(tokens, top_k));
+                    super::chat_logprobs_to_delta(tokens, top_k)
                 } else {
                     vec![]
                 };

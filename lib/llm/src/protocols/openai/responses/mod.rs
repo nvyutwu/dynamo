@@ -1309,9 +1309,11 @@ pub(crate) fn reasoning_item_parts(
     }
 }
 
-/// Chat token logprobs → Responses output-text logprobs.
+/// Chat token logprobs → Responses output-text logprobs, keeping the `top_k`
+/// most likely alternatives per token.
 pub(crate) fn chat_logprobs_to_output(
     tokens: &[dynamo_protocols::types::ChatCompletionTokenLogprob],
+    top_k: usize,
 ) -> Vec<dynamo_protocols::types::responses::LogProb> {
     use dynamo_protocols::types::responses::{LogProb, TopLogProb};
     tokens
@@ -1323,9 +1325,8 @@ pub(crate) fn chat_logprobs_to_output(
                 .unwrap_or_else(|| t.token.as_bytes().to_vec()),
             logprob: f64::from(t.logprob),
             token: t.token.clone(),
-            top_logprobs: t
-                .top_logprobs
-                .iter()
+            top_logprobs: top_alternatives(&t.top_logprobs, top_k)
+                .into_iter()
                 .map(|top| TopLogProb {
                     bytes: top
                         .bytes
@@ -1361,9 +1362,11 @@ pub(crate) fn output_logprobs_to_event(
         .collect()
 }
 
-/// Chat token logprobs → Responses `response.output_text.delta` logprobs.
+/// Chat token logprobs → Responses `response.output_text.delta` logprobs, keeping
+/// the `top_k` most likely alternatives per token.
 pub(crate) fn chat_logprobs_to_delta(
     tokens: &[dynamo_protocols::types::ChatCompletionTokenLogprob],
+    top_k: usize,
 ) -> Vec<dynamo_protocols::types::responses::ResponseLogProb> {
     use dynamo_protocols::types::responses::{ResponseLogProb, ResponseTopLobProb};
     tokens
@@ -1371,9 +1374,8 @@ pub(crate) fn chat_logprobs_to_delta(
         .map(|t| ResponseLogProb {
             logprob: f64::from(t.logprob),
             token: t.token.clone(),
-            top_logprobs: t
-                .top_logprobs
-                .iter()
+            top_logprobs: top_alternatives(&t.top_logprobs, top_k)
+                .into_iter()
                 .map(|top| ResponseTopLobProb {
                     logprob: f64::from(top.logprob),
                     token: top.token.clone(),
@@ -1381,6 +1383,38 @@ pub(crate) fn chat_logprobs_to_delta(
                 .collect(),
         })
         .collect()
+}
+
+/// The `top_k` most likely alternatives, highest first. vLLM also lists the
+/// sampled token when it falls outside the top k; Responses returns exactly k.
+fn top_alternatives(
+    top: &[dynamo_protocols::types::TopLogprobs],
+    top_k: usize,
+) -> Vec<&dynamo_protocols::types::TopLogprobs> {
+    let mut top: Vec<_> = top.iter().collect();
+    top.sort_by(|a, b| b.logprob.total_cmp(&a.logprob));
+    top.truncate(top_k);
+    top
+}
+
+/// Drop the token logprobs of a chat chunk that carries no output text.
+///
+/// Chat chunks carry logprobs for every generated token, reasoning and tool-call
+/// tokens included, while a Responses message reports logprobs for its output
+/// text only. The streaming converter reads logprobs from text deltas alone; the
+/// non-streaming path applies this before folding the chunks.
+pub(crate) fn retain_output_text_logprobs(
+    chunk: &mut super::chat_completions::NvCreateChatCompletionStreamResponse,
+) {
+    for choice in &mut chunk.inner.choices {
+        let has_text = matches!(
+            &choice.delta.content,
+            Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) if !text.is_empty()
+        );
+        if !has_text {
+            choice.logprobs = None;
+        }
+    }
 }
 
 fn convert_top_logprobs(input: Option<u8>) -> Option<u8> {
@@ -1523,6 +1557,11 @@ impl ResponseParams {
         self.include
             .as_ref()
             .is_some_and(|inc| inc.contains(&IncludeEnum::MessageOutputTextLogprobs))
+    }
+
+    /// Alternatives returned per output-text token: the requested `top_logprobs`.
+    pub(crate) fn output_top_logprobs(&self) -> usize {
+        usize::from(self.top_logprobs.unwrap_or(0))
     }
 
     /// Reasoning is returned when the client asks for it: a `reasoning.summary`,
@@ -1739,7 +1778,10 @@ pub fn chat_completion_to_response(
                 if let OutputMessageContent::OutputText(text) = content {
                     // The backend's token logprobs belong to the (single) text part.
                     if let Some(tokens) = chat_logprobs.take() {
-                        text.logprobs = Some(chat_logprobs_to_output(&tokens));
+                        text.logprobs = Some(chat_logprobs_to_output(
+                            &tokens,
+                            params.output_top_logprobs(),
+                        ));
                     } else if !keep_logprobs || text.logprobs.is_none() {
                         text.logprobs = Some(Vec::new());
                     }
@@ -4049,6 +4091,74 @@ thinking
             serde_json::json!([])
         );
         assert_eq!(json["top_logprobs"], 0);
+    }
+
+    #[test]
+    fn test_output_text_top_logprobs_capped_at_requested_k() {
+        use dynamo_protocols::types::{
+            ChatChoiceLogprobs, ChatCompletionTokenLogprob, TopLogprobs,
+        };
+        let top = |token: &str, logprob: f32| TopLogprobs {
+            token: token.into(),
+            logprob,
+            bytes: None,
+        };
+        let mut chat_resp = make_chat_resp_with_text("hi");
+        // vLLM lists the sampled token too when it falls outside the top k.
+        chat_resp.inner.choices[0].logprobs = Some(ChatChoiceLogprobs {
+            content: Some(vec![ChatCompletionTokenLogprob {
+                token: "hi".into(),
+                logprob: -3.0,
+                token_id: None,
+                bytes: None,
+                top_logprobs: vec![top("hi", -3.0), top("hey", -0.5), top("hello", -1.0)],
+            }]),
+            refusal: None,
+        });
+        let params = ResponseParams {
+            include: Some(vec![IncludeEnum::MessageOutputTextLogprobs]),
+            top_logprobs: Some(2),
+            ..Default::default()
+        };
+        let resp = chat_completion_to_response(chat_resp, &params, None).unwrap();
+        let json = serde_json::to_value(&resp).unwrap();
+        let alternatives = &json["output"][0]["content"][0]["logprobs"][0]["top_logprobs"];
+        let tokens: Vec<_> = alternatives
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["token"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokens, ["hey", "hello"]);
+    }
+
+    #[test]
+    fn test_retain_output_text_logprobs_drops_reasoning_and_tool_chunks() {
+        let lp = serde_json::json!({"content": [
+            {"token": "t", "logprob": -0.1, "bytes": null, "top_logprobs": []}
+        ]});
+        let chunk = |delta: serde_json::Value| {
+            serde_json::from_value::<
+                crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+            >(serde_json::json!({
+                "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                "choices": [{"index": 0, "delta": delta, "logprobs": lp, "finish_reason": null}]
+            }))
+            .unwrap()
+        };
+        let mut reasoning = chunk(serde_json::json!({"reasoning_content": "think"}));
+        let mut tool = chunk(
+            serde_json::json!({"tool_calls": [{"index": 0, "id": "call_0",
+            "type": "function", "function": {"name": "f", "arguments": "{}"}}]}),
+        );
+        let mut text = chunk(serde_json::json!({"content": "hello"}));
+        for chunk in [&mut reasoning, &mut tool, &mut text] {
+            retain_output_text_logprobs(chunk);
+        }
+        assert!(reasoning.inner.choices[0].logprobs.is_none());
+        assert!(tool.inner.choices[0].logprobs.is_none());
+        let kept = text.inner.choices[0].logprobs.as_ref().unwrap();
+        assert_eq!(kept.content.as_ref().unwrap().len(), 1);
     }
 
     #[test]
