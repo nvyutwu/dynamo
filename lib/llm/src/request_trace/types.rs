@@ -475,6 +475,7 @@ mod tests {
                         preferred_taint_multiplier: None,
                         decode_overlap_formula: false,
                     }],
+                    candidates_total: None,
                 }),
                 cache_loss: None,
             }),
@@ -486,6 +487,11 @@ mod tests {
         assert_eq!(
             value["request"]["routing_decision"]["selected_worker_id"],
             42
+        );
+        assert!(
+            value["request"]["routing_decision"]
+                .get("candidates_total")
+                .is_none()
         );
         assert_eq!(
             value["request"]["routing_decision"]["candidates"][0]["effective_overlap_blocks"],

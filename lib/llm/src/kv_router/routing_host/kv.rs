@@ -13,9 +13,110 @@ use crate::protocols::common::timing::{
     RoutingDecisionCandidate, RoutingDecisionParameter, RoutingDecisionTrace,
 };
 
+/// Caps `routing_decision.candidates` in request traces; unset or 0 keeps every eligible worker.
+const DECISION_TRACE_MAX_CANDIDATES_ENV: &str = "DYN_ROUTER_DECISION_TRACE_MAX_CANDIDATES";
+
+fn decision_trace_max_candidates() -> usize {
+    static MAX: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| match std::env::var(DECISION_TRACE_MAX_CANDIDATES_ENV) {
+            Err(_) => 0,
+            Ok(value) => value.trim().parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    %value,
+                    env = DECISION_TRACE_MAX_CANDIDATES_ENV,
+                    "Ignoring invalid decision-trace candidate cap; expected a non-negative integer"
+                );
+                0
+            }),
+        });
+    *MAX
+}
+
+/// Keeps the candidates needed to explain one decision: the selected and max-overlap workers
+/// (always, even beyond `max`), then the least-loaded worker, then the highest effective overlap,
+/// up to `max` rows. Input order is preserved. The second value is the uncapped count, `None`
+/// when nothing was dropped.
+fn cap_decision_candidates(
+    candidates: Vec<RoutingDecisionCandidate>,
+    max: usize,
+) -> (Vec<RoutingDecisionCandidate>, Option<u64>) {
+    if max == 0 || candidates.len() <= max {
+        return (candidates, None);
+    }
+    let total = candidates.len() as u64;
+    let load = |c: &RoutingDecisionCandidate| {
+        (
+            c.active_prefill_tokens,
+            c.active_requests,
+            c.worker_id,
+            c.dp_rank,
+        )
+    };
+    let mut keep: Vec<bool> = candidates
+        .iter()
+        .map(|c| c.selected || c.max_overlap)
+        .collect();
+    let mut kept = keep.iter().filter(|k| **k).count();
+    let mut by_overlap: Vec<usize> = (0..candidates.len()).collect();
+    by_overlap.sort_by(|&a, &b| {
+        candidates[b]
+            .effective_overlap_blocks
+            .total_cmp(&candidates[a].effective_overlap_blocks)
+            .then_with(|| load(&candidates[a]).cmp(&load(&candidates[b])))
+    });
+    let least_loaded = (0..candidates.len()).min_by_key(|&i| load(&candidates[i]));
+    for i in least_loaded.into_iter().chain(by_overlap) {
+        if kept >= max {
+            break;
+        }
+        if !keep[i] {
+            keep[i] = true;
+            kept += 1;
+        }
+    }
+    let capped = candidates
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(candidate, keep)| keep.then_some(candidate))
+        .collect();
+    (capped, Some(total))
+}
+
 fn request_trace_routing_decision(
     trace: dynamo_kv_router::protocols::RoutingDecisionTrace,
 ) -> RoutingDecisionTrace {
+    let candidates = trace
+        .candidates
+        .into_iter()
+        .map(|candidate| RoutingDecisionCandidate {
+            worker_id: candidate.worker_id,
+            dp_rank: candidate.dp_rank,
+            eligible: candidate.eligible,
+            selected: candidate.selected,
+            max_overlap: candidate.max_overlap,
+            total_cost_blocks: candidate.total_cost_blocks,
+            effective_overlap_blocks: candidate.effective_overlap_blocks,
+            device_overlap_blocks: candidate.device_overlap_blocks,
+            host_overlap_blocks: candidate.host_overlap_blocks,
+            disk_overlap_blocks: candidate.disk_overlap_blocks,
+            shared_beyond_device_blocks: candidate.shared_beyond_device_blocks,
+            raw_prefill_blocks: candidate.raw_prefill_blocks,
+            active_prefill_tokens: candidate.active_prefill_tokens,
+            prefill_cost_blocks: candidate.prefill_cost_blocks,
+            decode_cost_blocks: candidate.decode_cost_blocks,
+            active_requests: candidate.active_requests,
+            active_request_cost_blocks: candidate.active_request_cost_blocks,
+            overlap_credit_blocks: candidate.overlap_credit_blocks,
+            overlap_credit_decay: candidate.overlap_credit_decay,
+            effective_overlap_score_credit: candidate.effective_overlap_score_credit,
+            adjusted_prefill_blocks: candidate.adjusted_prefill_blocks,
+            base_score_blocks: candidate.base_score_blocks,
+            preferred_taint_multiplier: candidate.preferred_taint_multiplier,
+            decode_overlap_formula: candidate.decode_overlap_formula,
+        })
+        .collect();
+    let (candidates, candidates_total) =
+        cap_decision_candidates(candidates, decision_trace_max_candidates());
     RoutingDecisionTrace {
         schema: trace.schema,
         worker_type: trace.worker_type,
@@ -46,36 +147,8 @@ fn request_trace_routing_decision(
                 value: parameter.value,
             })
             .collect(),
-        candidates: trace
-            .candidates
-            .into_iter()
-            .map(|candidate| RoutingDecisionCandidate {
-                worker_id: candidate.worker_id,
-                dp_rank: candidate.dp_rank,
-                eligible: candidate.eligible,
-                selected: candidate.selected,
-                max_overlap: candidate.max_overlap,
-                total_cost_blocks: candidate.total_cost_blocks,
-                effective_overlap_blocks: candidate.effective_overlap_blocks,
-                device_overlap_blocks: candidate.device_overlap_blocks,
-                host_overlap_blocks: candidate.host_overlap_blocks,
-                disk_overlap_blocks: candidate.disk_overlap_blocks,
-                shared_beyond_device_blocks: candidate.shared_beyond_device_blocks,
-                raw_prefill_blocks: candidate.raw_prefill_blocks,
-                active_prefill_tokens: candidate.active_prefill_tokens,
-                prefill_cost_blocks: candidate.prefill_cost_blocks,
-                decode_cost_blocks: candidate.decode_cost_blocks,
-                active_requests: candidate.active_requests,
-                active_request_cost_blocks: candidate.active_request_cost_blocks,
-                overlap_credit_blocks: candidate.overlap_credit_blocks,
-                overlap_credit_decay: candidate.overlap_credit_decay,
-                effective_overlap_score_credit: candidate.effective_overlap_score_credit,
-                adjusted_prefill_blocks: candidate.adjusted_prefill_blocks,
-                base_score_blocks: candidate.base_score_blocks,
-                preferred_taint_multiplier: candidate.preferred_taint_multiplier,
-                decode_overlap_formula: candidate.decode_overlap_formula,
-            })
-            .collect(),
+        candidates,
+        candidates_total,
     }
 }
 
@@ -747,5 +820,171 @@ where
             metadata,
             operation.into_stream(selected_target, stream, self.session_affinity_mode)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        worker_id: u64,
+        effective_overlap_blocks: f64,
+        active_prefill_tokens: usize,
+        active_requests: usize,
+    ) -> RoutingDecisionCandidate {
+        RoutingDecisionCandidate {
+            worker_id,
+            dp_rank: 0,
+            eligible: true,
+            selected: false,
+            max_overlap: false,
+            total_cost_blocks: 0.0,
+            effective_overlap_blocks,
+            device_overlap_blocks: effective_overlap_blocks,
+            host_overlap_blocks: 0.0,
+            disk_overlap_blocks: 0.0,
+            shared_beyond_device_blocks: 0,
+            raw_prefill_blocks: 0.0,
+            active_prefill_tokens,
+            prefill_cost_blocks: 0.0,
+            decode_cost_blocks: 0.0,
+            active_requests,
+            active_request_cost_blocks: 0.0,
+            overlap_credit_blocks: 0.0,
+            overlap_credit_decay: 1.0,
+            effective_overlap_score_credit: 1.0,
+            adjusted_prefill_blocks: 0.0,
+            base_score_blocks: 0.0,
+            preferred_taint_multiplier: None,
+            decode_overlap_formula: false,
+        }
+    }
+
+    /// Ten workers: 2 holds the longest prefix, 7 was selected, 5 is the least loaded,
+    /// and 4 and 8 tie for the next-longest prefix (8 is less loaded).
+    fn ten_candidates() -> Vec<RoutingDecisionCandidate> {
+        let mut candidates = vec![
+            candidate(0, 1.0, 900, 3),
+            candidate(1, 0.0, 800, 3),
+            candidate(2, 9.0, 5000, 6),
+            candidate(3, 3.0, 700, 2),
+            candidate(4, 8.0, 600, 4),
+            candidate(5, 1.0, 0, 0),
+            candidate(6, 2.0, 400, 1),
+            candidate(7, 2.0, 100, 1),
+            candidate(8, 8.0, 300, 2),
+            candidate(9, 0.0, 200, 1),
+        ];
+        candidates[2].max_overlap = true;
+        candidates[7].selected = true;
+        candidates
+    }
+
+    fn worker_ids(candidates: &[RoutingDecisionCandidate]) -> Vec<u64> {
+        candidates.iter().map(|c| c.worker_id).collect()
+    }
+
+    fn trace(
+        candidates: Vec<RoutingDecisionCandidate>,
+        candidates_total: Option<u64>,
+    ) -> RoutingDecisionTrace {
+        RoutingDecisionTrace {
+            schema: "dynamo.router.decision.v1".to_string(),
+            worker_type: "aggregated".to_string(),
+            policy: "default".to_string(),
+            selection_reason: "minimum_cost".to_string(),
+            candidate_scope: "eligible_workers_only".to_string(),
+            block_size: 256,
+            request_blocks: 10,
+            track_prefill_tokens: true,
+            selected_worker_id: 7,
+            selected_dp_rank: 0,
+            max_overlap_worker_id: 2,
+            max_overlap_dp_rank: 0,
+            avoidable_prefill_token_equivalents: 0.0,
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 1.0,
+            prefill_load_scale: 1.0,
+            host_cache_hit_weight: 0.0,
+            disk_cache_hit_weight: 0.0,
+            shared_cache_multiplier: 0.0,
+            decode_active_request_weight: 0.0,
+            router_temperature: 0.0,
+            policy_parameters: Vec::new(),
+            candidates,
+            candidates_total,
+        }
+    }
+
+    #[test]
+    fn cap_decision_candidates_keeps_all_without_cap_or_when_within_cap() {
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 0);
+        assert_eq!(worker_ids(&kept), (0..10).collect::<Vec<u64>>());
+        assert_eq!(total, None);
+
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 10);
+        assert_eq!(kept.len(), 10);
+        assert_eq!(total, None);
+
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 64);
+        assert_eq!(kept.len(), 10);
+        assert_eq!(total, None);
+    }
+
+    #[test]
+    fn cap_decision_candidates_keeps_decision_rows_in_input_order() {
+        // Selected (7) and max-overlap (2) first, then the least-loaded worker (5).
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 3);
+        assert_eq!(worker_ids(&kept), vec![2, 5, 7]);
+        assert_eq!(total, Some(10));
+        assert!(kept.iter().any(|c| c.selected && c.worker_id == 7));
+        assert!(kept.iter().any(|c| c.max_overlap && c.worker_id == 2));
+
+        // Then the longest remaining prefix; the 4/8 tie goes to the less-loaded worker 8.
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 4);
+        assert_eq!(worker_ids(&kept), vec![2, 5, 7, 8]);
+        assert_eq!(total, Some(10));
+
+        let (kept, _) = cap_decision_candidates(ten_candidates(), 5);
+        assert_eq!(worker_ids(&kept), vec![2, 4, 5, 7, 8]);
+    }
+
+    #[test]
+    fn cap_decision_candidates_fills_by_overlap_when_selected_is_least_loaded() {
+        let mut candidates = ten_candidates();
+        candidates[5].active_prefill_tokens = 1000;
+        // Worker 7 (selected, 100 prefill tokens) is now the least loaded; the third row
+        // comes from the overlap ranking instead.
+        let (kept, total) = cap_decision_candidates(candidates, 3);
+        assert_eq!(worker_ids(&kept), vec![2, 7, 8]);
+        assert_eq!(total, Some(10));
+    }
+
+    #[test]
+    fn cap_decision_candidates_keeps_must_keep_rows_beyond_cap() {
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 1);
+        assert_eq!(worker_ids(&kept), vec![2, 7]);
+        assert_eq!(total, Some(10));
+
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 2);
+        assert_eq!(worker_ids(&kept), vec![2, 7]);
+        assert_eq!(total, Some(10));
+    }
+
+    #[test]
+    fn routing_decision_json_reports_candidates_total_only_when_capped() {
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 0);
+        let value = serde_json::to_value(trace(kept, total)).unwrap();
+        assert!(value.get("candidates_total").is_none());
+        assert_eq!(value["candidates"].as_array().unwrap().len(), 10);
+
+        let (kept, total) = cap_decision_candidates(ten_candidates(), 3);
+        let value = serde_json::to_value(trace(kept, total)).unwrap();
+        assert_eq!(value["candidates_total"], 10);
+        assert_eq!(value["candidates"].as_array().unwrap().len(), 3);
+
+        let round_trip: RoutingDecisionTrace = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.candidates_total, Some(10));
     }
 }
