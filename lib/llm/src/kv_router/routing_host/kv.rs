@@ -74,6 +74,9 @@ fn cap_decision_candidates(
             kept += 1;
         }
     }
+    if kept == candidates.len() {
+        return (candidates, None);
+    }
     let capped = candidates
         .into_iter()
         .zip(keep)
@@ -970,6 +973,23 @@ mod tests {
         let (kept, total) = cap_decision_candidates(ten_candidates(), 2);
         assert_eq!(worker_ids(&kept), vec![2, 7]);
         assert_eq!(total, Some(10));
+
+        // Two workers, one selected and the other holding the longest prefix: a cap of 1
+        // drops nothing, so the list is complete and carries no total.
+        let mut two = vec![candidate(0, 4.0, 900, 2), candidate(1, 0.0, 0, 0)];
+        two[0].max_overlap = true;
+        two[1].selected = true;
+        let (kept, total) = cap_decision_candidates(two, 1);
+        assert_eq!(worker_ids(&kept), vec![0, 1]);
+        assert_eq!(total, None);
+
+        // Same worker selected and max-overlap: a cap of 1 keeps that row only.
+        let mut two = vec![candidate(0, 4.0, 900, 2), candidate(1, 0.0, 0, 0)];
+        two[0].max_overlap = true;
+        two[0].selected = true;
+        let (kept, total) = cap_decision_candidates(two, 1);
+        assert_eq!(worker_ids(&kept), vec![0]);
+        assert_eq!(total, Some(2));
     }
 
     #[test]
