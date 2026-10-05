@@ -60,6 +60,10 @@ pub struct RoutingDecisionTrace {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_parameters: Vec<RoutingDecisionParameter>,
     pub candidates: Vec<RoutingDecisionCandidate>,
+    /// Number of eligible candidates before `DYN_ROUTER_DECISION_TRACE_MAX_CANDIDATES` trimmed
+    /// `candidates`; absent when `candidates` is the complete list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates_total: Option<u64>,
 }
 
 /// One named numeric parameter a custom policy attached to its decision trace.
