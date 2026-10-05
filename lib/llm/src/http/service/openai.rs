@@ -4130,6 +4130,17 @@ pub fn validate_responses_fields(request: &NvCreateResponse) -> Result<(), Error
     validate::validate_temperature(request.inner.temperature).map_err(&map_err)?;
     validate::validate_top_p(request.inner.top_p).map_err(&map_err)?;
     validate::validate_max_tokens(request.inner.max_output_tokens).map_err(&map_err)?;
+    let logprobs_requested_by = if request.inner.include.as_ref().is_some_and(|include| {
+        include
+            .contains(&dynamo_protocols::types::responses::IncludeEnum::MessageOutputTextLogprobs)
+    }) {
+        Some("include: message.output_text.logprobs")
+    } else if request.inner.top_logprobs.is_some_and(|k| k > 0) {
+        Some("top_logprobs")
+    } else {
+        None
+    };
+    validate::validate_kimi_k3_no_logprobs(logprobs_requested_by).map_err(&map_err)?;
 
     if let Some(text) = &request.inner.text {
         use crate::protocols::openai::responses::convert_text_format;

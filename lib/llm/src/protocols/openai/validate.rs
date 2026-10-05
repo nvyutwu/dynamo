@@ -139,6 +139,15 @@ static KIMI_K3_LENIENT_TOOL_ARGS: LazyLock<bool> =
 static KIMI_K3_IMMUTABLE_PARAMS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_IMMUTABLE_PARAMS"));
 
+/// True when this frontend serves Kimi K3 and should reject requests for token
+/// logprobs with HTTP 400. K3 logprobs do not line up with the returned text:
+/// they include reasoning and template tokens, and multi-token speculative
+/// steps (DSpark) repeat a window. The K3 reference providers (Moonshot,
+/// Baseten) do not offer logprobs either. Set on the K3 deployment only; unset
+/// leaves every other model unchanged.
+static KIMI_K3_DISABLE_LOGPROBS: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_DISABLE_LOGPROBS"));
+
 /// Validates that no unsupported fields are present in the request.
 ///
 /// Fields in `PASSTHROUGH_EXTRA_FIELDS` are validated by downstream handlers.
@@ -1013,6 +1022,25 @@ pub fn validate_chat_only_generation_flags(
     Ok(())
 }
 
+/// Reject a request for token logprobs when `DYN_KIMI_K3_DISABLE_LOGPROBS` is
+/// truthy. See [`KIMI_K3_DISABLE_LOGPROBS`]. `requested_by` names the field that
+/// asked for them; `None` when the request did not (`false`, `0` or absent).
+pub fn validate_kimi_k3_no_logprobs(requested_by: Option<&str>) -> Result<(), anyhow::Error> {
+    validate_kimi_k3_no_logprobs_with_gate(requested_by, *KIMI_K3_DISABLE_LOGPROBS)
+}
+
+fn validate_kimi_k3_no_logprobs_with_gate(
+    requested_by: Option<&str>,
+    enforce: bool,
+) -> Result<(), anyhow::Error> {
+    if enforce && let Some(field) = requested_by {
+        anyhow::bail!(
+            "`{field}` is not supported for this model: token logprobs are not available"
+        );
+    }
+    Ok(())
+}
+
 /// Enforce Moonshot's immutable sampling-parameter contract for Kimi K3 when
 /// `DYN_KIMI_K3_IMMUTABLE_PARAMS` is truthy. See [`KIMI_K3_IMMUTABLE_PARAMS`].
 pub fn validate_kimi_k3_immutable_params(
@@ -1102,6 +1130,19 @@ mod tests {
             parse_max_output_tokens(Some("99999999")),
             Some(MAX_OUTPUT_TOKENS)
         );
+    }
+
+    #[test]
+    fn kimi_k3_no_logprobs_gate() {
+        let err = validate_kimi_k3_no_logprobs_with_gate(Some("top_logprobs"), true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`top_logprobs` is not supported for this model"),
+            "{err}"
+        );
+        // not requested, or the gate is off
+        assert!(validate_kimi_k3_no_logprobs_with_gate(None, true).is_ok());
+        assert!(validate_kimi_k3_no_logprobs_with_gate(Some("logprobs"), false).is_ok());
     }
 
     fn unknown_fields() -> HashMap<String, serde_json::Value> {

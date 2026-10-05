@@ -471,6 +471,7 @@ impl ValidateRequest for NvCreateCompletionRequest {
         // none for stream
         // none for stream_options
         validate::validate_logprobs(self.inner.logprobs)?;
+        validate::validate_kimi_k3_no_logprobs(self.inner.logprobs.map(|_| "logprobs"))?;
         // none for echo
         validate::validate_stop(&self.inner.stop)?;
         validate::validate_presence_penalty(self.inner.presence_penalty)?;

@@ -801,8 +801,14 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for metadata
         validate::validate_frequency_penalty(self.inner.frequency_penalty)?;
         validate::validate_logit_bias(&self.inner.logit_bias)?;
-        // none for logprobs
         validate::validate_top_logprobs(self.inner.top_logprobs)?;
+        validate::validate_kimi_k3_no_logprobs(if self.inner.logprobs == Some(true) {
+            Some("logprobs")
+        } else if self.inner.top_logprobs.is_some_and(|k| k > 0) {
+            Some("top_logprobs")
+        } else {
+            None
+        })?;
         // `max_tokens` is deprecated but still accepted as a fallback for
         // `max_completion_tokens`, so it must be validated too.
         #[allow(deprecated)]
