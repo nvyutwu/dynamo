@@ -2100,6 +2100,7 @@ version = "1.5.0"
 dependencies = [
  "dynamo-kv-router",
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -2245,6 +2246,7 @@ dependencies = [
  "rayon",
  "reqwest 0.12.28",
  "rmp-serde",
+ "rustc-hash 2.1.2",
  "rustls",
  "serde",
  "serde_json",
@@ -2323,8 +2325,6 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "9.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e316d4d0f5082257f1629ca61973eafc17cee3e6ee0c24f7a55a61beeff40d97"
 dependencies = [
  "aho-corasick",
  "anyhow",
