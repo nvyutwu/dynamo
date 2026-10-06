@@ -100,15 +100,21 @@ experimental router exactly. Add any subset to tune it:
         balance_rel_threshold: 1.1
 ```
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `cache_threshold` | `0.5` | Fraction of the request's blocks that must be device-resident on the best worker before the cache tier applies. Compared strictly. Must be in `[0.0, 1.0]`. |
-| `balance_abs_threshold` | `32` | Minimum active-request spread before the load tier applies. |
-| `balance_rel_threshold` | `1.1` | Minimum ratio of largest to smallest active-request count before the load tier applies. Must be at least `1.0`. |
+| Parameter | Environment override | Default | Meaning |
+|---|---|---|---|
+| `cache_threshold` | `DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD` | `0.5` | Fraction of the request's blocks that must be cached on the best worker before the cache tier applies. Compared strictly unless `cache_threshold_inclusive` is set. Must be in `[0.0, 1.0]`. |
+| `cache_threshold_inclusive` | `DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD_INCLUSIVE` | `false` | Compare with `>=` instead of `>`. The variable accepts `1`/`0`, `true`/`false`, `yes`/`no` or `on`/`off`. |
+| `balance_abs_threshold` | `DYN_ROUTER_TWO_TIER_BALANCE_ABS_THRESHOLD` | `32` | Minimum active-request spread before the load tier applies. |
+| `balance_rel_threshold` | `DYN_ROUTER_TWO_TIER_BALANCE_REL_THRESHOLD` | `1.1` | Minimum ratio of largest to smallest active-request count before the load tier applies. Must be at least `1.0`. |
+| `host_cache_weight` | `DYN_ROUTER_TWO_TIER_HOST_CACHE_WEIGHT` | `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` | Weight of host-pinned (CPU offload) overlap blocks in the cache ratio. Must be at least `0.0`. |
 
-Both load gates must hold before the load tier displaces the cache tier. Parameters are validated at
-startup, so an out-of-range value or an unknown key fails the process immediately, naming the key,
-rather than being silently ignored. It selects the least-loaded worker once the active-request spread is greater than 32 and the
+Both load gates must hold before the load tier displaces the cache tier. An environment override
+wins over the instance's `parameters` and the default, and applies to every instance of this policy;
+use it when the policy YAML is baked into an image. Unset or blank variables are ignored. Parameters
+and overrides are validated at startup, so an out-of-range or unparsable value or an unknown key
+fails the process immediately, naming the key or variable, rather than being silently ignored. The
+startup line `Two-tier worker-selection policy enabled` reports the values in force and
+`env_overrides`, the variables that were applied. It selects the least-loaded worker once the active-request spread is greater than 32 and the
 largest count is more than 1.1 times the smallest; otherwise it prefers the worker holding the
 largest device-KV overlap when that overlap covers more than 50% of the request's blocks.
 
