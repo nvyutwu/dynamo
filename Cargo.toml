@@ -42,6 +42,8 @@ members = [
     "deploy/inference-gateway/ext-proc",
     "deploy/inference-gateway/sidecar",
 ]
+# Vendored crates.io sources used only through [patch.crates-io] below.
+exclude = ["lib/vendored"]
 resolver = "3"
 
 [workspace.package]
@@ -199,6 +201,12 @@ sha2 = { version = "0.10" }
 tokio-rustls = { version = "0.26" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2" }
+
+# dynamo-parsers 9.0.0 exactly as published on crates.io plus the Kimi K3 unique tool-call ID
+# fix (ai-dynamo/frontend-crates#353). See lib/vendored/dynamo-parsers-9.0.0/VENDORED.md.
+# Keep in lockstep with lib/bindings/python/Cargo.toml.
+[patch.crates-io]
+dynamo-parsers = { path = "lib/vendored/dynamo-parsers-9.0.0" }
 
 [profile.dev.package]
 insta.opt-level = 3

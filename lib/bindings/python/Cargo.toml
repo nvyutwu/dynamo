@@ -134,6 +134,10 @@ dynamo-llm = { path = "../../llm", default-features = false }
 opentelemetry_sdk = { version = "0.31.0", features = ["trace"] }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
+# Same patch as the workspace root Cargo.toml (this crate is its own workspace).
+[patch.crates-io]
+dynamo-parsers = { path = "../../vendored/dynamo-parsers-9.0.0" }
+
 [profile.profiling]
 inherits = "release"
 debug = true
