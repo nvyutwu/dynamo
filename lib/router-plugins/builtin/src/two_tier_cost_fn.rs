@@ -31,7 +31,9 @@
 //! already applies to the same quantity — so the two tiers agree on what a CPU hit is worth unless
 //! an instance deliberately overrides it. Set the weight to 0.0 to restore device-only ranking.
 //!
-//! Every tunable also has a `DYN_ROUTER_TWO_TIER_*` environment override (see [`ENV_OVERRIDES`]).
+//! Every tunable also has an environment override, named `DYN_ROUTER_TWO_TIER_` plus the field name in
+//! upper case (`DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD`, `..._CACHE_THRESHOLD_INCLUSIVE`,
+//! `..._BALANCE_ABS_THRESHOLD`, `..._BALANCE_REL_THRESHOLD`, `..._HOST_CACHE_WEIGHT`).
 //! An override wins over the instance's `parameters` and the default, applies to every instance of
 //! this policy, and is validated the same way. It exists because deployments bake the policy YAML
 //! into the image, so the environment is the only knob that can change without a rebuild.
@@ -67,15 +69,6 @@ const ENV_CACHE_THRESHOLD_INCLUSIVE: &str = "DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD
 const ENV_BALANCE_ABS_THRESHOLD: &str = "DYN_ROUTER_TWO_TIER_BALANCE_ABS_THRESHOLD";
 const ENV_BALANCE_REL_THRESHOLD: &str = "DYN_ROUTER_TWO_TIER_BALANCE_REL_THRESHOLD";
 const ENV_HOST_CACHE_WEIGHT: &str = "DYN_ROUTER_TWO_TIER_HOST_CACHE_WEIGHT";
-
-/// Environment overrides, one per [`Parameters`] field, in field order.
-pub const ENV_OVERRIDES: [&str; 5] = [
-    ENV_CACHE_THRESHOLD,
-    ENV_CACHE_THRESHOLD_INCLUSIVE,
-    ENV_BALANCE_ABS_THRESHOLD,
-    ENV_BALANCE_REL_THRESHOLD,
-    ENV_HOST_CACHE_WEIGHT,
-];
 
 /// Tunables for [`POLICY_TYPE`], named after their `sgl-router` counterparts.
 ///
@@ -720,7 +713,16 @@ mod tests {
                 (ENV_HOST_CACHE_WEIGHT, "1.0"),
             ]))
             .unwrap();
-        assert_eq!(applied, ENV_OVERRIDES.to_vec());
+        assert_eq!(
+            applied,
+            [
+                ENV_CACHE_THRESHOLD,
+                ENV_CACHE_THRESHOLD_INCLUSIVE,
+                ENV_BALANCE_ABS_THRESHOLD,
+                ENV_BALANCE_REL_THRESHOLD,
+                ENV_HOST_CACHE_WEIGHT,
+            ]
+        );
         assert_eq!(parameters.cache_threshold, 0.4);
         assert!(parameters.cache_threshold_inclusive);
         assert_eq!(parameters.balance_abs_threshold, 16);
