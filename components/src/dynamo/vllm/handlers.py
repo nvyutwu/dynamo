@@ -3226,19 +3226,33 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             return {"complete": False, "reason": "negative_cache_count"}
         if external_used > external_hits:
             return {"complete": False, "reason": "external_used_exceeds_hits"}
-        return {
+        reused = local_hits + external_used
+        found = BaseWorkerHandler._found_by_cache_group(
+            request_output, local_hits, reused
+        )
+        # With per-group hits, F4 is the prefix the full-attention groups found
+        # before a hybrid model reconciles it with recurrent state, split into the
+        # part on GPU and the part only the CPU tier holds.
+        if found is None:
+            worker_found = local_hits + external_lookups
+            gpu_found, cpu_found = local_hits, external_hits
+        else:
+            worker_found = found["full_attention"]
+            gpu_found = found["local_full_attention"]
+            cpu_found = worker_found - gpu_found
+        report: Dict[str, Any] = {
             "complete": True,
             "prompt_tokens": len(prompt_tokens),
             "gpu_hit_tokens": local_hits,
             "cpu_hit_tokens": external_used,
             "cpu_lookup_tokens": external_lookups,
-            "worker_lookup_tokens": local_hits + external_lookups,
-            "worker_used_tokens": local_hits + external_used,
+            "worker_lookup_tokens": worker_found,
+            "worker_used_tokens": reused,
             "tiers": [
                 {
                     "tier": "gpu",
                     "events": [
-                        {"event": "found", "tokens": local_hits, "accuracy": "exact"},
+                        {"event": "found", "tokens": gpu_found, "accuracy": "exact"},
                         {"event": "used", "tokens": local_hits, "accuracy": "exact"},
                     ],
                 },
@@ -3252,7 +3266,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         },
                         {
                             "event": "found",
-                            "tokens": external_hits,
+                            "tokens": cpu_found,
                             "accuracy": "exact",
                         },
                         {"event": "used", "tokens": external_used, "accuracy": "exact"},
@@ -3260,6 +3274,34 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 },
             ],
         }
+        if found is not None:
+            report["found_by_cache_group"] = found
+        return report
+
+    @staticmethod
+    def _found_by_cache_group(
+        request_output: RequestOutput, local_hits: int, reused: int
+    ) -> Optional[Dict[str, int]]:
+        """Prefix the full-attention groups found (any tier, and GPU only) and the
+        deepest recurrent state found, before a hybrid model reconciles them into
+        the reused prefix; None when the engine does not report them."""
+        full_attention = getattr(request_output, "num_full_attention_hit_tokens", None)
+        local_full_attention = getattr(
+            request_output, "num_local_full_attention_hit_tokens", None
+        )
+        if not isinstance(full_attention, int) or not isinstance(
+            local_full_attention, int
+        ):
+            return None
+        local_full_attention = max(local_full_attention, local_hits)
+        found = {
+            "full_attention": max(full_attention, local_full_attention, reused),
+            "local_full_attention": local_full_attention,
+        }
+        recurrent_state = getattr(request_output, "num_mamba_state_hit_tokens", None)
+        if isinstance(recurrent_state, int):
+            found["recurrent_state"] = max(recurrent_state, reused)
+        return found
 
     @staticmethod
     def _extract_logprobs(
