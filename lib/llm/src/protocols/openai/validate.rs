@@ -1041,6 +1041,133 @@ fn validate_kimi_k3_no_logprobs_with_gate(
     Ok(())
 }
 
+/// Environment variable listing the media kinds a deployment rejects with HTTP 400
+/// (comma-separated, any of `image`, `video`, `audio`). Kimi K3 serves text and
+/// images only. A video or audio part would otherwise reach a worker, which fetches
+/// and decodes it before vLLM's per-prompt limit check: the client gets a 500, and a
+/// malformed H.264 stream can crash the worker process. Unset accepts every kind.
+pub const REJECT_MEDIA_INPUTS_ENV: &str = "DYN_REJECT_MEDIA_INPUTS";
+
+/// Media kinds a deployment turns away; see [`REJECT_MEDIA_INPUTS_ENV`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RejectedMediaInputs {
+    pub image: bool,
+    pub video: bool,
+    pub audio: bool,
+}
+
+impl RejectedMediaInputs {
+    fn parse(value: Option<&str>) -> Self {
+        let mut rejected = Self::default();
+        for kind in value.unwrap_or_default().split(',').map(str::trim) {
+            match kind.to_ascii_lowercase().as_str() {
+                "" => {}
+                "image" => rejected.image = true,
+                "video" => rejected.video = true,
+                "audio" => rejected.audio = true,
+                other => tracing::warn!(
+                    "ignoring {other:?} in {REJECT_MEDIA_INPUTS_ENV}; expected image, video or audio"
+                ),
+            }
+        }
+        rejected
+    }
+
+    fn rejects(&self, kind: &str) -> bool {
+        match kind {
+            "image" => self.image,
+            "video" => self.video,
+            "audio" => self.audio,
+            _ => false,
+        }
+    }
+}
+
+static REJECTED_MEDIA_INPUTS: LazyLock<RejectedMediaInputs> = LazyLock::new(|| {
+    RejectedMediaInputs::parse(std::env::var(REJECT_MEDIA_INPUTS_ENV).ok().as_deref())
+});
+
+/// `(kind, content part type)` of a user content part that carries media.
+fn user_media_part(
+    part: &dynamo_protocols::types::ChatCompletionRequestUserMessageContentPart,
+) -> Option<(&'static str, &'static str)> {
+    use dynamo_protocols::types::ChatCompletionRequestUserMessageContentPart as Part;
+    match part {
+        Part::Text(_) => None,
+        Part::ImageUrl(_) => Some(("image", "image_url")),
+        Part::VideoUrl(_) => Some(("video", "video_url")),
+        Part::AudioUrl(_) => Some(("audio", "audio_url")),
+        Part::InputAudio(_) => Some(("audio", "input_audio")),
+    }
+}
+
+/// `(kind, content part type)` of a tool content part that carries media.
+fn tool_media_part(
+    part: &dynamo_protocols::types::ChatCompletionRequestToolMessageContentPart,
+) -> Option<(&'static str, &'static str)> {
+    use dynamo_protocols::types::ChatCompletionRequestToolMessageContentPart as Part;
+    match part {
+        Part::Text(_) => None,
+        Part::ImageUrl(_) => Some(("image", "image_url")),
+        Part::VideoUrl(_) => Some(("video", "video_url")),
+        Part::AudioUrl(_) => Some(("audio", "audio_url")),
+    }
+}
+
+/// Reject media input (and audio output) the deployment does not serve, before the
+/// request is routed to a worker. See [`REJECT_MEDIA_INPUTS_ENV`].
+pub fn validate_media_inputs(
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
+    audio_output_requested: bool,
+) -> Result<(), anyhow::Error> {
+    validate_media_inputs_with(messages, audio_output_requested, *REJECTED_MEDIA_INPUTS)
+}
+
+/// Inner form of [`validate_media_inputs`] with the rejected kinds passed explicitly
+/// so tests do not depend on the process-global `LazyLock`.
+fn validate_media_inputs_with(
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
+    audio_output_requested: bool,
+    rejected: RejectedMediaInputs,
+) -> Result<(), anyhow::Error> {
+    use dynamo_protocols::types::{
+        ChatCompletionRequestMessage as Message, ChatCompletionRequestToolMessageContent as Tool,
+        ChatCompletionRequestUserMessageContent as User,
+    };
+    if rejected == RejectedMediaInputs::default() {
+        return Ok(());
+    }
+    if rejected.audio && audio_output_requested {
+        anyhow::bail!("audio output is not supported for this model");
+    }
+    for (index, message) in messages.iter().enumerate() {
+        let media = match message {
+            Message::User(user) => match &user.content {
+                User::Array(parts) => parts
+                    .iter()
+                    .filter_map(user_media_part)
+                    .find(|(kind, _)| rejected.rejects(kind)),
+                User::Text(_) => None,
+            },
+            Message::Tool(tool) => match &tool.content {
+                Tool::Array(parts) => parts
+                    .iter()
+                    .filter_map(tool_media_part)
+                    .find(|(kind, _)| rejected.rejects(kind)),
+                Tool::Text(_) => None,
+            },
+            _ => None,
+        };
+        if let Some((kind, part)) = media {
+            anyhow::bail!(
+                "{kind} input is not supported for this model: remove the `{part}` content part \
+                 from messages[{index}]"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Enforce Moonshot's immutable sampling-parameter contract for Kimi K3 when
 /// `DYN_KIMI_K3_IMMUTABLE_PARAMS` is truthy. See [`KIMI_K3_IMMUTABLE_PARAMS`].
 pub fn validate_kimi_k3_immutable_params(
@@ -1143,6 +1270,107 @@ mod tests {
         // not requested, or the gate is off
         assert!(validate_kimi_k3_no_logprobs_with_gate(None, true).is_ok());
         assert!(validate_kimi_k3_no_logprobs_with_gate(Some("logprobs"), false).is_ok());
+    }
+
+    #[test]
+    fn reject_media_inputs_env_parsing() {
+        let video_audio = RejectedMediaInputs {
+            image: false,
+            video: true,
+            audio: true,
+        };
+        assert_eq!(
+            RejectedMediaInputs::parse(Some(" video, Audio ")),
+            video_audio
+        );
+        assert_eq!(
+            RejectedMediaInputs::parse(Some("video,,bogus,audio")),
+            video_audio
+        );
+        assert_eq!(
+            RejectedMediaInputs::parse(Some("")),
+            RejectedMediaInputs::default()
+        );
+        assert_eq!(
+            RejectedMediaInputs::parse(None),
+            RejectedMediaInputs::default()
+        );
+    }
+
+    fn media_messages(
+        content: serde_json::Value,
+    ) -> Vec<dynamo_protocols::types::ChatCompletionRequestMessage> {
+        serde_json::from_value(json!([
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": content}
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn reject_media_inputs_turns_away_video_and_audio() {
+        let video_audio = RejectedMediaInputs::parse(Some("video,audio"));
+        for (part, kind) in [
+            (
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}),
+                "video input",
+            ),
+            (
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
+                "audio input",
+            ),
+            (
+                json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+                "audio input",
+            ),
+        ] {
+            let messages = media_messages(json!([{"type": "text", "text": "describe"}, part]));
+            let err = validate_media_inputs_with(&messages, false, video_audio).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(kind), "{message}");
+            assert!(message.contains("messages[1]"), "{message}");
+        }
+
+        // images and plain text pass; nothing is rejected when the gate is unset
+        let image = media_messages(json!([
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]));
+        assert!(validate_media_inputs_with(&image, false, video_audio).is_ok());
+        assert!(
+            validate_media_inputs_with(&media_messages(json!("hi")), false, video_audio).is_ok()
+        );
+        let video = media_messages(json!([
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}
+        ]));
+        assert!(validate_media_inputs_with(&video, false, RejectedMediaInputs::default()).is_ok());
+    }
+
+    #[test]
+    fn reject_media_inputs_covers_tool_results_and_audio_output() {
+        let video_audio = RejectedMediaInputs::parse(Some("video,audio"));
+        let messages: Vec<dynamo_protocols::types::ChatCompletionRequestMessage> =
+            serde_json::from_value(json!([
+                {"role": "user", "content": "run the tool"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "record", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": [
+                    {"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}
+                ]}
+            ]))
+            .unwrap();
+        let err = validate_media_inputs_with(&messages, false, video_audio).unwrap_err();
+        assert!(err.to_string().contains("messages[2]"), "{err}");
+
+        let text = media_messages(json!("hi"));
+        let err = validate_media_inputs_with(&text, true, video_audio).unwrap_err();
+        assert!(err.to_string().contains("audio output"), "{err}");
+        assert!(
+            validate_media_inputs_with(&text, true, RejectedMediaInputs::parse(Some("video")))
+                .is_ok()
+        );
     }
 
     fn unknown_fields() -> HashMap<String, serde_json::Value> {
