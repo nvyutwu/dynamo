@@ -288,6 +288,48 @@ class TestUsageStatistics:
             ],
         }
 
+    def test_cache_loss_engine_data_reports_found_by_cache_group(self):
+        mock_output = Mock()
+        mock_output.prompt_token_ids = list(range(40_000))
+        mock_output.num_cached_tokens = 29_184
+        mock_output.num_local_cached_tokens = 0
+        mock_output.num_external_cached_tokens = 29_184
+        mock_output.num_external_lookup_tokens = 40_000
+        mock_output.num_full_attention_hit_tokens = 36_864
+        mock_output.num_local_full_attention_hit_tokens = 24_576
+        mock_output.num_mamba_state_hit_tokens = 29_184
+
+        data = BaseWorkerHandler._cache_loss_engine_data(mock_output)
+
+        assert data["worker_lookup_tokens"] == 36_864
+        assert data["worker_used_tokens"] == 29_184
+        assert data["found_by_cache_group"] == {
+            "full_attention": 36_864,
+            "local_full_attention": 24_576,
+            "recurrent_state": 29_184,
+        }
+        assert data["tiers"][0]["events"][0]["tokens"] == 24_576
+        assert data["tiers"][1]["events"][1]["tokens"] == 12_288
+
+    def test_cache_loss_engine_data_found_without_recurrent_state(self):
+        mock_output = Mock()
+        mock_output.prompt_token_ids = [1, 2, 3, 4]
+        mock_output.num_cached_tokens = 2
+        mock_output.num_local_cached_tokens = 2
+        mock_output.num_external_cached_tokens = 0
+        mock_output.num_external_lookup_tokens = 2
+        mock_output.num_full_attention_hit_tokens = 1
+        mock_output.num_local_full_attention_hit_tokens = 1
+        mock_output.num_mamba_state_hit_tokens = None
+
+        data = BaseWorkerHandler._cache_loss_engine_data(mock_output)
+
+        assert data["worker_lookup_tokens"] == 2
+        assert data["found_by_cache_group"] == {
+            "full_attention": 2,
+            "local_full_attention": 2,
+        }
+
     def test_cache_loss_engine_data_marks_missing_worker_counters_incomplete(self):
         mock_output = Mock()
         mock_output.prompt_token_ids = [1, 2]
