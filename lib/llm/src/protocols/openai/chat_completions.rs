@@ -795,6 +795,13 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
         validate::validate_chat_template_args(self.chat_template_args.as_ref())?;
         validate::validate_messages(&self.inner.messages)?;
+        let audio_output_requested = self.inner.audio.is_some()
+            || self.inner.modalities.as_ref().is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| serde_json::to_value(modality).is_ok_and(|v| v == "audio"))
+            });
+        validate::validate_media_inputs(&self.inner.messages, audio_output_requested)?;
         validate::validate_model(&self.inner.model)?;
         // none for store
         validate::validate_reasoning_effort(&self.inner.reasoning_effort)?;
