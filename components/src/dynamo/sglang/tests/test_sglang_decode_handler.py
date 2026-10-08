@@ -1995,6 +1995,7 @@ async def test_supported_sampling_reaches_engine(mode, n):
     handler.serving_mode = mode
     handler._enable_frontend_decoding = False
     handler._mm_hashes_supported = False
+    handler._mm_limits = {}
     handler._engine_supports_priority = False
     handler._routed_experts_kwargs = {}
     handler.enable_trace = False

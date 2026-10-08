@@ -5,9 +5,12 @@ import json
 
 import pytest
 
+from dynamo.llm.exceptions import InvalidArgument
 from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
     build_disagg_mm_kwargs,
     extract_media_urls,
+    parse_mm_limits,
+    raise_if_mm_limit_exceeded,
     raise_if_unextracted_multimodal,
 )
 from dynamo.sglang.request_handlers.multimodal.worker_handler import StreamProcessor
@@ -180,3 +183,57 @@ async def test_multimodal_stream_keeps_reading_after_one_choice_finishes():
         "stop",
         "stop",
     ]
+
+
+def test_parse_mm_limits_accepts_vllm_form():
+    assert parse_mm_limits(None) == {}
+    assert parse_mm_limits("") == {}
+    assert parse_mm_limits('{"image": 10}') == {"image": 10}
+    assert parse_mm_limits('{"image": 0, "video": 1, "audio": 2}') == {
+        "image": 0,
+        "video": 1,
+        "audio": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "10",
+        "[10]",
+        '{"picture": 1}',
+        '{"image": -1}',
+        '{"image": 1.5}',
+        '{"image": true}',
+        "{",
+    ],
+)
+def test_parse_mm_limits_rejects_malformed_values(value):
+    with pytest.raises(ValueError, match="--limit-mm-per-prompt"):
+        parse_mm_limits(value)
+
+
+def _image_request(count):
+    return {
+        "token_ids": [1, 2, 3],
+        "multi_modal_data": {
+            "image_url": [{"Url": f"https://example.com/{i}.png"} for i in range(count)]
+        },
+    }
+
+
+def test_mm_limit_allows_up_to_the_limit():
+    raise_if_mm_limit_exceeded(_image_request(10), {"image": 10})
+    raise_if_mm_limit_exceeded(_image_request(11), {})
+    raise_if_mm_limit_exceeded({"token_ids": [1]}, {"image": 0})
+    # Unlisted modalities are unlimited.
+    raise_if_mm_limit_exceeded(_image_request(11), {"video": 0})
+
+
+def test_mm_limit_rejects_one_over_with_vllm_message():
+    with pytest.raises(InvalidArgument) as exc:
+        raise_if_mm_limit_exceeded(_image_request(11), {"image": 10})
+    assert str(exc.value) == "At most 10 image(s) may be provided in one prompt."
+
+    with pytest.raises(InvalidArgument, match="At most 0 image"):
+        raise_if_mm_limit_exceeded(_image_request(1), {"image": 0})
