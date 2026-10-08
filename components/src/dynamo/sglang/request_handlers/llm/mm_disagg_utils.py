@@ -6,10 +6,12 @@ workers, so both feed identical media URLs to the engine and reproduce the same
 token layout the transferred KV depends on.
 """
 
+import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
+from dynamo.llm.exceptions import InvalidArgument
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,65 @@ def _raw_multimodal_content_types(request: Dict[str, Any]) -> set[str]:
             ):
                 content_types.add(part["type"])
     return content_types
+
+
+_MM_LIMIT_KEYS = {
+    "image": IMAGE_URL_KEY,
+    "video": VIDEO_URL_KEY,
+    "audio": AUDIO_URL_KEY,
+}
+
+
+def parse_mm_limits(value: Optional[str]) -> Dict[str, int]:
+    """Parse ``--limit-mm-per-prompt`` (vLLM's JSON form, e.g. ``{"image": 10}``).
+
+    SGLang has no per-request media cap, so the Dynamo worker enforces it. Keys are
+    ``image``, ``video`` and ``audio``; a modality that is not listed is unlimited.
+    """
+    if value is None or not str(value).strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--limit-mm-per-prompt must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            '--limit-mm-per-prompt must be a JSON object, e.g. {"image": 10}'
+        )
+    limits: Dict[str, int] = {}
+    for modality, limit in parsed.items():
+        if modality not in _MM_LIMIT_KEYS:
+            raise ValueError(
+                f"--limit-mm-per-prompt: unknown modality {modality!r} "
+                f"(expected one of {sorted(_MM_LIMIT_KEYS)})"
+            )
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError(
+                f"--limit-mm-per-prompt: {modality} limit must be a non-negative "
+                f"integer, got {limit!r}"
+            )
+        limits[modality] = limit
+    return limits
+
+
+def raise_if_mm_limit_exceeded(
+    request: Dict[str, Any], limits: Mapping[str, int]
+) -> None:
+    """Reject a request carrying more media items than ``limits`` allows (HTTP 400).
+
+    Same message as vLLM's ``--limit-mm-per-prompt`` check, so clients see one error
+    whichever engine serves the model.
+    """
+    if not limits:
+        return
+    mm_data = _multi_modal_data(request)
+    for modality, limit in limits.items():
+        items = mm_data.get(_MM_LIMIT_KEYS[modality]) or []
+        count = len(items) if isinstance(items, list) else 1
+        if count > limit:
+            raise InvalidArgument(
+                f"At most {limit} {modality}(s) may be provided in one prompt."
+            )
 
 
 def raise_if_unextracted_multimodal(request: Dict[str, Any]) -> None:

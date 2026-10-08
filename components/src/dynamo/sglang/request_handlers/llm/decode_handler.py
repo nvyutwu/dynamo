@@ -40,6 +40,8 @@ from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
     VIDEO_URL_KEY,
     build_disagg_mm_kwargs,
     extract_media_urls,
+    parse_mm_limits,
+    raise_if_mm_limit_exceeded,
     raise_if_unextracted_multimodal,
 )
 
@@ -298,6 +300,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             self._image_loader = ImageLoader(enable_frontend_decoding=True)
             self._video_loader = VideoLoader(enable_frontend_decoding=True)
         self._mm_hashes_supported: bool = self._resolve_mm_hashes_supported(self.engine)
+        self._mm_limits = parse_mm_limits(
+            getattr(
+                getattr(self.config, "dynamo_args", None), "limit_mm_per_prompt", None
+            )
+        )
         if self.serving_mode == DisaggregationMode.DECODE:
             logging.info(
                 "Decode worker handler initialized (disaggregated decode mode)"
@@ -451,6 +458,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
     ) -> AsyncIterator[Dict[str, Any]]:
         """Build and dispatch one native SGLang request."""
         raise_if_unextracted_multimodal(request)
+        raise_if_mm_limit_exceeded(request, self._mm_limits)
         input_ids = input_param.get("input_ids")
         if not isinstance(input_ids, list):
             raise ValueError("native SGLang Generate requires token input")
@@ -535,6 +543,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         if self.serving_mode == DisaggregationMode.DECODE:
             raise_if_unextracted_multimodal(request)
+            raise_if_mm_limit_exceeded(request, self._mm_limits)
 
             # Check if bootstrap_info is pre-computed in the request (from frontend)
             bootstrap_info = request.get("bootstrap_info")
@@ -598,6 +607,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     yield out
         else:
             raise_if_unextracted_multimodal(request)
+            raise_if_mm_limit_exceeded(request, self._mm_limits)
 
             # Extract media URLs for multimodal requests. SGLang's mm_data_processor
             # handles loading/preprocessing, and the scheduler does vision encoding.

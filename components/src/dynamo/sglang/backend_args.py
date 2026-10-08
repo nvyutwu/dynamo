@@ -159,6 +159,19 @@ class DynamoSGLangArgGroup(ArgGroup):
             ),
         )
 
+        add_argument(
+            g,
+            flag_name="--limit-mm-per-prompt",
+            env_var="DYN_SGL_LIMIT_MM_PER_PROMPT",
+            default=None,
+            help=(
+                "Maximum media items per request as a JSON object, e.g. "
+                "'{\"image\": 10}' (same form as vLLM). SGLang has no such cap, so the "
+                "Dynamo worker rejects a request over the limit with HTTP 400. "
+                "Unlisted modalities are unlimited."
+            ),
+        )
+
         # Topology constraints for --frontend-decoding are enforced in
         # DynamoSGLangConfig.validate() below.
         add_frontend_decoding_arg(g, env_prefix="SGL")
@@ -196,6 +209,7 @@ class DynamoSGLangConfig(ConfigBase):
     engine_routes: list[str]
     frontend_decoding: bool = False
     sglang_trace_level: int
+    limit_mm_per_prompt: Optional[str] = None
 
     # Extra served names beyond the primary, parsed from --served-model-name.
     # None (not []) since ConfigBase copies class defaults by reference.
@@ -217,6 +231,11 @@ class DynamoSGLangConfig(ConfigBase):
         self.validate_multimodal_topology()
 
         self.validate_dedicated_mm_encoder()
+
+        # Fail at startup, not on the first multimodal request.
+        from dynamo.sglang.request_handlers.llm.mm_disagg_utils import parse_mm_limits
+
+        parse_mm_limits(self.limit_mm_per_prompt)
 
     def validate_dedicated_mm_encoder(self) -> None:
         if self.dedicated_mm_encoder and not self.enable_multimodal:
