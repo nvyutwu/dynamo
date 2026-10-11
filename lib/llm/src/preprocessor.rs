@@ -7912,6 +7912,365 @@ mod tests {
         );
     }
 
+    /// One backend delta per model token of a thinking-on K3 turn; the prompt
+    /// already opened the think channel.
+    const K3_THINKING_TURN_TOKENS: [&str; 15] = [
+        "17*23 = 391.",
+        "<|close|>",
+        "think",
+        "<|sep|>",
+        "<|open|>",
+        "response",
+        "<|sep|>",
+        "391",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+        "<|end_of_msg|>",
+    ];
+
+    fn kimi_k3_token_chunk(
+        token: &str,
+        finish_reason: Option<FinishReason>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        let mut chunk = chat_stream_chunk(0, Some(Role::Assistant));
+        let choice = &mut chunk.data.as_mut().unwrap().inner.choices[0];
+        choice.delta.content = Some(ChatCompletionMessageContent::Text(token.to_string()));
+        choice.finish_reason = finish_reason;
+        chunk
+    }
+
+    /// Production `internal-kimi-k3` 5d1b7749 (2026-10-11), no tools,
+    /// `max_tokens: 64`: replies cut inside the closing markup returned
+    /// `391<|close|>response`, `391<|close|>message` or `<|open|>response` as
+    /// content with `finish_reason: length`, streaming and non-streaming.
+    /// Cut the turn after every token and run the shared stream (reasoning
+    /// parser, K3 jail, tool policy) and the non-streaming aggregator.
+    #[tokio::test]
+    async fn test_kimi_k3_max_tokens_cut_markup_never_reaches_stream_or_batch_content() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "What is 17*23? Answer with the number only."}],
+            "max_tokens": 64
+        }))
+        .unwrap();
+        let tool_call_parsing_enabled = OpenAIPreprocessor::tool_call_parsing_enabled(&request);
+        let answer_at = K3_THINKING_TURN_TOKENS
+            .iter()
+            .position(|token| *token == "391")
+            .unwrap();
+
+        for cut in 1..=K3_THINKING_TURN_TOKENS.len() {
+            let finish = if cut == K3_THINKING_TURN_TOKENS.len() {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            };
+            let expected = if cut > answer_at { "391" } else { "" };
+            let chunks: Vec<_> = K3_THINKING_TURN_TOKENS[..cut]
+                .iter()
+                .enumerate()
+                .map(|(position, token)| {
+                    kimi_k3_token_chunk(token, (position + 1 == cut).then_some(finish))
+                })
+                .collect();
+
+            let reasoned = OpenAIPreprocessor::parse_reasoning_content_from_stream(
+                stream::iter(chunks),
+                "kimi_k3".to_string(),
+                true,
+            );
+            let jailed = OpenAIPreprocessor::apply_tool_calling_jail(
+                Some("kimi_k3".to_string()),
+                request.inner.tool_choice.clone(),
+                None,
+                false,
+                false,
+                reasoned,
+            );
+            let responses: Vec<_> = OpenAIPreprocessor::apply_tool_call_response_policy(
+                jailed,
+                tool_call_parsing_enabled,
+            )
+            .collect()
+            .await;
+
+            let choices: Vec<_> = responses
+                .iter()
+                .flat_map(|response| response.data.iter())
+                .flat_map(|data| data.inner.choices.iter())
+                .collect();
+            let content: Vec<&str> = choices
+                .iter()
+                .filter_map(|choice| match &choice.delta.content {
+                    Some(ChatCompletionMessageContent::Text(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let reasoning: String = choices
+                .iter()
+                .filter_map(|choice| choice.delta.reasoning_content.as_deref())
+                .collect();
+            assert_eq!(content.concat(), expected, "stream, cut after {cut} tokens");
+            assert!(
+                content.iter().all(|delta| !delta.contains("<|")),
+                "stream, cut after {cut} tokens: {content:?}"
+            );
+            assert_eq!(reasoning, "17*23 = 391.", "stream, cut after {cut} tokens");
+            assert_eq!(
+                choices
+                    .iter()
+                    .filter_map(|choice| choice.finish_reason)
+                    .collect::<Vec<_>>(),
+                vec![finish],
+                "stream, cut after {cut} tokens"
+            );
+
+            // Same options the HTTP handler builds for this request.
+            let parsing_options = crate::protocols::openai::ParsingOptions::new(
+                Some("kimi_k3".to_string()),
+                Some("kimi_k3".to_string()),
+            )
+            .with_tool_call_parsing_enabled(tool_call_parsing_enabled);
+            let response =
+                crate::protocols::openai::chat_completions::aggregator::DeltaAggregator::apply(
+                    stream::iter(responses),
+                    parsing_options,
+                )
+                .await
+                .unwrap();
+            let choice = &response.inner.choices[0];
+            let batch_content = match &choice.message.content {
+                Some(ChatCompletionMessageContent::Text(text)) => text.as_str(),
+                None => "",
+                Some(other) => panic!("unexpected content {other:?}"),
+            };
+            assert_eq!(batch_content, expected, "batch, cut after {cut} tokens");
+            assert_eq!(
+                choice.finish_reason,
+                Some(finish),
+                "batch, cut after {cut} tokens"
+            );
+            assert_eq!(
+                choice.message.reasoning_content.as_deref(),
+                Some("17*23 = 391."),
+                "batch, cut after {cut} tokens"
+            );
+        }
+    }
+
+    /// Split raw K3 output into one piece per control token and per text run.
+    fn kimi_k3_pieces(raw: &str) -> Vec<&str> {
+        let mut pieces = Vec::new();
+        let mut rest = raw;
+        while !rest.is_empty() {
+            let end = if rest.starts_with("<|") {
+                rest.find("|>").map_or(rest.len(), |end| end + 2)
+            } else {
+                rest.find("<|").unwrap_or(rest.len())
+            };
+            let (piece, tail) = rest.split_at(end);
+            pieces.push(piece);
+            rest = tail;
+        }
+        pieces
+    }
+
+    /// A request that does not permit tools (no `tools`, as Terminus-2 sends, or
+    /// `tool_choice: "none"`) gets a native K3 tool call stripped by the response
+    /// policy; the prompt is left as the model provider renders it. The call must
+    /// reach the client neither as `tool_calls` nor as XTML text, and the finish
+    /// reason is `stop`, on both transports. `tool_choice: "auto"` is the control
+    /// that shows the same output does parse into a call.
+    #[tokio::test]
+    async fn test_kimi_k3_tool_call_is_stripped_when_request_forbids_tools() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }
+        }]);
+        let messages = serde_json::json!([{"role": "user", "content": "List the files."}]);
+        let requests = [
+            (
+                "tool_choice=none",
+                serde_json::json!({"model": "moonshotai/Kimi-K3", "messages": messages,
+                    "tools": tools, "tool_choice": "none"}),
+                false,
+            ),
+            (
+                "no tools",
+                serde_json::json!({"model": "moonshotai/Kimi-K3", "messages": messages}),
+                false,
+            ),
+            (
+                "tool_choice=auto (control)",
+                serde_json::json!({"model": "moonshotai/Kimi-K3", "messages": messages,
+                    "tools": tools, "tool_choice": "auto"}),
+                true,
+            ),
+        ];
+        let call = concat!(
+            "<|open|>tools<|sep|>",
+            "<|open|>call tool=\"bash\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"command\" type=\"string\"<|sep|>ls",
+            "<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
+            "<|close|>message<|sep|><|end_of_msg|>"
+        );
+        let outputs = [
+            (format!("Run ls.<|close|>think<|sep|>{call}"), ""),
+            (
+                format!(
+                    "Run ls.<|close|>think<|sep|><|open|>response<|sep|>Listing.\
+                     <|close|>response<|sep|>{call}"
+                ),
+                "Listing.",
+            ),
+        ];
+
+        for (label, body, permits_tools) in &requests {
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(body.clone()).unwrap();
+            let tool_call_parsing_enabled = OpenAIPreprocessor::tool_call_parsing_enabled(&request);
+            assert_eq!(tool_call_parsing_enabled, *permits_tools, "{label}");
+            // Same conversion as `postprocessor_parsing_stream`.
+            let tool_definitions: Option<Vec<_>> = Some(request.effective_tools())
+                .filter(|tools| !tools.is_empty())
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                            name: tool.function.name.clone(),
+                            parameters: tool.function.parameters.clone(),
+                            strict: tool.function.strict,
+                        })
+                        .collect()
+                });
+
+            for (raw, expected_content) in &outputs {
+                let pieces = kimi_k3_pieces(raw);
+                let chunks: Vec<_> = pieces
+                    .iter()
+                    .enumerate()
+                    .map(|(position, piece)| {
+                        kimi_k3_token_chunk(
+                            piece,
+                            (position + 1 == pieces.len()).then_some(FinishReason::Stop),
+                        )
+                    })
+                    .collect();
+                let reasoned = OpenAIPreprocessor::parse_reasoning_content_from_stream(
+                    stream::iter(chunks),
+                    "kimi_k3".to_string(),
+                    true,
+                );
+                let jailed = OpenAIPreprocessor::apply_tool_calling_jail(
+                    Some("kimi_k3".to_string()),
+                    request.inner.tool_choice.clone(),
+                    tool_definitions.clone(),
+                    false,
+                    false,
+                    reasoned,
+                );
+                let responses: Vec<_> = OpenAIPreprocessor::apply_tool_call_response_policy(
+                    jailed,
+                    tool_call_parsing_enabled,
+                )
+                .collect()
+                .await;
+
+                let choices: Vec<_> = responses
+                    .iter()
+                    .flat_map(|response| response.data.iter())
+                    .flat_map(|data| data.inner.choices.iter())
+                    .collect();
+                let content: String = choices
+                    .iter()
+                    .filter_map(|choice| match &choice.delta.content {
+                        Some(ChatCompletionMessageContent::Text(text)) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let reasoning: String = choices
+                    .iter()
+                    .filter_map(|choice| choice.delta.reasoning_content.as_deref())
+                    .collect();
+                let streamed_calls: Vec<_> = choices
+                    .iter()
+                    .filter_map(|choice| choice.delta.tool_calls.as_ref())
+                    .flatten()
+                    .filter_map(|call| call.function.as_ref()?.name.clone())
+                    .collect();
+                let finishes: Vec<_> = choices
+                    .iter()
+                    .filter_map(|choice| choice.finish_reason)
+                    .collect();
+                let case = format!("{label}, content {expected_content:?}");
+                assert_eq!(content, *expected_content, "stream, {case}");
+                assert!(!content.contains("<|"), "stream, {case}: {content:?}");
+                assert_eq!(reasoning, "Run ls.", "stream, {case}");
+                if *permits_tools {
+                    assert_eq!(streamed_calls, vec!["bash"], "stream, {case}");
+                    assert_eq!(finishes, vec![FinishReason::ToolCalls], "stream, {case}");
+                } else {
+                    assert!(streamed_calls.is_empty(), "stream, {case}");
+                    assert_eq!(finishes, vec![FinishReason::Stop], "stream, {case}");
+                }
+
+                let parsing_options = crate::protocols::openai::ParsingOptions::new(
+                    Some("kimi_k3".to_string()),
+                    Some("kimi_k3".to_string()),
+                )
+                .with_tool_call_parsing_enabled(tool_call_parsing_enabled);
+                let response =
+                    crate::protocols::openai::chat_completions::aggregator::DeltaAggregator::apply(
+                        stream::iter(responses),
+                        parsing_options,
+                    )
+                    .await
+                    .unwrap();
+                let choice = &response.inner.choices[0];
+                let batch_content = match &choice.message.content {
+                    Some(ChatCompletionMessageContent::Text(text)) => text.as_str(),
+                    None => "",
+                    Some(other) => panic!("unexpected content {other:?}"),
+                };
+                let batch_calls: Vec<_> = choice
+                    .message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|call| call.function.name.as_str())
+                    .collect();
+                assert_eq!(batch_content, *expected_content, "batch, {case}");
+                if *permits_tools {
+                    assert_eq!(batch_calls, vec!["bash"], "batch, {case}");
+                    assert_eq!(
+                        choice.finish_reason,
+                        Some(FinishReason::ToolCalls),
+                        "batch, {case}"
+                    );
+                } else {
+                    assert!(choice.message.tool_calls.is_none(), "batch, {case}");
+                    assert_eq!(
+                        choice.finish_reason,
+                        Some(FinishReason::Stop),
+                        "batch, {case}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn prompt_invalid_request_maps_to_invalid_argument() {
         let error = PromptRenderError::invalid_request("unsupported model parameter").into();

@@ -28,6 +28,12 @@ use super::super::response::{CalledFunction, ToolCallResponse, ToolCallType};
 
 pub(crate) const SEP: &str = "<|sep|>";
 
+/// The reserved control tokens that begin every opening or closing boundary.
+/// Each is a single vocabulary entry, so its complete spelling in decoded output
+/// is protocol markup, never a sub-token prefix of ordinary text.
+const OPEN_TOKEN: &str = "<|open|>";
+const CLOSE_TOKEN: &str = "<|close|>";
+
 pub(crate) const RESPONSE_OPEN: &str = "<|open|>response<|sep|>";
 pub(crate) const RESPONSE_CLOSE: &str = "<|close|>response<|sep|>";
 pub(crate) const TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
@@ -234,6 +240,35 @@ pub(crate) fn split_reasoning_handoff(message: &str) -> Option<(&str, &str)> {
     Some(message.split_at(position))
 }
 
+/// Return the byte position of a trailing boundary that generation stopped
+/// inside, e.g. `<|close|>response` in `391<|close|>response` when `max_tokens`
+/// ends the turn before `<|sep|>`.
+///
+/// The suffix must begin with a whole open/close control token and be a strict
+/// prefix of a K3 boundary (canonical or spaced). Such a suffix is protocol
+/// markup that can never become user text. A sub-token prefix such as `<|clo`
+/// carries no control token, may be literal text, and is not matched.
+pub(crate) fn incomplete_trailing_boundary_start(text: &str) -> Option<usize> {
+    // Every boundary has exactly one open/close token, at its start, so only the
+    // last one can begin an unfinished boundary at the end of the text.
+    let start = [OPEN_TOKEN, CLOSE_TOKEN]
+        .into_iter()
+        .filter_map(|token| text.rfind(token))
+        .max()?;
+    let suffix = &text[start..];
+    JAIL_BOUNDARIES
+        .into_iter()
+        .chain(SPACED_JAIL_BOUNDARIES)
+        .any(|boundary| boundary.len() > suffix.len() && boundary.starts_with(suffix))
+        .then_some(start)
+}
+
+/// Drop a trailing boundary that generation stopped inside. See
+/// [`incomplete_trailing_boundary_start`].
+pub(crate) fn strip_incomplete_trailing_boundary(text: &str) -> &str {
+    incomplete_trailing_boundary_start(text).map_or(text, |start| &text[..start])
+}
+
 /// Find a canonical K3 marker or its spaced spelling and return the byte
 /// position immediately after it.
 fn find_wire_marker_end(text: &str, canonical: &str) -> Option<usize> {
@@ -256,7 +291,9 @@ fn earliest_position(text: &str, markers: &[&str]) -> Option<usize> {
 fn extract_response_text(message: &str) -> String {
     let logical_end =
         earliest_position(message, &[MESSAGE_CLOSE, END_OF_MSG]).unwrap_or(message.len());
-    let logical = &message[..logical_end];
+    // A turn cut by `max_tokens` can end inside its closing markup; the
+    // unfinished boundary is not response text.
+    let logical = strip_incomplete_trailing_boundary(&message[..logical_end]);
 
     if let Some(open) = logical.find(RESPONSE_OPEN) {
         let body_start = open + RESPONSE_OPEN.len();
@@ -633,6 +670,68 @@ mod tests {
 
         assert!(calls.is_empty());
         assert_eq!(normal, "answer");
+    }
+
+    /// `max_tokens` stopped production `internal-kimi-k3` (5d1b7749,
+    /// 2026-10-11) inside the closing markup and the batch path returned
+    /// `391<|close|>response`. The clean turn is
+    /// `<|open|>response<|sep|>391<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>`.
+    #[test]
+    fn max_tokens_cut_inside_closing_markup_keeps_only_the_answer() {
+        for (input, expected) in [
+            // Captured shapes (the jail already consumed `<|open|>response<|sep|>`).
+            ("391<|close|>response", "391"),
+            ("391<|close|>message", "391"),
+            ("<|open|>response", ""),
+            // Every other token-level cut of the closing markup.
+            ("391<|close|>", "391"),
+            ("391<|close|>response<|sep|><|close|>", "391"),
+            ("391<|close|>response<|sep|><|close|>message", "391"),
+            ("<|open|>", ""),
+            ("<|open|>response<|sep|>391<|close|>", "391"),
+            ("<|open|>response<|sep|>391<|close|>response", "391"),
+            (
+                "<|open|>response<|sep|>391<|close|>response<|sep|><|close|>message",
+                "391",
+            ),
+            // Engine-spaced spelling and an orphan reasoning close.
+            ("391<|close|> response", "391"),
+            ("391<|close|>think", "391"),
+        ] {
+            let (calls, normal) = parse(input);
+            assert!(calls.is_empty(), "{input}");
+            assert_eq!(normal, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn trailing_text_that_is_not_an_unfinished_boundary_is_kept() {
+        for input in [
+            // No whole control token: may be literal text.
+            "answer<|clo",
+            "answer<|",
+            // A control token followed by text no boundary starts with.
+            "literal <|open|>example value",
+        ] {
+            let (_, normal) = parse(input);
+            assert_eq!(normal, input);
+        }
+    }
+
+    #[test]
+    fn cut_after_a_complete_tool_section_keeps_the_call() {
+        let input = format!(
+            "{}<|close|>mess",
+            tools(&call(
+                "tool=\"calc\" index=\"1\"",
+                &arg("x", Some("number"), "1")
+            ))
+        );
+        let (calls, normal) = parse(&input);
+
+        assert_eq!(normal, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, r#"{"x":1}"#);
     }
 
     #[test]

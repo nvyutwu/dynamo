@@ -202,8 +202,9 @@ tokio-rustls = { version = "0.26" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2" }
 
-# dynamo-parsers 9.0.0 exactly as published on crates.io plus the Kimi K3 unique tool-call ID
-# fix (ai-dynamo/frontend-crates#353). See lib/vendored/dynamo-parsers-9.0.0/VENDORED.md.
+# dynamo-parsers 9.0.0 exactly as published on crates.io plus two Kimi K3 fixes: unique tool-call
+# IDs (ai-dynamo/frontend-crates#353) and dropping closing markup cut by max_tokens. See
+# lib/vendored/dynamo-parsers-9.0.0/VENDORED.md.
 # Keep in lockstep with lib/bindings/python/Cargo.toml.
 [patch.crates-io]
 dynamo-parsers = { path = "lib/vendored/dynamo-parsers-9.0.0" }

@@ -1061,8 +1061,16 @@ impl ChoiceJailState {
                 Some(ChoiceEmission::Content(final_choice))
             }
         } else if !self.partial_match_buffer.is_empty() {
-            let content = std::mem::take(&mut self.partial_match_buffer);
-            let choice = create_choice_stream(
+            let mut content = std::mem::take(&mut self.partial_match_buffer);
+            if is_kimi_k3_parser(jail_stream.tool_call_parser.as_deref()) {
+                // `max_tokens` can stop K3 inside its closing markup, leaving
+                // e.g. `<|close|>response` held here as a partial boundary.
+                // That is protocol output, not text: drop it. The finish reason
+                // still reports the truncation.
+                let kept = crate::tool_calling::xtml::strip_incomplete_trailing_boundary(&content);
+                content.truncate(kept.len());
+            }
+            let mut choice = create_choice_stream(
                 self.index,
                 Some(Role::Assistant),
                 &content,
@@ -1070,6 +1078,11 @@ impl ChoiceJailState {
                 self.stream_finish_reason,
                 None,
             );
+            if content.is_empty() {
+                // Nothing visible remains; emit only the terminal reason, if any.
+                choice.finish_reason?;
+                choice.delta.content = None;
+            }
             Some(ChoiceEmission::Content(choice))
         } else {
             None
@@ -3278,6 +3291,152 @@ mod tests {
 
         assert_eq!(collect_text_content(&responses), expected);
         assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    /// One backend delta per K3 token. With `finish_on_last_token` the last
+    /// token carries `finish_reason`; otherwise a content-less terminal delta
+    /// does, as some engines send it.
+    fn k3_token_stream(
+        tokens: &[&str],
+        finish_reason: FinishReason,
+        finish_on_last_token: bool,
+    ) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
+        let mut chunks: Vec<_> = tokens.iter().map(|token| text_chunk(token)).collect();
+        if finish_on_last_token && let Some(last) = chunks.last_mut() {
+            last.data.as_mut().expect("token response").choices[0].finish_reason =
+                Some(finish_reason);
+        } else {
+            let mut terminal = terminal_chunk();
+            terminal.data.as_mut().expect("terminal response").choices[0].finish_reason =
+                Some(finish_reason);
+            chunks.push(terminal);
+        }
+        chunks
+    }
+
+    async fn apply_kimi_k3_tokens(
+        tokens: &[&str],
+        finish_reason: FinishReason,
+        finish_on_last_token: bool,
+    ) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
+        apply_tool_calling_jail(
+            Some("kimi_k3".to_string()),
+            None,
+            None,
+            false,
+            stream::iter(k3_token_stream(tokens, finish_reason, finish_on_last_token)),
+        )
+        .collect()
+        .await
+    }
+
+    fn content_deltas(responses: &[Annotated<CreateChatCompletionStreamResponse>]) -> Vec<String> {
+        responses
+            .iter()
+            .flat_map(|r| r.data.iter())
+            .flat_map(|d| d.choices.iter())
+            .filter_map(|c| match &c.delta.content {
+                Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(t)) => {
+                    Some(t.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn finish_reasons(
+        responses: &[Annotated<CreateChatCompletionStreamResponse>],
+    ) -> Vec<FinishReason> {
+        responses
+            .iter()
+            .flat_map(|r| r.data.iter())
+            .flat_map(|d| d.choices.iter())
+            .filter_map(|c| c.finish_reason)
+            .collect()
+    }
+
+    /// Thinking-on K3 turn after the reasoning parser removed
+    /// `<|close|>think<|sep|>`: one string per model token.
+    const K3_ANSWER_TOKENS: [&str; 11] = [
+        "<|open|>",
+        "response",
+        "<|sep|>",
+        "391",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+        "<|end_of_msg|>",
+    ];
+
+    /// Production `internal-kimi-k3` 5d1b7749 (2026-10-11), `max_tokens: 64`:
+    /// replies ended `391<|close|>response`, `391<|close|>message` or
+    /// `<|open|>response` with `finish_reason: length`.
+    #[tokio::test]
+    async fn kimi_k3_max_tokens_cut_inside_closing_markup_emits_no_marker_text() {
+        let captured: [(&[&str], &str); 4] = [
+            (&["391", "<|close|>", "response"], "391"),
+            (&K3_ANSWER_TOKENS[..6], "391"),
+            (&K3_ANSWER_TOKENS[..9], "391"),
+            (&["<|open|>", "response"], ""),
+        ];
+        for (tokens, expected) in captured {
+            for finish_on_last_token in [true, false] {
+                let responses =
+                    apply_kimi_k3_tokens(tokens, FinishReason::Length, finish_on_last_token).await;
+                let deltas = content_deltas(&responses);
+
+                assert_eq!(deltas.concat(), expected, "{tokens:?}");
+                assert!(
+                    deltas.iter().all(|delta| !delta.contains("<|")),
+                    "{tokens:?} leaked {deltas:?}"
+                );
+                assert_eq!(
+                    finish_reasons(&responses),
+                    vec![FinishReason::Length],
+                    "{tokens:?}"
+                );
+                assert!(collect_tool_calls(&responses).is_empty());
+            }
+        }
+    }
+
+    /// Cut the clean turn after every token: the content is a prefix of the
+    /// answer and never markup, and exactly one `length` finish is reported.
+    #[tokio::test]
+    async fn kimi_k3_every_token_level_max_tokens_cut_is_marker_free() {
+        let answer_at = K3_ANSWER_TOKENS
+            .iter()
+            .position(|token| *token == "391")
+            .expect("answer token");
+        for cut in 1..K3_ANSWER_TOKENS.len() {
+            let expected = if cut > answer_at { "391" } else { "" };
+            for finish_on_last_token in [true, false] {
+                let responses = apply_kimi_k3_tokens(
+                    &K3_ANSWER_TOKENS[..cut],
+                    FinishReason::Length,
+                    finish_on_last_token,
+                )
+                .await;
+
+                assert_eq!(
+                    collect_text_content(&responses),
+                    expected,
+                    "cut after {cut} tokens"
+                );
+                assert_eq!(
+                    finish_reasons(&responses),
+                    vec![FinishReason::Length],
+                    "cut after {cut} tokens"
+                );
+            }
+        }
+
+        let complete = apply_kimi_k3_tokens(&K3_ANSWER_TOKENS, FinishReason::Stop, true).await;
+        assert_eq!(collect_text_content(&complete), "391");
+        assert_eq!(finish_reasons(&complete), vec![FinishReason::Stop]);
     }
 
     #[tokio::test]
