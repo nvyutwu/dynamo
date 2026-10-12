@@ -3,6 +3,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dynamo_runtime::engine::{AsyncEngineContext, AsyncEngineContextProvider};
 use dynamo_runtime::pipeline::Context;
@@ -159,7 +160,10 @@ fn build_request_end_trace_state_for_policy(
 }
 
 impl RequestEndTraceState {
-    fn emit(&mut self) {
+    /// `cancelled`: the response stream was dropped before its end, or the request was killed
+    /// before a stream existed. Such a record gets `termination: cancelled` when no finish
+    /// reason was seen.
+    fn emit(&mut self, cancelled: bool) {
         let Some(RequestTraceRequestEndState {
             request_tracker,
             replay_metrics,
@@ -176,6 +180,11 @@ impl RequestEndTraceState {
             replay_metrics
         });
         if let Some(agent_state) = self.agent.take() {
+            if cancelled {
+                agent_state
+                    .finish_reason_metadata
+                    .mark_cancelled_if_unfinished();
+            }
             let (agent_context, mut metrics) =
                 super::request_metrics_from_agent_state(agent_state, self.request_id.clone());
             metrics.replay = replay_metrics;
@@ -193,7 +202,7 @@ impl RequestEndTraceState {
 impl Drop for RequestEndTraceState {
     fn drop(&mut self) {
         if self.request_context.is_killed() {
-            self.emit();
+            self.emit(true);
         }
     }
 }
@@ -226,10 +235,17 @@ where
         return stream;
     };
 
+    // Set once the inner stream has ended; a stream dropped before that was cancelled.
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_flag = finished.clone();
+    let stream = stream.chain(futures::stream::poll_fn(move |_| {
+        finished_flag.store(true, Ordering::Release);
+        std::task::Poll::Ready(None)
+    }));
     let (stream, done) = crate::telemetry::stream::notify_on_completion(stream);
     tokio::spawn(async move {
         done.await;
-        trace_state.emit();
+        trace_state.emit(!finished.load(Ordering::Acquire));
     });
     stream
 }
@@ -424,7 +440,7 @@ mod tests {
         assert!(request_state.replay_metrics.is_none());
         assert!(request_state.output_sequence_hash_capture.is_none());
 
-        state.emit();
+        state.emit(false);
         let records = drain_request_records(&mut receiver, &request_id);
         assert_eq!(records.len(), 1);
         let traced = records[0].request.as_ref().expect("request payload");
@@ -520,7 +536,7 @@ mod tests {
         let (mut state, context) =
             request_end_state("req-emit-once", Arc::new(RequestTracker::new()));
 
-        state.emit();
+        state.emit(false);
         context.kill();
         drop(state);
 
@@ -718,7 +734,153 @@ mod tests {
                 .and_then(|metadata| metadata.backend_finish_reason.as_deref()),
             Some("length")
         );
+        assert_eq!(
+            request
+                .finish_reason_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.termination.as_deref()),
+            None,
+            "a stream dropped after the engine finished is not marked cancelled"
+        );
         assert_eq!(request.output_tokens, Some(9));
+    }
+
+    async fn recv_request_end(
+        receiver: &mut tokio::sync::broadcast::Receiver<crate::request_trace::RequestTraceRecord>,
+        request_id: &str,
+    ) -> crate::request_trace::RequestTraceRecord {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let record = receiver.recv().await.unwrap();
+                if record
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+                {
+                    break record;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn termination(record: &crate::request_trace::RequestTraceRecord) -> Option<String> {
+        record
+            .request
+            .as_ref()
+            .and_then(|request| request.finish_reason_metadata.as_ref())
+            .and_then(|metadata| metadata.termination.clone())
+    }
+
+    #[tokio::test]
+    async fn stream_dropped_before_end_without_finish_reason_is_cancelled() {
+        BUS.init(16);
+        let mut receiver = BUS.subscribe();
+        let tracker = Arc::new(RequestTracker::new());
+        let context = Context::new(());
+        let request_id = context.id().to_string();
+        let state = build_request_end_trace_state_for_policy(
+            &preprocessed_request(SamplingOptions::default()),
+            &Some(tracker.clone()),
+            &context,
+            2,
+            true,
+        );
+        let stream = TrackerDropStream {
+            tracker,
+            dropped: Arc::new(AtomicBool::new(false)),
+        };
+
+        drop(wrap_request_end_stream(Box::pin(stream), state));
+
+        let record = recv_request_end(&mut receiver, &request_id).await;
+        assert_eq!(termination(&record).as_deref(), Some("cancelled"));
+        let metadata = record.request.unwrap().finish_reason_metadata.unwrap();
+        assert!(metadata.finish_reason.is_none());
+        assert!(metadata.backend_finish_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_consumed_to_end_is_not_cancelled() {
+        BUS.init(16);
+        let mut receiver = BUS.subscribe();
+        let context = Context::new(());
+        let request_id = context.id().to_string();
+        let state = build_request_end_trace_state_for_policy(
+            &preprocessed_request(SamplingOptions::default()),
+            &Some(Arc::new(RequestTracker::new())),
+            &context,
+            2,
+            true,
+        );
+        let stream = futures::stream::iter(Vec::<Annotated<NvCreateCompletionResponse>>::new());
+
+        let items: Vec<_> = wrap_request_end_stream(Box::pin(stream), state)
+            .collect()
+            .await;
+
+        assert!(items.is_empty());
+        let record = recv_request_end(&mut receiver, &request_id).await;
+        assert_eq!(termination(&record), None);
+    }
+
+    #[tokio::test]
+    async fn stream_dropped_after_openai_finish_reason_is_not_cancelled() {
+        BUS.init(16);
+        let mut receiver = BUS.subscribe();
+        let tracker = Arc::new(RequestTracker::new());
+        let context = Context::new(());
+        let request_id = context.id().to_string();
+        let state = build_request_end_trace_state_for_policy(
+            &preprocessed_request(SamplingOptions::default()),
+            &Some(tracker.clone()),
+            &context,
+            2,
+            true,
+        );
+        finish_reason_metadata_handle(&state)
+            .expect("finish reasons are tracked")
+            .record_choice_finish_reason_for_test(0, dynamo_protocols::types::FinishReason::Stop);
+        let stream = TrackerDropStream {
+            tracker,
+            dropped: Arc::new(AtomicBool::new(false)),
+        };
+
+        drop(wrap_request_end_stream(Box::pin(stream), state));
+
+        let record = recv_request_end(&mut receiver, &request_id).await;
+        assert_eq!(termination(&record), None);
+        assert_eq!(
+            record
+                .request
+                .and_then(|request| request.finish_reason_metadata)
+                .and_then(|metadata| metadata.finish_reason),
+            Some(dynamo_protocols::types::FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn request_killed_before_response_stream_is_cancelled() {
+        BUS.init(16);
+        let mut receiver = BUS.subscribe();
+        let context = Context::new(());
+        let request_id = context.id().to_string();
+        let state = build_request_end_trace_state_for_policy(
+            &preprocessed_request(SamplingOptions::default()),
+            &Some(Arc::new(RequestTracker::new())),
+            &context,
+            2,
+            true,
+        )
+        .expect("request is traced");
+
+        context.context().kill();
+        drop(state);
+
+        let records = drain_request_records(&mut receiver, &request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(termination(&records[0]).as_deref(), Some("cancelled"));
     }
 
     #[test]

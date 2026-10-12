@@ -540,6 +540,77 @@ mod tests {
     }
 
     #[test]
+    fn capture_request_end_headers_keeps_256_bytes_and_cuts_257() {
+        let capture_list = vec![
+            "x-session-id".to_string(),
+            "x-parent-session-id".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-id",
+            "a".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "x-parent-session-id",
+            "b".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES + 1)
+                .parse()
+                .unwrap(),
+        );
+
+        let captured = capture_request_end_http_headers_with_list(&headers, &capture_list)
+            .expect("allowlisted headers are captured");
+        assert_eq!(
+            captured["x-session-id"],
+            "a".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES)
+        );
+        assert_eq!(
+            captured["x-parent-session-id"],
+            "b".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES)
+        );
+    }
+
+    #[test]
+    fn capture_request_end_headers_joins_repeats_and_drops_empty_and_non_ascii() {
+        let capture_list = vec![
+            "x-session-id".to_string(),
+            "thread-id".to_string(),
+            "x-dynamo-session-id".to_string(),
+            "nvcf-reqid".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.append("x-session-id", "rep-a".parse().unwrap());
+        headers.append("x-session-id", "rep-b".parse().unwrap());
+        headers.insert("thread-id", "".parse().unwrap());
+        headers.insert(
+            "x-dynamo-session-id",
+            axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
+        headers.insert("nvcf-reqid", "r-1".parse().unwrap());
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+
+        let captured = capture_request_end_http_headers_with_list(&headers, &capture_list)
+            .expect("allowlisted headers are captured");
+        assert_eq!(
+            captured,
+            BTreeMap::from([
+                ("nvcf-reqid".to_string(), "r-1".to_string()),
+                ("x-session-id".to_string(), "rep-a, rep-b".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn capture_request_end_headers_only_empty_values_captures_nothing() {
+        let capture_list = vec!["x-session-id".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "".parse().unwrap());
+
+        assert!(capture_request_end_http_headers_with_list(&headers, &capture_list).is_none());
+    }
+
+    #[test]
     fn capture_http_headers_empty_list_captures_nothing() {
         let mut headers = HeaderMap::new();
         headers.insert("x-request-id", "abc-123".parse().unwrap());

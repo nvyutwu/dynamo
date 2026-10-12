@@ -49,6 +49,21 @@ impl SharedFinishReasonMetadata {
         self.state.lock()
     }
 
+    /// See [`FinishReasonMetadata::mark_cancelled_if_unfinished`].
+    pub(crate) fn mark_cancelled_if_unfinished(&self) {
+        self.lock().metadata.mark_cancelled_if_unfinished();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_choice_finish_reason_for_test(
+        &self,
+        choice_index: u32,
+        finish_reason: dynamo_protocols::types::FinishReason,
+    ) {
+        self.lock()
+            .record_choice_finish_reason(choice_index, finish_reason);
+    }
+
     #[cfg(feature = "request-trace-bench")]
     #[doc(hidden)]
     pub fn record_tool_call_chunk_for_bench(

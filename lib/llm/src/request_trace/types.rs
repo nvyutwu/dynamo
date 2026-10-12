@@ -205,7 +205,16 @@ pub struct FinishReasonMetadata {
     /// fields remain as a compact summary for the common single-choice case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<ChoiceFinishReasonMetadata>,
+
+    /// How the request ended when neither the engine nor the response carried a
+    /// finish reason. `cancelled`: the response stream was dropped before its end
+    /// (client or gateway disconnect) or the request was killed before it started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub termination: Option<String>,
 }
+
+/// `FinishReasonMetadata::termination` for requests that ended without a finish reason.
+pub const TERMINATION_CANCELLED: &str = "cancelled";
 
 impl FinishReasonMetadata {
     pub fn is_empty(&self) -> bool {
@@ -214,6 +223,14 @@ impl FinishReasonMetadata {
             && self.stop_reason.is_none()
             && self.tool_calls.is_empty()
             && self.choices.is_empty()
+            && self.termination.is_none()
+    }
+
+    /// Mark the request `cancelled` unless a finish reason (OpenAI or engine) was recorded.
+    pub fn mark_cancelled_if_unfinished(&mut self) {
+        if self.finish_reason.is_none() && self.backend_finish_reason.is_none() {
+            self.termination = Some(TERMINATION_CANCELLED.to_string());
+        }
     }
 
     pub fn record_choice_finish_reason(
