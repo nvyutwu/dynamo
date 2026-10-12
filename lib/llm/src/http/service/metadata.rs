@@ -137,7 +137,9 @@ pub fn extract_metadata_from_header_pairs(
     )
 }
 
-pub(super) fn attach_x_request_id<T: Send + Sync + 'static>(
+/// Attach the request-trace values taken from HTTP headers: `x-request-id` and the
+/// `request_end` header allowlist.
+pub(super) fn attach_request_trace_headers<T: Send + Sync + 'static>(
     request: &mut Context<T>,
     headers: &HeaderMap,
 ) {
@@ -152,6 +154,13 @@ pub(super) fn attach_x_request_id<T: Send + Sync + 'static>(
         request.insert(
             crate::request_trace::X_REQUEST_ID_CONTEXT_KEY,
             x_request_id.to_string(),
+        );
+    }
+    if let Some(captured) = crate::request_trace::payload::capture_request_end_http_headers(headers)
+    {
+        request.insert(
+            crate::request_trace::REQUEST_END_HTTP_HEADERS_CONTEXT_KEY,
+            captured,
         );
     }
 }

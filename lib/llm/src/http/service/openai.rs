@@ -40,7 +40,7 @@ use super::{
         monitor_for_disconnects_with_activity, monitor_for_disconnects_with_error_signal,
     },
     error::{HttpError, invalid_argument},
-    metadata::{attach_x_request_id, extract_metadata_from_http},
+    metadata::{attach_request_trace_headers, extract_metadata_from_http},
     metrics::{
         CancellationLabels, Endpoint, ErrorType, EventConverter,
         process_chat_response_and_observe_metrics,
@@ -877,7 +877,7 @@ where
     let metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
-    attach_x_request_id(&mut request, headers);
+    attach_request_trace_headers(&mut request, headers);
     if let Some(mut agent_context) = agent_context_from_headers(headers) {
         agent_context.input_trigger = classify_input_trigger(request.content());
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);
@@ -899,6 +899,16 @@ fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
         target.insert(
             crate::request_trace::X_REQUEST_ID_CONTEXT_KEY,
             x_request_id.as_ref().clone(),
+        );
+    }
+    if crate::request_trace::is_enabled()
+        && let Ok(captured) = source.get::<std::collections::BTreeMap<String, String>>(
+            crate::request_trace::REQUEST_END_HTTP_HEADERS_CONTEXT_KEY,
+        )
+    {
+        target.insert(
+            crate::request_trace::REQUEST_END_HTTP_HEADERS_CONTEXT_KEY,
+            captured.as_ref().clone(),
         );
     }
 

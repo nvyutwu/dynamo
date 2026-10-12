@@ -54,6 +54,7 @@ static BUS: TelemetryBus<RequestTraceRecord> = TelemetryBus::new();
 
 pub const DEFAULT_TOOL_EVENTS_TOPIC: &str = "agent-tool-events";
 pub(crate) const X_REQUEST_ID_CONTEXT_KEY: &str = "request_trace.x_request_id";
+pub(crate) const REQUEST_END_HTTP_HEADERS_CONTEXT_KEY: &str = "request_trace.request_end_headers";
 
 pub async fn init_from_env_with_shutdown(shutdown: CancellationToken) -> anyhow::Result<()> {
     let policy = policy();

@@ -64,7 +64,7 @@ use crate::types::Annotated;
 
 // Re-use helpers from the openai module (sibling under service/)
 use super::error::{SanitizedError, invalid_argument};
-use super::metadata::{attach_x_request_id, extract_metadata_from_http};
+use super::metadata::{attach_request_trace_headers, extract_metadata_from_http};
 use super::openai::{get_body_limit, get_or_create_request_id, warn_nvext_disabled};
 
 // ---------------------------------------------------------------------------
@@ -386,7 +386,7 @@ async fn handler_anthropic_messages(
         )
     })?;
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
-    attach_x_request_id(&mut request, &headers);
+    attach_request_trace_headers(&mut request, &headers);
     if let Some(mut agent_context) = agent_context_from_headers(&headers) {
         agent_context.input_trigger = Some(classify_anthropic_request(request.content()));
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);

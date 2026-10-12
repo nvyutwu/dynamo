@@ -89,8 +89,6 @@ fn build_request_end_trace_state_for_policy(
     trace_block_size: usize,
     request_trace_enabled: bool,
 ) -> Option<RequestEndTraceState> {
-    let has_agent_context = common_request.agent_context.is_some();
-
     if !request_trace_enabled {
         return None;
     }
@@ -137,9 +135,11 @@ fn build_request_end_trace_state_for_policy(
         },
     };
 
-    let agent = has_agent_context
-        .then(|| super::build_agent_context_trace_state(common_request, tracker, context))
-        .flatten();
+    let agent = Some(super::build_agent_context_trace_state(
+        common_request,
+        tracker,
+        context,
+    ));
 
     let output_sequence_hash_capture = replay_metrics.as_ref().map(|replay_metrics| {
         super::output_sequence_hash_capture(&common_request.token_ids, replay_metrics)
@@ -644,6 +644,81 @@ mod tests {
                 .input_length,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn request_without_agent_context_emits_model_finish_reason_and_headers() {
+        BUS.init(16);
+        let mut receiver = BUS.subscribe();
+        let tracker = Arc::new(RequestTracker::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let request = preprocessed_request(SamplingOptions::default());
+        let headers = std::collections::BTreeMap::from([
+            ("nvcf-reqid".to_string(), "3f1c".to_string()),
+            ("x-session-id".to_string(), "opencode-run-1".to_string()),
+        ]);
+        let mut context = Context::new(());
+        context.insert(
+            crate::request_trace::X_REQUEST_ID_CONTEXT_KEY,
+            "client-call-1".to_string(),
+        );
+        context.insert(
+            crate::request_trace::REQUEST_END_HTTP_HEADERS_CONTEXT_KEY,
+            headers.clone(),
+        );
+        let expected_request_id = context.id().to_string();
+        let state = build_request_end_trace_state_for_policy(
+            &request,
+            &Some(tracker.clone()),
+            &context,
+            2,
+            true,
+        );
+        let finish_reason_metadata = finish_reason_metadata_handle(&state)
+            .expect("finish reasons are tracked without an agent session");
+        crate::request_trace::record_backend_finish_reason_metadata(
+            Some(&finish_reason_metadata),
+            Some(0),
+            Some(&crate::protocols::common::FinishReason::Length),
+            None,
+        );
+        let stream = TrackerDropStream {
+            tracker,
+            dropped: dropped.clone(),
+        };
+
+        let wrapped = wrap_request_end_stream(Box::pin(stream), state);
+        drop(wrapped);
+
+        let record = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let record = receiver.recv().await.unwrap();
+                if record
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == expected_request_id)
+                {
+                    break record;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(record.agent_context.is_none());
+        assert_eq!(record.event_source, None);
+        let request = record.request.as_ref().expect("request payload");
+        assert_eq!(request.model.as_deref(), Some("test-model"));
+        assert_eq!(request.x_request_id.as_deref(), Some("client-call-1"));
+        assert_eq!(request.http_request_headers.as_ref(), Some(&headers));
+        assert_eq!(
+            request
+                .finish_reason_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.backend_finish_reason.as_deref()),
+            Some("length")
+        );
+        assert_eq!(request.output_tokens, Some(9));
     }
 
     #[test]

@@ -87,6 +87,10 @@ pub struct RequestTraceMetrics {
     pub x_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Allowlisted HTTP request headers the client sent
+    /// (`DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST`); omitted when none matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_request_headers: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -361,6 +365,7 @@ mod tests {
                 request_id: "req-1".to_string(),
                 x_request_id: None,
                 model: None,
+                http_request_headers: None,
                 input_tokens: None,
                 output_tokens: Some(4),
                 cached_tokens: None,
@@ -411,6 +416,7 @@ mod tests {
                 request_id: "req-1".to_string(),
                 x_request_id: None,
                 model: None,
+                http_request_headers: None,
                 input_tokens: Some(256),
                 output_tokens: None,
                 cached_tokens: None,

@@ -316,6 +316,7 @@ mod tests {
                 request_id: "req-123".to_string(),
                 x_request_id: None,
                 model: None,
+                http_request_headers: None,
                 input_tokens: None,
                 output_tokens: Some(7),
                 cached_tokens: None,
