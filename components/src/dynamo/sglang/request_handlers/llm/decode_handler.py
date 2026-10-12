@@ -821,7 +821,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     completion_tokens = meta_info.get("completion_tokens")
                     cached_tokens = meta_info.get("cached_tokens")
                     prefill_prompt_tokens_details = None
-                    if cached_tokens is not None and cached_tokens > 0:
+                    if cached_tokens is not None:
                         prefill_prompt_tokens_details = {"cached_tokens": cached_tokens}
                     if input_tokens is not None and completion_tokens is not None:
                         completion_usage = {

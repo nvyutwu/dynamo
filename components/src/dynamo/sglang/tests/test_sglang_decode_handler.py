@@ -1934,6 +1934,45 @@ async def test_process_token_stream_preserves_hidden_stop_token_but_not_reason()
     assert "stop_reason" not in chunks[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cached_tokens, expected_details",
+    [(0, {"cached_tokens": 0}), (5, {"cached_tokens": 5}), (None, None)],
+    ids=["miss", "hit", "unreported"],
+)
+async def test_process_token_stream_reports_cached_tokens_on_cache_miss(
+    cached_tokens, expected_details
+):
+    # A cache miss must report cached_tokens 0 (as the vLLM handler does), not omit
+    # prompt_tokens_details; only an engine that reports nothing omits it.
+    handler = _new_decode_handler()
+
+    chunks = await _collect(
+        handler._process_token_stream(
+            _stream(
+                [
+                    {
+                        "index": 0,
+                        "output_ids": [101],
+                        "meta_info": {
+                            "id": "request-1",
+                            "finish_reason": {"type": "stop"},
+                            "prompt_tokens": 7,
+                            "completion_tokens": 1,
+                            "cached_tokens": cached_tokens,
+                        },
+                    }
+                ]
+            ),
+            _Context(),
+        )
+    )
+
+    usage = chunks[0]["completion_usage"]
+    assert usage["prompt_tokens"] == 7
+    assert usage.get("prompt_tokens_details") == expected_details
+
+
 async def _collect(stream):
     return [item async for item in stream]
 
