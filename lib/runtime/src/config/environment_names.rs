@@ -638,6 +638,14 @@ pub mod llm {
         pub const DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST: &str =
             "DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST";
 
+        /// Comma/whitespace-separated allowlist of HTTP request header names to
+        /// record in `request_end` records (`request.http_request_headers`).
+        /// Unset/empty captures none. Only headers the client sent are recorded;
+        /// values are unredacted and capped at 256 bytes, so never list
+        /// credential-bearing headers.
+        pub const DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST: &str =
+            "DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST";
+
         /// S3 bucket for the S3 request-trace sink. Required when
         /// `DYN_REQUEST_TRACE_SINKS` includes `s3`.
         pub const DYN_REQUEST_TRACE_S3_BUCKET: &str = "DYN_REQUEST_TRACE_S3_BUCKET";
@@ -1056,6 +1064,7 @@ mod tests {
             llm::request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT,
             llm::request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC,
             llm::request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST,
+            llm::request_trace::DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST,
             llm::audit::DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES,
             // Model
             model::model_express::MODEL_EXPRESS_URL,

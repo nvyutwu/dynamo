@@ -166,6 +166,37 @@ pub fn capture_http_headers(headers: &HeaderMap) -> Option<BTreeMap<String, Stri
     capture_http_headers_with_list(headers, &super::policy().http_header_capture_list)
 }
 
+/// Longest header value recorded in a `request_end` record; longer values are cut on a char
+/// boundary so a client cannot inflate every trace record through one header.
+pub(crate) const MAX_REQUEST_END_HEADER_VALUE_BYTES: usize = 256;
+
+/// Collect the `request_end` header allowlist (`DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST`).
+/// `None` unless request-end records are traced and at least one listed header was sent.
+pub fn capture_request_end_http_headers(headers: &HeaderMap) -> Option<BTreeMap<String, String>> {
+    let policy = super::policy();
+    if !super::is_enabled() || !policy.emit_request_end_records() {
+        return None;
+    }
+    capture_request_end_http_headers_with_list(headers, &policy.request_end_header_capture_list)
+}
+
+fn capture_request_end_http_headers_with_list(
+    headers: &HeaderMap,
+    capture_list: &[String],
+) -> Option<BTreeMap<String, String>> {
+    let mut captured = capture_http_headers_with_list(headers, capture_list)?;
+    for value in captured.values_mut() {
+        if value.len() > MAX_REQUEST_END_HEADER_VALUE_BYTES {
+            let mut end = MAX_REQUEST_END_HEADER_VALUE_BYTES;
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            value.truncate(end);
+        }
+    }
+    Some(captured)
+}
+
 fn capture_http_headers_with_list(
     headers: &HeaderMap,
     capture_list: &[String],
@@ -462,6 +493,121 @@ mod tests {
             !captured.contains_key("authorization"),
             "non-allowlisted header must never be captured"
         );
+    }
+
+    #[test]
+    fn capture_request_end_headers_records_only_sent_allowlisted_headers() {
+        let capture_list = vec![
+            "x-claude-code-session-id".to_string(),
+            "thread-id".to_string(),
+            "nvcf-reqid".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Claude-Code-Session-Id", "sess-1".parse().unwrap());
+        headers.insert("nvcf-reqid", "3f1c".parse().unwrap());
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+
+        let captured = capture_request_end_http_headers_with_list(&headers, &capture_list)
+            .expect("sent allowlisted headers are captured");
+        assert_eq!(
+            captured,
+            BTreeMap::from([
+                ("nvcf-reqid".to_string(), "3f1c".to_string()),
+                ("x-claude-code-session-id".to_string(), "sess-1".to_string()),
+            ]),
+            "unsent allowlisted headers are absent and non-allowlisted headers are never captured"
+        );
+
+        assert!(
+            capture_request_end_http_headers_with_list(&HeaderMap::new(), &capture_list).is_none(),
+            "a request without any allowlisted header records nothing"
+        );
+    }
+
+    #[test]
+    fn capture_request_end_headers_caps_value_length() {
+        let capture_list = vec!["x-session-id".to_string()];
+        let long_value = "s".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES + 50);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", long_value.parse().unwrap());
+
+        let captured = capture_request_end_http_headers_with_list(&headers, &capture_list)
+            .expect("allowlisted header is captured");
+        assert_eq!(
+            captured["x-session-id"].len(),
+            MAX_REQUEST_END_HEADER_VALUE_BYTES
+        );
+    }
+
+    #[test]
+    fn capture_request_end_headers_keeps_256_bytes_and_cuts_257() {
+        let capture_list = vec![
+            "x-session-id".to_string(),
+            "x-parent-session-id".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-id",
+            "a".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "x-parent-session-id",
+            "b".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES + 1)
+                .parse()
+                .unwrap(),
+        );
+
+        let captured = capture_request_end_http_headers_with_list(&headers, &capture_list)
+            .expect("allowlisted headers are captured");
+        assert_eq!(
+            captured["x-session-id"],
+            "a".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES)
+        );
+        assert_eq!(
+            captured["x-parent-session-id"],
+            "b".repeat(MAX_REQUEST_END_HEADER_VALUE_BYTES)
+        );
+    }
+
+    #[test]
+    fn capture_request_end_headers_joins_repeats_and_drops_empty_and_non_ascii() {
+        let capture_list = vec![
+            "x-session-id".to_string(),
+            "thread-id".to_string(),
+            "x-dynamo-session-id".to_string(),
+            "nvcf-reqid".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.append("x-session-id", "rep-a".parse().unwrap());
+        headers.append("x-session-id", "rep-b".parse().unwrap());
+        headers.insert("thread-id", "".parse().unwrap());
+        headers.insert(
+            "x-dynamo-session-id",
+            axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
+        headers.insert("nvcf-reqid", "r-1".parse().unwrap());
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+
+        let captured = capture_request_end_http_headers_with_list(&headers, &capture_list)
+            .expect("allowlisted headers are captured");
+        assert_eq!(
+            captured,
+            BTreeMap::from([
+                ("nvcf-reqid".to_string(), "r-1".to_string()),
+                ("x-session-id".to_string(), "rep-a, rep-b".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn capture_request_end_headers_only_empty_values_captures_nothing() {
+        let capture_list = vec!["x-session-id".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "".parse().unwrap());
+
+        assert!(capture_request_end_http_headers_with_list(&headers, &capture_list).is_none());
     }
 
     #[test]

@@ -74,6 +74,7 @@ pub(crate) fn emit_request_end(
         request_id,
         x_request_id: None,
         model: None,
+        http_request_headers: None,
         input_tokens: tracker.isl_tokens().map(|v| v as u64),
         output_tokens: Some(tracker.osl_tokens()),
         cached_tokens: tracker.cached_tokens().map(|v| v as u64),
@@ -106,8 +107,10 @@ pub(crate) fn emit_request_end(
     });
 }
 
+/// Emit a `request_end` built from the per-request trace state. `event_source` stays tied to an
+/// agent session, as before, so records without one keep their previous envelope.
 pub(crate) fn emit_agent_request_end(
-    agent_context: AgentContext,
+    agent_context: Option<AgentContext>,
     mut request: RequestTraceMetrics,
 ) {
     sanitize_request(&mut request);
@@ -115,8 +118,10 @@ pub(crate) fn emit_agent_request_end(
         schema: RequestTraceSchema::V1,
         event_type: RequestTraceEventType::RequestEnd,
         event_time_unix_ms: event_time_unix_ms_from_request(&request),
-        event_source: Some(RequestTraceEventSource::Dynamo),
-        agent_context: Some(agent_context),
+        event_source: agent_context
+            .as_ref()
+            .map(|_| RequestTraceEventSource::Dynamo),
+        agent_context,
         request: Some(request),
         tool: None,
         payload: None,

@@ -3,7 +3,7 @@
 
 //! Dynamo LLM integration helpers for agent-context request trace records.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,6 +47,21 @@ struct PendingToolCallMetadata {
 impl SharedFinishReasonMetadata {
     fn lock(&self) -> parking_lot::MutexGuard<'_, FinishReasonMetadataState> {
         self.state.lock()
+    }
+
+    /// See [`FinishReasonMetadata::mark_cancelled_if_unfinished`].
+    pub(crate) fn mark_cancelled_if_unfinished(&self) {
+        self.lock().metadata.mark_cancelled_if_unfinished();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_choice_finish_reason_for_test(
+        &self,
+        choice_index: u32,
+        finish_reason: dynamo_protocols::types::FinishReason,
+    ) {
+        self.lock()
+            .record_choice_finish_reason(choice_index, finish_reason);
     }
 
     #[cfg(feature = "request-trace-bench")]
@@ -208,6 +223,7 @@ pub(crate) fn request_metrics(
         request_id,
         x_request_id,
         model: Some(model),
+        http_request_headers: None,
         input_tokens: tracker.and_then(|tracker| tracker.isl_tokens().map(|v| v as u64)),
         output_tokens: tracker.map(RequestTracker::osl_tokens),
         cached_tokens: tracker.and_then(|tracker| tracker.cached_tokens().map(|v| v as u64)),
@@ -234,12 +250,16 @@ pub(crate) fn request_metrics(
     }
 }
 
+/// Per-request `request_end` state. Built for every traced request so model, `x-request-id`,
+/// allowlisted headers and finish reasons are recorded whether or not the client sent an agent
+/// session header; `agent_context` is `Some` only when it did.
 #[derive(Clone)]
 pub(crate) struct AgentContextTraceState {
-    pub agent_context: AgentContext,
+    pub agent_context: Option<AgentContext>,
     pub request_model: String,
     pub request_tracker: Option<Arc<RequestTracker>>,
     pub x_request_id: Option<String>,
+    pub http_request_headers: Option<BTreeMap<String, String>>,
     pub finish_reason_metadata: SharedFinishReasonMetadata,
 }
 
@@ -247,8 +267,7 @@ pub(crate) fn build_agent_context_trace_state(
     common_request: &PreprocessedRequest,
     tracker: &Option<Arc<RequestTracker>>,
     context: &Context<()>,
-) -> Option<AgentContextTraceState> {
-    let agent_context = common_request.agent_context.clone()?;
+) -> AgentContextTraceState {
     let x_request_id = dynamo_runtime::logging::get_distributed_tracing_context()
         .and_then(|c| c.x_request_id)
         .or_else(|| {
@@ -257,13 +276,18 @@ pub(crate) fn build_agent_context_trace_state(
                 .ok()
                 .map(|v| v.as_ref().clone())
         });
-    Some(AgentContextTraceState {
-        agent_context,
+    let http_request_headers = context
+        .get::<BTreeMap<String, String>>(super::REQUEST_END_HTTP_HEADERS_CONTEXT_KEY)
+        .ok()
+        .map(|headers| headers.as_ref().clone());
+    AgentContextTraceState {
+        agent_context: common_request.agent_context.clone(),
         request_model: common_request.model.clone(),
         request_tracker: tracker.clone(),
         x_request_id,
+        http_request_headers,
         finish_reason_metadata: SharedFinishReasonMetadata::default(),
-    })
+    }
 }
 
 pub(crate) fn record_backend_finish_reason_metadata(
@@ -359,19 +383,20 @@ fn snapshot_finish_reason_metadata(
 pub(crate) fn request_metrics_from_agent_state(
     trace_state: AgentContextTraceState,
     request_id: String,
-) -> (AgentContext, RequestTraceMetrics) {
+) -> (Option<AgentContext>, RequestTraceMetrics) {
     let AgentContextTraceState {
         agent_context,
         request_model,
         request_tracker,
         x_request_id,
+        http_request_headers,
         finish_reason_metadata,
     } = trace_state;
 
     if request_tracker.is_none() {
         tracing::warn!(
             request_id,
-            "agent_context present but request tracker is missing; emitting partial trace"
+            "request trace state present but request tracker is missing; emitting partial trace"
         );
     }
     let mut metrics = super::request_metrics(
@@ -380,6 +405,7 @@ pub(crate) fn request_metrics_from_agent_state(
         request_model,
         request_tracker.as_deref(),
     );
+    metrics.http_request_headers = http_request_headers;
     metrics.finish_reason_metadata = snapshot_finish_reason_metadata(&finish_reason_metadata);
     (agent_context, metrics)
 }
@@ -523,6 +549,7 @@ fn tool_events_namespace(local_model: &LocalModel) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::{thread, time::Duration};
 
     use crate::protocols::common::{
@@ -622,6 +649,41 @@ mod tests {
         assert!(metrics.worker.is_none());
     }
 
+    #[test]
+    fn test_request_end_without_agent_context_keeps_finish_reason_and_headers() {
+        let finish_reason_metadata = SharedFinishReasonMetadata::default();
+        record_backend_finish_reason_metadata(
+            Some(&finish_reason_metadata),
+            Some(0),
+            Some(&common::FinishReason::Length),
+            None,
+        );
+        let headers = BTreeMap::from([
+            ("nvcf-reqid".to_string(), "3f1c".to_string()),
+            ("thread-id".to_string(), "codex-thread-7".to_string()),
+        ]);
+        let trace_state = AgentContextTraceState {
+            agent_context: None,
+            request_model: "test-model".to_string(),
+            request_tracker: None,
+            x_request_id: Some("client-call-1".to_string()),
+            http_request_headers: Some(headers.clone()),
+            finish_reason_metadata,
+        };
+
+        let (agent_context, request) =
+            request_metrics_from_agent_state(trace_state, "req-plain".to_string());
+
+        assert!(agent_context.is_none());
+        assert_eq!(request.model.as_deref(), Some("test-model"));
+        assert_eq!(request.x_request_id.as_deref(), Some("client-call-1"));
+        assert_eq!(request.http_request_headers, Some(headers));
+        let metadata = request
+            .finish_reason_metadata
+            .expect("finish metadata is recorded without an agent session");
+        assert_eq!(metadata.backend_finish_reason.as_deref(), Some("length"));
+    }
+
     #[tokio::test]
     async fn test_chat_request_end_records_finish_reason_metadata() {
         let finish_reason_metadata = SharedFinishReasonMetadata::default();
@@ -633,16 +695,17 @@ mod tests {
         );
 
         let trace_state = AgentContextTraceState {
-            agent_context: AgentContext {
+            agent_context: Some(AgentContext {
                 session_id: "run-finish:agent".to_string(),
                 parent_session_id: None,
                 session_final: None,
                 compaction: None,
                 input_trigger: None,
-            },
+            }),
             request_model: "test-model".to_string(),
             request_tracker: None,
             x_request_id: Some("llm-call-1".to_string()),
+            http_request_headers: None,
             finish_reason_metadata,
         };
 
@@ -751,16 +814,17 @@ mod tests {
         );
 
         let trace_state = AgentContextTraceState {
-            agent_context: AgentContext {
+            agent_context: Some(AgentContext {
                 session_id: "run-completion-finish:agent".to_string(),
                 parent_session_id: None,
                 session_final: None,
                 compaction: None,
                 input_trigger: None,
-            },
+            }),
             request_model: "test-model".to_string(),
             request_tracker: None,
             x_request_id: Some("completion-call-1".to_string()),
+            http_request_headers: None,
             finish_reason_metadata,
         };
 

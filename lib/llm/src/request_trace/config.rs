@@ -96,6 +96,8 @@ pub struct RequestTracePolicy {
     pub nats_subject: String,
     pub otel_max_payload_bytes: usize,
     pub http_header_capture_list: Vec<String>,
+    /// Request headers recorded in `request_end` records; independent of payload capture.
+    pub request_end_header_capture_list: Vec<String>,
     pub tool_events_zmq_endpoint: Option<String>,
     pub tool_events_zmq_topic: Option<String>,
     pub s3_bucket: Option<String>,
@@ -195,22 +197,9 @@ fn load_from_env() -> RequestTracePolicy {
     .filter(|value| *value > 0)
     .unwrap_or(DEFAULT_OTEL_MAX_PAYLOAD_BYTES);
     let http_header_capture_list =
-        std::env::var(env_request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST)
-            .ok()
-            .map(|raw| {
-                let mut names = Vec::new();
-                for name in raw
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .map(str::to_ascii_lowercase)
-                    .filter(|name| !name.is_empty())
-                {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
-                }
-                names
-            })
-            .unwrap_or_default();
+        env_header_list(env_request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST);
+    let request_end_header_capture_list =
+        env_header_list(env_request_trace::DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST);
     let tool_events_zmq_endpoint =
         std::env::var(env_request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT)
             .ok()
@@ -249,6 +238,7 @@ fn load_from_env() -> RequestTracePolicy {
         nats_subject,
         otel_max_payload_bytes,
         http_header_capture_list,
+        request_end_header_capture_list,
         tool_events_zmq_endpoint,
         tool_events_zmq_topic,
         s3_bucket,
@@ -376,6 +366,24 @@ fn env_trimmed(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Lowercased, de-duplicated header names from a comma/whitespace-separated variable.
+fn env_header_list(name: &str) -> Vec<String> {
+    let Ok(raw) = std::env::var(name) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for name in raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::to_ascii_lowercase)
+        .filter(|name| !name.is_empty())
+    {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn env_usize(names: &[&str]) -> Option<usize> {
     names.iter().find_map(|name| {
         std::env::var(name)
@@ -455,6 +463,7 @@ mod tests {
         env_request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT,
         env_request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC,
         env_request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST,
+        env_request_trace::DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST,
         env_audit::DYN_AUDIT_SINKS,
         env_audit::DYN_AUDIT_FORCE_LOGGING,
         env_audit::DYN_AUDIT_CAPACITY,
@@ -563,6 +572,33 @@ mod tests {
         with_request_trace_env(&[(env_request_trace::DYN_REQUEST_TRACE, "1")], || {
             let policy = load_from_env();
             assert!(policy.http_header_capture_list.is_empty());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn request_end_header_capture_list_is_independent_of_payload_list() {
+        with_request_trace_env(
+            &[
+                (env_request_trace::DYN_REQUEST_TRACE, "1"),
+                (
+                    env_request_trace::DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST,
+                    "X-Claude-Code-Session-Id thread-id,NVCF-REQID, thread-id",
+                ),
+            ],
+            || {
+                let policy = load_from_env();
+                assert_eq!(
+                    policy.request_end_header_capture_list,
+                    vec!["x-claude-code-session-id", "thread-id", "nvcf-reqid"]
+                );
+                assert!(policy.http_header_capture_list.is_empty());
+            },
+        );
+
+        with_request_trace_env(&[(env_request_trace::DYN_REQUEST_TRACE, "1")], || {
+            let policy = load_from_env();
+            assert!(policy.request_end_header_capture_list.is_empty());
         });
     }
 

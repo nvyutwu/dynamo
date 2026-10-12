@@ -352,6 +352,10 @@ See [Forward Pass Metrics Trace Reference](forward-pass-metrics-traces.mdx) for 
   Comma- or whitespace-separated allowlist of HTTP header names captured on `request_payload` rows. Values are not redacted.
 </ParamField>
 
+<ParamField path="DYN_REQUEST_TRACE_REQUEST_END_HEADER_CAPTURE_LIST" type="string">
+  Comma- or whitespace-separated allowlist of HTTP header names recorded on `request_end` rows as `request.http_request_headers`, independent of payload capture. Only headers the client sent appear; values are not redacted and are cut at 256 bytes. Do not list credential-bearing headers.
+</ParamField>
+
 See [Request Trace Reference](request-traces.mdx) for compatibility aliases, sink behavior, and record semantics.
 
 ## Related
