@@ -446,6 +446,7 @@ def _new_decode_handler(*, enable_frontend_decoding: bool):
     handler._image_loader = None
     handler._video_loader = None
     handler._mm_hashes_supported = False
+    handler._mm_limits = {}
 
     @asynccontextmanager
     async def no_cancellation_monitor(*args, **kwargs):
