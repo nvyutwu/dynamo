@@ -287,7 +287,7 @@ impl
                         return Some((output, state));
                     };
 
-                    let result = match decoder.process_token_ids(&data.token_ids) {
+                    let mut result = match decoder.process_token_ids(&data.token_ids) {
                         Ok(result) => result,
                         Err(e) => {
                             tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
@@ -304,6 +304,15 @@ impl
                             return Some((output, state));
                         }
                     };
+
+                    if result.stop_trigger.is_none() && data.finish_reason.is_some()
+                        && let Some(pending) = decoder.flush_pending()
+                    {
+                        result.text.get_or_insert_with(String::new).push_str(&pending);
+                        if let Some(token) = result.tokens.last_mut() {
+                            token.get_or_insert_with(String::new).push_str(&pending);
+                        }
+                    }
 
                     // NOTE: the `finish_reason` is computed from the generated `token_ids` alone.
                     // The `data` field can have a `finish_reason` set, coming from the underlying
@@ -637,47 +646,73 @@ impl Decoder {
             .min()
     }
 
-    /// Append `new_text` to the jail and check the stop sequences. Returns the part of
-    /// `new_text` to emit and the trigger when a stop sequence is found.
-    fn match_stop_sequences(&mut self, new_text: &str) -> Option<(String, StopTrigger)> {
-        let pre_append = self.jail.len();
+    /// Match stops before releasing text. The jail retains search history plus any
+    /// suffix that could still become a hidden stop string on a later token.
+    fn match_stop_sequences(&mut self, new_text: &str) -> StepResult {
+        let pending_start = self.jail.len() - self.jailed_bytes;
         self.jail.push_str(new_text);
 
-        // Check hidden stop sequences first (excluded from output)
-        for seq in &self.hidden_stop_sequences {
-            if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes()) {
-                // return only new bytes after pre_append .. offset (excluding stop sequence);
-                // a match that started in previously returned text returns ""
-                let partial = if offset >= pre_append {
-                    self.jail[pre_append..offset].to_string()
-                } else {
-                    String::new()
-                };
-                return Some((
-                    partial,
-                    StopTrigger::HiddenStopSequenceDetected(seq.to_string()),
-                ));
-            }
+        let hidden_match = self
+            .hidden_stop_sequences
+            .iter()
+            .filter_map(|seq| {
+                galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
+                    .map(|offset| (offset, seq))
+            })
+            .min_by_key(|(offset, _)| *offset);
+        if let Some((offset, seq)) = hidden_match {
+            let emitted = self.jail[pending_start..offset.max(pending_start)].to_string();
+            let trigger = StopTrigger::HiddenStopSequenceDetected(seq.clone());
+            self.jail.clear();
+            self.jailed_bytes = 0;
+            return StepResult::with_stop_trigger(Some(emitted), trigger);
         }
 
-        // Check visible stop sequences (included in output)
-        for seq in &self.visible_stop_sequences {
-            if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes()) {
-                let stop_end = offset + seq.len();
-                let with_stop = if stop_end > pre_append {
-                    self.jail[pre_append..stop_end].to_string()
-                } else {
-                    String::new()
-                };
-                return Some((
-                    with_stop,
-                    StopTrigger::VisibleStopSequenceDetected(seq.to_string()),
-                ));
-            }
+        let visible_match = self
+            .visible_stop_sequences
+            .iter()
+            .filter_map(|seq| {
+                galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
+                    .map(|offset| (offset, seq))
+            })
+            .min_by_key(|(offset, _)| *offset);
+        if let Some((offset, seq)) = visible_match {
+            let stop_end = offset + seq.len();
+            let emitted = self.jail[pending_start..stop_end.max(pending_start)].to_string();
+            let trigger = StopTrigger::VisibleStopSequenceDetected(seq.clone());
+            self.jail.clear();
+            self.jailed_bytes = 0;
+            return StepResult::with_stop_trigger(Some(emitted), trigger);
         }
 
+        // Only hidden stops need emission buffering. UTF-8 character boundaries
+        // ensure a withheld prefix never divides a code point.
+        let held = self
+            .hidden_stop_sequences
+            .iter()
+            .map(|seq| {
+                seq.char_indices()
+                    .rev()
+                    .map(|(len, _)| len)
+                    .find(|&len| len > 0 && self.jail.ends_with(&seq[..len]))
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0);
+        let emit_end = self.jail.len() - held;
+        let emitted = self.jail[pending_start..emit_end].to_string();
+        self.jailed_bytes = held;
         Self::maybe_drain_to_max_bytes(&mut self.jail, self.jail_max_bytes);
-        None
+        StepResult::ok(Some(emitted))
+    }
+
+    /// An unfinished stop prefix is ordinary text when generation ends without
+    /// a string match. Drain it once at EOS or an engine-supplied finish.
+    fn flush_pending(&mut self) -> Option<String> {
+        let pending = self.jailed_string();
+        self.jailed_bytes = 0;
+        self.jail.clear();
+        pending
     }
 
     /// Minimum amount of work to determine if a given generated/decoded sequence should be stopped
@@ -707,6 +742,13 @@ impl Decoder {
 
         // Check token stops. Visible token IDs are included in output.
         if self.visible_stop_ids.contains(&token_id) {
+            let token = match (self.flush_pending(), token) {
+                (Some(mut pending), Some(token)) => {
+                    pending.push_str(&token);
+                    Some(pending)
+                }
+                (pending, token) => pending.or(token),
+            };
             return Ok(StepResult::with_stop_trigger(
                 token,
                 StopTrigger::VisibleStopTokenDetected(token_id),
@@ -721,7 +763,7 @@ impl Decoder {
             } else {
                 StopTrigger::HiddenStopTokenDetected(token_id)
             };
-            return Ok(StepResult::with_stop_trigger(None, trigger));
+            return Ok(StepResult::with_stop_trigger(self.flush_pending(), trigger));
         }
 
         // While the model is still reasoning, stop sequences do not apply; start matching
@@ -745,23 +787,21 @@ impl Decoder {
             let answer_start = end.saturating_sub(tail_start).min(token.len());
             let answer = self.reasoning_tail[end..].to_string();
             self.reasoning_tail.clear();
-            if !answer.is_empty()
-                && let Some((emitted, trigger)) = self.match_stop_sequences(&answer)
-            {
-                let mut out = token[..answer_start].to_string();
+            let mut result = self.match_stop_sequences(&answer);
+            let mut out = token[..answer_start].to_string();
+            if let Some(emitted) = result.token.take() {
                 out.push_str(&emitted);
-                return Ok(StepResult::with_stop_trigger(Some(out), trigger));
             }
-            return Ok(StepResult::ok(Some(token.clone())));
+            result.token = Some(out);
+            return Ok(result);
         }
 
         // check stop sequences - the jail will always hold at least the largest stop sequence
         // if jail_max_bytes is 0, then there are no stop sequences
         if self.jail_max_bytes > 0
             && let Some(token) = &token
-            && let Some((emitted, trigger)) = self.match_stop_sequences(token)
         {
-            return Ok(StepResult::with_stop_trigger(Some(emitted), trigger));
+            return Ok(self.match_stop_sequences(token));
         }
 
         Ok(StepResult::ok(token))
@@ -963,6 +1003,235 @@ mod tests {
             }
         }
         (out, false)
+    }
+
+    fn stop_prefix_decoder(
+        pieces: &'static [&'static str],
+        stops: &[&str],
+        include_stop: bool,
+    ) -> Decoder {
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(PieceDecoder(pieces));
+        Decoder::new(
+            crate::tokenizers::DecodeStream::new(tokenizer, &[], false),
+            StopConditions {
+                stop: Some(stops.iter().map(|s| s.to_string()).collect()),
+                stop_token_ids_hidden: Some(vec![99]),
+                ..Default::default()
+            },
+            include_stop,
+            None,
+        )
+    }
+
+    #[test]
+    fn stop_prefix_is_withheld_until_full_match() {
+        let mut decoder =
+            stop_prefix_decoder(&["alpha", " STOP", "_HERE", " beta"], &["STOP_HERE"], false);
+        assert_eq!(decoder.step(0).unwrap().token.as_deref(), Some("alpha"));
+        assert_eq!(decoder.step(1).unwrap().token.as_deref(), Some(" "));
+        let last = decoder.step(2).unwrap();
+        assert_eq!(last.token.as_deref().unwrap_or(""), "");
+        assert!(
+            matches!(last.stop_trigger, Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "STOP_HERE")
+        );
+    }
+
+    #[test]
+    fn stop_prefix_handles_one_character_per_token() {
+        let mut decoder = stop_prefix_decoder(
+            &["alpha ", "S", "T", "O", "P", "_", "H", "E", "R", "E"],
+            &["STOP_HERE"],
+            false,
+        );
+        let result = decoder
+            .process_token_ids(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("alpha "));
+        assert!(result.stop_trigger.is_some());
+    }
+
+    #[test]
+    fn stop_prefix_false_alarm_releases_buffered_text() {
+        let mut decoder =
+            stop_prefix_decoder(&["alpha STOP", "_OTHER beta"], &["STOP_HERE"], false);
+        assert_eq!(decoder.step(0).unwrap().token.as_deref(), Some("alpha "));
+        let next = decoder.step(1).unwrap();
+        assert_eq!(next.token.as_deref(), Some("STOP_OTHER beta"));
+        assert!(next.stop_trigger.is_none());
+    }
+
+    #[test]
+    fn stop_prefix_unicode_and_overlapping_stops() {
+        let mut decoder =
+            stop_prefix_decoder(&["hello ", "é", "终", "止 tail"], &["é终止", "终止"], false);
+        let result = decoder.process_token_ids(&[0, 1, 2, 3]).unwrap();
+        assert_eq!(result.text.as_deref(), Some("hello "));
+        assert!(
+            matches!(result.stop_trigger, Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "é终止")
+        );
+    }
+
+    #[test]
+    fn stop_prefix_selects_earliest_match_in_a_chunk() {
+        let mut decoder =
+            stop_prefix_decoder(&["alpha STOP_HERE beta"], &["beta", "STOP_HERE"], false);
+        let result = decoder.step(0).unwrap();
+        assert_eq!(result.token.as_deref(), Some("alpha "));
+        assert!(
+            matches!(result.stop_trigger, Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "STOP_HERE")
+        );
+    }
+
+    #[test]
+    fn stop_prefix_visible_stop_is_returned() {
+        let mut decoder =
+            stop_prefix_decoder(&["alpha", " STOP", "_HERE beta"], &["STOP_HERE"], true);
+        let result = decoder.process_token_ids(&[0, 1, 2]).unwrap();
+        assert_eq!(result.text.as_deref(), Some("alpha STOP_HERE"));
+        assert!(matches!(
+            result.stop_trigger,
+            Some(StopTrigger::VisibleStopSequenceDetected(_))
+        ));
+    }
+
+    #[test]
+    fn stop_prefix_after_reasoning_end_is_withheld() {
+        let pieces = &[
+            "STOP_HERE in reasoning",
+            "<|close|>think<|sep|>alpha STOP",
+            "_HERE beta",
+        ];
+        let mut decoder =
+            stop_prefix_decoder(pieces, &["STOP_HERE"], false).with_reasoning_start(true);
+        let result = decoder.process_token_ids(&[0, 1, 2]).unwrap();
+        assert_eq!(
+            result.text.as_deref(),
+            Some("STOP_HERE in reasoning<|close|>think<|sep|>alpha ")
+        );
+        assert!(result.stop_trigger.is_some());
+    }
+
+    #[test]
+    fn stop_prefix_unmatched_suffix_is_flushed_at_eos() {
+        let mut decoder = stop_prefix_decoder(&["alpha STOP", "<eos>"], &["STOP_HERE"], false);
+        decoder.hidden_stop_ids.insert(1);
+        assert_eq!(decoder.step(0).unwrap().token.as_deref(), Some("alpha "));
+        let terminal = decoder.step(1).unwrap();
+        assert_eq!(terminal.token.as_deref(), Some("STOP"));
+        assert!(matches!(
+            terminal.stop_trigger,
+            Some(StopTrigger::HiddenStopTokenDetected(1))
+        ));
+        assert!(decoder.flush_pending().is_none());
+    }
+
+    #[test]
+    fn stop_prefix_visible_token_stop_flushes_pending_text() {
+        let mut decoder = stop_prefix_decoder(&["alpha STOP", "!"], &["STOP_HERE"], false);
+        decoder.visible_stop_ids.insert(1);
+        assert_eq!(decoder.step(0).unwrap().token.as_deref(), Some("alpha "));
+        let terminal = decoder.step(1).unwrap();
+        assert_eq!(terminal.token.as_deref(), Some("STOP!"));
+        assert!(matches!(
+            terminal.stop_trigger,
+            Some(StopTrigger::VisibleStopTokenDetected(1))
+        ));
+    }
+
+    #[test]
+    fn stop_prefix_choices_keep_independent_pending_text() {
+        let pieces = &["alpha STOP", "second STOP", "_HERE", "_OTHER"];
+        let mut first = stop_prefix_decoder(pieces, &["STOP_HERE"], false);
+        let mut second = stop_prefix_decoder(pieces, &["STOP_HERE"], false);
+        assert_eq!(first.step(0).unwrap().token.as_deref(), Some("alpha "));
+        assert_eq!(second.step(1).unwrap().token.as_deref(), Some("second "));
+        assert_eq!(first.step(2).unwrap().token.as_deref(), Some(""));
+        assert_eq!(second.step(3).unwrap().token.as_deref(), Some("STOP_OTHER"));
+    }
+
+    struct SyntheticStopPrefixEndEngine {
+        terminal_has_tokens: bool,
+        finish_reason: FinishReason,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for SyntheticStopPrefixEndEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let mut outputs = Vec::new();
+            if !self.terminal_has_tokens {
+                outputs.push(Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![0],
+                    index: Some(0),
+                    ..Default::default()
+                }));
+            }
+            outputs.push(Annotated::from_data(LLMEngineOutput {
+                token_ids: if self.terminal_has_tokens {
+                    vec![0]
+                } else {
+                    vec![]
+                },
+                finish_reason: Some(self.finish_reason.clone()),
+                index: Some(0),
+                ..Default::default()
+            }));
+            Ok(ResponseStream::new(
+                Box::pin(futures::stream::iter(outputs)),
+                request.context(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_prefix_engine_finish_flushes_with_and_without_token_ids() {
+        for terminal_has_tokens in [false, true] {
+            for finish_reason in [FinishReason::Stop, FinishReason::Length] {
+                let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(PieceDecoder(&["alpha STOP"]));
+                let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+                let request = PreprocessedRequest::builder()
+                    .model("test-model".to_string())
+                    .token_ids(vec![])
+                    .stop_conditions(StopConditions {
+                        stop: Some(vec!["STOP_HERE".to_string()]),
+                        ..Default::default()
+                    })
+                    .sampling_options(SamplingOptions::default())
+                    .output_options(OutputOptions::default())
+                    .build()
+                    .unwrap();
+                let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+                    Arc::new(SyntheticStopPrefixEndEngine {
+                        terminal_has_tokens,
+                        finish_reason: finish_reason.clone(),
+                    });
+                let mut stream =
+                    Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+                        .await
+                        .unwrap();
+                let mut text = String::new();
+                let mut tokens = Vec::new();
+                let mut finish = None;
+                while let Some(output) = stream.next().await {
+                    let data = output.data.unwrap();
+                    text.push_str(data.text.as_deref().unwrap_or(""));
+                    tokens.extend(data.token_ids);
+                    if data.finish_reason.is_some() {
+                        finish = data.finish_reason;
+                    }
+                }
+                assert_eq!(
+                    text, "alpha STOP",
+                    "terminal_has_tokens={terminal_has_tokens}"
+                );
+                assert_eq!(tokens, vec![0], "buffer flush must not invent token IDs");
+                assert_eq!(finish, Some(finish_reason));
+            }
+        }
     }
 
     const K3_PIECES: &[&str] = &[
