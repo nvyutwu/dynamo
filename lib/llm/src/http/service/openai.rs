@@ -4599,6 +4599,7 @@ pub fn validate_responses_fields(request: &NvCreateResponse) -> Result<(), Error
     validate::validate_temperature(request.inner.temperature).map_err(&map_err)?;
     validate::validate_top_p(request.inner.top_p).map_err(&map_err)?;
     validate::validate_max_tokens(request.inner.max_output_tokens).map_err(&map_err)?;
+    validate::validate_stop(&request.stop).map_err(&map_err)?;
 
     if let Some(text) = &request.inner.text {
         use crate::protocols::openai::responses::convert_text_format;
@@ -6445,6 +6446,7 @@ mod tests {
             },
             nvext: None,
             chat_template_args: None,
+            stop: None,
             thinking_token_budget: None,
         }
     }
@@ -8097,6 +8099,30 @@ mod tests {
     #[test]
     fn test_validate_responses_fields_accepts_clean_request() {
         assert!(validate_responses_fields(&make_base_request()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_responses_stop_extension() {
+        use dynamo_protocols::types::Stop;
+        for stop in [
+            Stop::String(String::new()),
+            Stop::StringArray(vec![]),
+            Stop::StringArray(vec!["STOP_HERE".into(), String::new()]),
+            Stop::StringArray(vec!["STOP_HERE".into(); 33]),
+        ] {
+            let mut request = make_base_request();
+            request.stop = Some(stop);
+            let (code, body) =
+                validate_responses_fields(&request).expect_err("invalid stop must be rejected");
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert!(body.message.to_lowercase().contains("stop"));
+        }
+        let mut request = make_base_request();
+        request.stop = Some(Stop::StringArray(vec![
+            "STOP_HERE".into(),
+            "終了_MARKER".into(),
+        ]));
+        assert!(validate_responses_fields(&request).is_ok());
     }
 
     #[test]

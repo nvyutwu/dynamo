@@ -207,6 +207,7 @@ mod tests {
             },
             nvext: None,
             chat_template_args: None,
+            stop: None,
             thinking_token_budget: None,
         }
     }
@@ -220,6 +221,7 @@ mod tests {
             },
             nvext: None,
             chat_template_args: None,
+            stop: None,
             thinking_token_budget: None,
         }
     }

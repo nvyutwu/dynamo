@@ -75,6 +75,13 @@ pub struct NvCreateResponse {
     /// `thinking_token_budget` sampling parameter when supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_token_budget: Option<u32>,
+
+    /// Dynamo extension: hidden stop strings or token IDs, using Chat Completions
+    /// semantics and validation. The standard Responses API has no `stop` field;
+    /// omission preserves the existing behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub stop: Option<dynamo_protocols::types::Stop>,
 }
 
 #[derive(ToSchema, Deserialize, Validate, Debug, Clone)]
@@ -236,7 +243,11 @@ impl OpenAIStopConditionsProvider for NvCreateResponse {
     }
 
     fn get_stop(&self) -> Option<Vec<String>> {
-        None
+        self.stop.as_ref().and_then(|stop| stop.strings())
+    }
+
+    fn get_stop_token_ids(&self) -> Option<Vec<crate::types::TokenIdType>> {
+        self.stop.as_ref().and_then(|stop| stop.token_ids())
     }
 
     fn nvext(&self) -> Option<&NvExt> {
@@ -1027,6 +1038,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
 
         Ok(NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
+                stop: resp.stop,
                 messages,
                 model: resp.inner.model.unwrap_or_default(),
                 temperature: resp.inner.temperature,
@@ -1476,6 +1488,7 @@ mod tests {
             },
             nvext: None,
             chat_template_args: None,
+            stop: None,
             thinking_token_budget: None,
         }
     }
@@ -2501,6 +2514,7 @@ mod tests {
                 },
                 nvext: None,
                 chat_template_args: None,
+                stop: None,
                 thinking_token_budget: None,
             };
 
@@ -4407,6 +4421,82 @@ mod tests {
 
         // nvext should be omitted when None
         assert!(json.get("nvext").is_none());
+    }
+
+    #[test]
+    fn test_stop_extension_reaches_chat_and_decoder_conditions() {
+        use crate::protocols::common::StopConditionsProvider;
+        for stream in [false, true] {
+            for stop in [
+                serde_json::json!("STOP_HERE"),
+                serde_json::json!(["beta", "STOP_HERE"]),
+                serde_json::json!(["終了_MARKER"]),
+            ] {
+                let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+                    "model": "test-model", "input": "alpha STOP_HERE beta", "stream": stream,
+                    "stop": stop
+                }))
+                .unwrap();
+                let expected = req.get_stop().unwrap();
+                let serialized = serde_json::to_value(&req).unwrap();
+                assert_eq!(serialized["stop"], stop);
+                let req: NvCreateResponse = serde_json::from_value(serialized).unwrap();
+                assert_eq!(
+                    req.extract_stop_conditions().unwrap().stop,
+                    Some(expected.clone())
+                );
+                let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+                assert_eq!(chat.get_stop(), Some(expected.clone()));
+                assert_eq!(chat.extract_stop_conditions().unwrap().stop, Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn test_stop_extension_absent_or_null_preserves_default() {
+        for extra in [serde_json::json!({}), serde_json::json!({"stop": null})] {
+            let mut body = serde_json::json!({"model": "test-model", "input": "hello"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let req: NvCreateResponse = serde_json::from_value(body).unwrap();
+            assert!(req.get_stop().is_none());
+            assert!(serde_json::to_value(&req).unwrap().get("stop").is_none());
+            let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+            assert!(chat.get_stop().is_none());
+        }
+    }
+
+    #[test]
+    fn test_stop_extension_token_ids_follow_chat_semantics() {
+        use crate::protocols::common::StopConditionsProvider;
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "stop": [32, 34]
+        }))
+        .unwrap();
+        assert_eq!(req.get_stop_token_ids(), Some(vec![32, 34]));
+        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert_eq!(
+            chat.extract_stop_conditions().unwrap().stop_token_ids,
+            Some(vec![32, 34])
+        );
+    }
+
+    #[test]
+    fn test_stop_extension_rejects_malformed_types() {
+        for stop in [
+            serde_json::json!(true),
+            serde_json::json!({"text": "STOP"}),
+            serde_json::json!(["STOP", 123]),
+            serde_json::json!([-1]),
+        ] {
+            assert!(
+                serde_json::from_value::<NvCreateResponse>(serde_json::json!({
+                    "model": "test-model", "input": "hello", "stop": stop
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]
