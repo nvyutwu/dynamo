@@ -648,6 +648,7 @@ impl Decoder {
 
     /// Match stops before releasing text. The jail retains search history plus any
     /// suffix that could still become a hidden stop string on a later token.
+    /// Like vLLM, choose the match that completes earliest; ties keep list order.
     fn match_stop_sequences(&mut self, new_text: &str) -> StepResult {
         let pending_start = self.jail.len() - self.jailed_bytes;
         self.jail.push_str(new_text);
@@ -659,7 +660,7 @@ impl Decoder {
                 galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
                     .map(|offset| (offset, seq))
             })
-            .min_by_key(|(offset, _)| *offset);
+            .min_by_key(|(offset, seq)| offset + seq.len());
         if let Some((offset, seq)) = hidden_match {
             let emitted = self.jail[pending_start..offset.max(pending_start)].to_string();
             let trigger = StopTrigger::HiddenStopSequenceDetected(seq.clone());
@@ -675,7 +676,7 @@ impl Decoder {
                 galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
                     .map(|offset| (offset, seq))
             })
-            .min_by_key(|(offset, _)| *offset);
+            .min_by_key(|(offset, seq)| offset + seq.len());
         if let Some((offset, seq)) = visible_match {
             let stop_end = offset + seq.len();
             let emitted = self.jail[pending_start..stop_end.max(pending_start)].to_string();
@@ -1021,6 +1022,62 @@ mod tests {
             include_stop,
             None,
         )
+    }
+
+    #[test]
+    fn vllm_stop_earliest_completion_and_list_order() {
+        for include_stop in [false, true] {
+            for (stops, expected, matched) in [
+                (
+                    vec!["ABCDE", "BC"],
+                    if include_stop { "ABC" } else { "A" },
+                    "BC",
+                ),
+                (
+                    vec!["BC", "ABC"],
+                    if include_stop { "ABC" } else { "A" },
+                    "BC",
+                ),
+                (
+                    vec!["ABC", "BC"],
+                    if include_stop { "ABC" } else { "" },
+                    "ABC",
+                ),
+            ] {
+                let mut decoder = stop_prefix_decoder(&["ABCDE tail"], &stops, include_stop);
+                let result = decoder.step(0).unwrap();
+                assert_eq!(result.token.as_deref(), Some(expected), "stops={stops:?}");
+                match result.stop_trigger {
+                    Some(
+                        StopTrigger::HiddenStopSequenceDetected(s)
+                        | StopTrigger::VisibleStopSequenceDetected(s),
+                    ) => assert_eq!(s, matched),
+                    other => panic!("unexpected trigger: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vllm_stop_overlapping_shorter_marker_wins_in_one_token() {
+        for stops in [["STOP_TOKEN", "STOP"], ["STOP", "STOP_TOKEN"]] {
+            for include_stop in [false, true] {
+                let mut decoder =
+                    stop_prefix_decoder(&["alpha STOP_TOKEN beta"], &stops, include_stop);
+                let result = decoder.step(0).unwrap();
+                assert_eq!(
+                    result.token.as_deref(),
+                    Some(if include_stop { "alpha STOP" } else { "alpha " })
+                );
+                match result.stop_trigger {
+                    Some(
+                        StopTrigger::HiddenStopSequenceDetected(s)
+                        | StopTrigger::VisibleStopSequenceDetected(s),
+                    ) => assert_eq!(s, "STOP"),
+                    other => panic!("unexpected trigger: {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]
