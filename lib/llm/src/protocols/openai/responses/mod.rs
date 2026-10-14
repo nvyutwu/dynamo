@@ -58,6 +58,12 @@ pub struct NvCreateResponse {
     #[schema(value_type = Object)]
     pub nvext: Option<NvExt>,
 
+    /// Dynamo extension: hidden stop strings or token IDs, using Chat Completions semantics.
+    /// The standard Responses API has no `stop` field. Omission preserves its default behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub stop: Option<dynamo_protocols::types::Stop>,
+
     /// Chat-template arguments, forwarded to the converted chat request.
     ///
     /// Mirrors the Chat Completions field, including the `chat_template_kwargs`
@@ -79,6 +85,8 @@ struct NvCreateResponseFields {
     inner: dynamo_protocols::types::responses::CreateResponse,
     #[serde(default)]
     nvext: Option<NvExt>,
+    #[serde(default)]
+    stop: Option<dynamo_protocols::types::Stop>,
     #[serde(default, alias = "chat_template_kwargs")]
     chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
@@ -118,6 +126,7 @@ impl TryFrom<serde_json::Value> for NvCreateResponse {
         Ok(Self {
             inner: fields.inner,
             nvext: fields.nvext,
+            stop: fields.stop,
             chat_template_args,
         })
     }
@@ -429,7 +438,11 @@ impl OpenAIStopConditionsProvider for NvCreateResponse {
     }
 
     fn get_stop(&self) -> Option<Vec<String>> {
-        None
+        self.stop.as_ref().and_then(|stop| stop.strings())
+    }
+
+    fn get_stop_token_ids(&self) -> Option<Vec<crate::types::TokenIdType>> {
+        self.stop.as_ref().and_then(|stop| stop.token_ids())
     }
 
     fn nvext(&self) -> Option<&NvExt> {
@@ -1256,6 +1269,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 top_p: resp.inner.top_p,
                 presence_penalty: extras.presence_penalty,
                 frequency_penalty: extras.frequency_penalty,
+                stop: resp.stop,
                 max_completion_tokens: resp.inner.max_output_tokens,
                 store: resp.inner.store,
                 parallel_tool_calls: resp.inner.parallel_tool_calls,
@@ -1917,6 +1931,7 @@ mod tests {
 
     fn make_response_with_input(text: &str) -> NvCreateResponse {
         NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Text(text.into()),
                 model: Some("test-model".into()),
@@ -1931,6 +1946,82 @@ mod tests {
                 ..Default::default()
             }),
             chat_template_args: None,
+        }
+    }
+
+    #[test]
+    fn test_stop_extension_reaches_chat_and_decoder_conditions() {
+        use crate::protocols::common::StopConditionsProvider;
+        for stream in [false, true] {
+            for stop in [
+                serde_json::json!("STOP_HERE"),
+                serde_json::json!(["beta", "STOP_HERE"]),
+                serde_json::json!(["終了_MARKER"]),
+            ] {
+                let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+                    "model": "test-model", "input": "alpha STOP_HERE beta", "stream": stream,
+                    "stop": stop
+                }))
+                .unwrap();
+                let expected = req.get_stop().unwrap();
+                let serialized = serde_json::to_value(&req).unwrap();
+                assert_eq!(serialized["stop"], stop);
+                let req: NvCreateResponse = serde_json::from_value(serialized).unwrap();
+                assert_eq!(
+                    req.extract_stop_conditions().unwrap().stop,
+                    Some(expected.clone())
+                );
+                let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+                assert_eq!(chat.get_stop(), Some(expected.clone()));
+                assert_eq!(chat.extract_stop_conditions().unwrap().stop, Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn test_stop_extension_absent_or_null_preserves_default() {
+        for extra in [serde_json::json!({}), serde_json::json!({"stop": null})] {
+            let mut body = serde_json::json!({"model": "test-model", "input": "hello"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let req: NvCreateResponse = serde_json::from_value(body).unwrap();
+            assert!(req.get_stop().is_none());
+            assert!(serde_json::to_value(&req).unwrap().get("stop").is_none());
+            let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+            assert!(chat.get_stop().is_none());
+        }
+    }
+
+    #[test]
+    fn test_stop_extension_token_ids_follow_chat_semantics() {
+        use crate::protocols::common::StopConditionsProvider;
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "stop": [32, 34]
+        }))
+        .unwrap();
+        assert_eq!(req.get_stop_token_ids(), Some(vec![32, 34]));
+        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert_eq!(
+            chat.extract_stop_conditions().unwrap().stop_token_ids,
+            Some(vec![32, 34])
+        );
+    }
+
+    #[test]
+    fn test_stop_extension_rejects_malformed_types() {
+        for stop in [
+            serde_json::json!(true),
+            serde_json::json!({"text": "STOP"}),
+            serde_json::json!(["STOP", 123]),
+            serde_json::json!([-1]),
+        ] {
+            assert!(
+                serde_json::from_value::<NvCreateResponse>(serde_json::json!({
+                    "model": "test-model", "input": "hello", "stop": stop
+                }))
+                .is_err()
+            );
         }
     }
 
@@ -2063,6 +2154,7 @@ mod tests {
     #[test]
     fn test_instructions_prepended_as_system_message() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Text("hello".into()),
                 model: Some("test-model".into()),
@@ -2093,6 +2185,7 @@ mod tests {
         // Codex CLI sends `instructions` + a `developer`-role input item.
         // Both convert to System messages; backends like Qwen reject more than one.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 instructions: Some("You are a coding agent.".into()),
                 input: InputParam::Items(vec![
@@ -2154,6 +2247,7 @@ mod tests {
     #[test]
     fn test_input_items_multi_turn() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -2216,6 +2310,7 @@ mod tests {
     #[test]
     fn test_input_items_with_file_id_and_image_url_prefers_url() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![InputItem::Item(Item::Message(MessageItem::Input(
                     InputMessage {
@@ -2262,6 +2357,7 @@ mod tests {
     #[test]
     fn test_easy_message_user_multimodal_preserves_images() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![InputItem::EasyMessage(EasyInputMessage {
                     role: ResponseRole::User,
@@ -2320,6 +2416,7 @@ mod tests {
     #[test]
     fn test_easy_message_user_text_only_stays_text() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![InputItem::EasyMessage(EasyInputMessage {
                     role: ResponseRole::User,
@@ -2349,6 +2446,7 @@ mod tests {
     #[test]
     fn test_easy_message_system_contentlist_collapses_to_text() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::EasyMessage(EasyInputMessage {
@@ -2386,6 +2484,7 @@ mod tests {
     #[test]
     fn test_easy_message_assistant_contentlist_collapses_to_text() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::EasyMessage(EasyInputMessage {
@@ -2420,6 +2519,7 @@ mod tests {
     #[test]
     fn test_function_call_input_items() {
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -2467,6 +2567,7 @@ mod tests {
         // Codex's view_image tool returns the image as function_call_output content;
         // it must reach the model as an image part, not be flattened away.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::FunctionCall(FunctionToolCall {
@@ -2621,6 +2722,7 @@ mod tests {
         // and `tool_calls`, otherwise chat templates that require a tool message to
         // immediately follow its assistant tool_call (e.g. MiniMax) will reject the input.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -2704,6 +2806,7 @@ mod tests {
         };
 
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::EasyMessage(EasyInputMessage {
@@ -2759,6 +2862,7 @@ mod tests {
         // breaks strict-alternation chat templates and distorts the context
         // the model sees.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -2827,6 +2931,7 @@ mod tests {
         };
 
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::EasyMessage(EasyInputMessage {
@@ -2869,6 +2974,7 @@ mod tests {
         // `content: ""` for pure-tool-call turns. Turn-boundary cases (empty
         // OutputMessage with no tool_calls) still emit `Some(Text(""))`.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -2953,6 +3059,7 @@ mod tests {
 
         for (reasoning, expected) in cases {
             let req = NvCreateResponse {
+                stop: None,
                 inner: CreateResponse {
                     input: InputParam::Items(vec![InputItem::Item(Item::Reasoning(reasoning))]),
                     model: Some("test-model".into()),
@@ -2998,6 +3105,7 @@ mod tests {
             }))
         };
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     reasoning("rs_1", "first thought"),
@@ -3038,6 +3146,7 @@ mod tests {
         };
 
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -3118,6 +3227,7 @@ mod tests {
         // Must yield 3 chat messages: user, assistant(content + tool_calls),
         // tool. Any other shape breaks the chat template's tool-call pairing.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -3188,6 +3298,7 @@ mod tests {
         // coalescer's accumulator is order-agnostic — both orderings must
         // produce the same merged assistant message.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -3254,6 +3365,7 @@ mod tests {
         // adjacent Item::FunctionCall items. They must coalesce into a single
         // assistant message carrying all tool_calls.
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
@@ -3324,6 +3436,7 @@ mod tests {
         // model loses visibility into what it previously refused.
         use dynamo_protocols::types::responses::RefusalContent;
         let req = NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![
                     InputItem::Item(Item::Message(MessageItem::Input(InputMessage {

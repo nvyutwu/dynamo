@@ -1037,6 +1037,40 @@ mod tests {
     }
 
     #[test]
+    fn responses_stop_wire_request_uses_shared_prefix_decoder() {
+        use crate::protocols::common::StopConditionsProvider;
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+        use crate::protocols::openai::responses::NvCreateResponse;
+
+        for stream in [false, true] {
+            for stop in [
+                serde_json::json!("STOP_HERE"),
+                serde_json::json!(["STOP_HERE"]),
+            ] {
+                let response: NvCreateResponse = serde_json::from_value(serde_json::json!({
+                    "model": "test-model", "input": "alpha STOP_HERE beta", "stream": stream, "stop": stop
+                })).unwrap();
+                let chat: NvCreateChatCompletionRequest = response.try_into().unwrap();
+                let conditions = chat.extract_stop_conditions().unwrap();
+                let tokenizer: Arc<dyn traits::Tokenizer> =
+                    Arc::new(PieceDecoder(&["alpha", " STOP", "_HERE", " beta"]));
+                let mut decoder = Decoder::new(
+                    crate::tokenizers::DecodeStream::new(tokenizer, &[], false),
+                    conditions,
+                    false,
+                    None,
+                );
+                assert_eq!(decoder.step(0).unwrap().token.as_deref(), Some("alpha"));
+                assert_eq!(decoder.step(1).unwrap().token.as_deref(), Some(" "));
+                let terminal = decoder.step(2).unwrap();
+                assert_eq!(terminal.token.as_deref().unwrap_or(""), "");
+                assert!(matches!(terminal.stop_trigger,
+                    Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "STOP_HERE"));
+            }
+        }
+    }
+
+    #[test]
     fn stop_prefix_handles_one_character_per_token() {
         let mut decoder = stop_prefix_decoder(
             &["alpha ", "S", "T", "O", "P", "_", "H", "E", "R", "E"],

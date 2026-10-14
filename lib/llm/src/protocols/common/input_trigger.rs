@@ -195,6 +195,7 @@ mod tests {
 
     fn response_request_with_easy_messages(role: ResponseRole) -> NvCreateResponse {
         NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![InputItem::EasyMessage(EasyInputMessage {
                     role,
@@ -211,6 +212,7 @@ mod tests {
 
     fn response_request_with_item(item: serde_json::Value) -> NvCreateResponse {
         NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: InputParam::Items(vec![serde_json::from_value(item).unwrap()]),
                 model: Some("test".into()),
