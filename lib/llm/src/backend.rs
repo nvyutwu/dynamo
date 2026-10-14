@@ -2647,3 +2647,158 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stop_scenario_tests {
+    use super::*;
+    use crate::tokenizers::traits;
+    use std::sync::Arc;
+
+    struct PieceDecoder(&'static [&'static str]);
+
+    impl traits::Encoder for PieceDecoder {
+        fn encode(&self, _input: &str) -> anyhow::Result<crate::tokenizers::Encoding> {
+            Ok(crate::tokenizers::Encoding::Sp(vec![]))
+        }
+        fn encode_batch(
+            &self,
+            _inputs: &[&str],
+        ) -> anyhow::Result<Vec<crate::tokenizers::Encoding>> {
+            Ok(vec![])
+        }
+    }
+
+    impl traits::Decoder for PieceDecoder {
+        fn decode(
+            &self,
+            token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> anyhow::Result<traits::DecodeResult> {
+            Ok(traits::DecodeResult::Complete(
+                token_ids.iter().map(|id| self.0[*id as usize]).collect(),
+            ))
+        }
+    }
+
+    impl traits::Tokenizer for PieceDecoder {}
+
+    fn decoder(pieces: &'static [&'static str], stops: &[&str], include_stop: bool) -> Decoder {
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(PieceDecoder(pieces));
+        Decoder::new(
+            crate::tokenizers::DecodeStream::new(tokenizer, &[], false),
+            StopConditions {
+                stop: Some(stops.iter().map(|s| s.to_string()).collect()),
+                stop_token_ids_hidden: Some(vec![99]),
+                ..Default::default()
+            },
+            include_stop,
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn released(r: &StepResult) -> &str {
+        r.released_text.as_deref().unwrap_or("")
+    }
+
+    #[test]
+    fn withheld_until_full_match() {
+        let mut d = decoder(&["alpha", " STOP", "_HERE", " beta"], &["STOP_HERE"], false);
+        assert_eq!(released(&d.step(0).unwrap()), "alpha");
+        assert_eq!(released(&d.step(1).unwrap()), " ");
+        let last = d.step(2).unwrap();
+        assert_eq!(released(&last), "");
+        assert!(matches!(last.stop_trigger,
+            Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "STOP_HERE"));
+    }
+
+    #[test]
+    fn one_character_per_token() {
+        let mut d = decoder(
+            &["alpha ", "S", "T", "O", "P", "_", "H", "E", "R", "E"],
+            &["STOP_HERE"],
+            false,
+        );
+        let r = d.process_token_ids(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+        assert_eq!(r.text.as_deref(), Some("alpha "));
+        assert!(r.stop_trigger.is_some());
+    }
+
+    #[test]
+    fn false_alarm_releases_buffered_text() {
+        let mut d = decoder(&["alpha STOP", "_OTHER beta"], &["STOP_HERE"], false);
+        assert_eq!(released(&d.step(0).unwrap()), "alpha ");
+        let next = d.step(1).unwrap();
+        assert_eq!(released(&next), "STOP_OTHER beta");
+        assert!(next.stop_trigger.is_none());
+    }
+
+    #[test]
+    fn unicode_and_overlapping_stops() {
+        let mut d = decoder(&["hello ", "é", "终", "止 tail"], &["é终止", "终止"], false);
+        let r = d.process_token_ids(&[0, 1, 2, 3]).unwrap();
+        assert_eq!(r.text.as_deref(), Some("hello "));
+        assert!(matches!(r.stop_trigger,
+            Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "é终止"));
+    }
+
+    #[test]
+    fn visible_stop_is_returned() {
+        let mut d = decoder(&["alpha", " STOP", "_HERE beta"], &["STOP_HERE"], true);
+        let r = d.process_token_ids(&[0, 1, 2]).unwrap();
+        assert_eq!(r.text.as_deref(), Some("alpha STOP_HERE"));
+        assert!(matches!(r.stop_trigger, Some(StopTrigger::VisibleStopSequenceDetected(_))));
+    }
+
+    #[test]
+    fn unmatched_suffix_flushed_at_hidden_stop_token() {
+        let mut d = decoder(&["alpha STOP", "<eos>"], &["STOP_HERE"], false);
+        d.hidden_stop_ids.insert(1);
+        assert_eq!(released(&d.step(0).unwrap()), "alpha ");
+        let t = d.step(1).unwrap();
+        assert_eq!(released(&t), "STOP");
+        assert!(matches!(t.stop_trigger, Some(StopTrigger::HiddenStopTokenDetected(1))));
+        assert!(d.flush_jailed().is_none());
+    }
+
+    #[test]
+    fn visible_token_stop_flushes_pending_text() {
+        let mut d = decoder(&["alpha STOP", "!"], &["STOP_HERE"], false);
+        d.visible_stop_ids.insert(1);
+        assert_eq!(released(&d.step(0).unwrap()), "alpha ");
+        let t = d.step(1).unwrap();
+        assert_eq!(released(&t), "STOP!");
+        assert!(matches!(t.stop_trigger, Some(StopTrigger::VisibleStopTokenDetected(1))));
+    }
+
+    #[test]
+    fn choices_keep_independent_pending_text() {
+        let pieces = &["alpha STOP", "second STOP", "_HERE", "_OTHER"];
+        let mut a = decoder(pieces, &["STOP_HERE"], false);
+        let mut b = decoder(pieces, &["STOP_HERE"], false);
+        assert_eq!(released(&a.step(0).unwrap()), "alpha ");
+        assert_eq!(released(&b.step(1).unwrap()), "second ");
+        assert_eq!(released(&a.step(2).unwrap()), "");
+        assert_eq!(released(&b.step(3).unwrap()), "STOP_OTHER");
+    }
+
+    // ---- earliest-completing stop (vLLM) vs list order: documents upstream behaviour ----
+    #[test]
+    fn multiple_stops_one_token_earliest_completion() {
+        for include_stop in [false, true] {
+            let mut d = decoder(&["ABCDE tail"], &["ABCDE", "BC"], include_stop);
+            let r = d.step(0).unwrap();
+            let want = if include_stop { "ABC" } else { "A" };
+            assert_eq!(released(&r), want, "include_stop={include_stop}");
+        }
+    }
+
+    #[test]
+    fn multiple_stops_overlapping_shorter_marker_wins() {
+        for stops in [["STOP_TOKEN", "STOP"], ["STOP", "STOP_TOKEN"]] {
+            let mut d = decoder(&["alpha STOP_TOKEN beta"], &stops, false);
+            assert_eq!(released(&d.step(0).unwrap()), "alpha ", "stops={stops:?}");
+        }
+    }
+}
