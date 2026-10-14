@@ -4140,6 +4140,7 @@ pub fn validate_responses_fields(request: &NvCreateResponse) -> Result<(), Error
     validate::validate_temperature(request.inner.temperature).map_err(&map_err)?;
     validate::validate_top_p(request.inner.top_p).map_err(&map_err)?;
     validate::validate_max_tokens(request.inner.max_output_tokens).map_err(&map_err)?;
+    validate::validate_stop(&request.stop).map_err(&map_err)?;
     let logprobs_requested_by = if request.inner.include.as_ref().is_some_and(|include| {
         include
             .contains(&dynamo_protocols::types::responses::IncludeEnum::MessageOutputTextLogprobs)
@@ -5944,6 +5945,7 @@ mod tests {
 
     fn make_base_request() -> NvCreateResponse {
         NvCreateResponse {
+            stop: None,
             inner: CreateResponse {
                 input: Input::Text("hello".into()),
                 model: Some("test-model".into()),
@@ -6752,6 +6754,30 @@ mod tests {
     #[test]
     fn test_validate_responses_fields_accepts_clean_request() {
         assert!(validate_responses_fields(&make_base_request()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_responses_stop_extension() {
+        use dynamo_protocols::types::Stop;
+        for stop in [
+            Stop::String(String::new()),
+            Stop::StringArray(vec![]),
+            Stop::StringArray(vec!["STOP_HERE".into(), String::new()]),
+            Stop::StringArray(vec!["STOP_HERE".into(); 33]),
+        ] {
+            let mut request = make_base_request();
+            request.stop = Some(stop);
+            let (code, body) =
+                validate_responses_fields(&request).expect_err("invalid stop must be rejected");
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert!(body.message.contains("Stop") || body.message.contains("stop"));
+        }
+        let mut request = make_base_request();
+        request.stop = Some(Stop::StringArray(vec![
+            "STOP_HERE".into(),
+            "終了_MARKER".into(),
+        ]));
+        assert!(validate_responses_fields(&request).is_ok());
     }
 
     #[test]
