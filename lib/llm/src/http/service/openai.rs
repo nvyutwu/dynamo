@@ -1018,7 +1018,7 @@ async fn handler_completions(
 #[tracing::instrument(skip_all)]
 async fn completions(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
@@ -1029,6 +1029,11 @@ async fn completions(
     // Validate stream_options is only used when streaming (NVBug 5662680)
     validate_completion_stream_options(&request)?;
 
+    // Clamp an oversized output budget before validation (DYN_MAX_OUTPUT_TOKENS_CLAMP).
+    crate::protocols::openai::validate::clamp_max_output_tokens(
+        &mut request.inner.max_tokens,
+        "max_tokens",
+    );
     validate_completion_fields_generic(&request)?;
 
     // Detect batch prompts
@@ -3129,6 +3134,16 @@ async fn chat_completions(
         return Err(err_response);
     }
 
+    // Clamp an oversized output budget before validation (DYN_MAX_OUTPUT_TOKENS_CLAMP).
+    crate::protocols::openai::validate::clamp_max_output_tokens(
+        &mut request.inner.max_tokens,
+        "max_tokens",
+    );
+    crate::protocols::openai::validate::clamp_max_output_tokens(
+        &mut request.inner.max_completion_tokens,
+        "max_completion_tokens",
+    );
+
     // Handle Rest of Validation Errors
     if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
@@ -3730,6 +3745,12 @@ async fn responses(
         inflight_guard.mark_error(ErrorType::NotImplemented);
         return Ok(resp.into_response());
     }
+
+    // Clamp an oversized output budget before validation (DYN_MAX_OUTPUT_TOKENS_CLAMP).
+    crate::protocols::openai::validate::clamp_max_output_tokens(
+        &mut request.inner.max_output_tokens,
+        "max_output_tokens",
+    );
 
     // Validate sampling and output parameters
     if let Err(err_response) = validate_responses_fields(&request) {
