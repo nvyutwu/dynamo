@@ -916,6 +916,82 @@ pub fn max_output_tokens_limit() -> u32 {
     configured_max_output_tokens().unwrap_or(MAX_OUTPUT_TOKENS)
 }
 
+/// Environment variable that turns the deployment's maximum output length from a
+/// rejection threshold into a silent clamp: a request above `DYN_MAX_OUTPUT_TOKENS`
+/// is served with `DYN_MAX_OUTPUT_TOKENS` instead of a 400. The hard
+/// `MAX_OUTPUT_TOKENS` ceiling is still rejected. Off by default.
+pub const MAX_OUTPUT_TOKENS_CLAMP_ENV: &str = "DYN_MAX_OUTPUT_TOKENS_CLAMP";
+
+fn parse_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Whether `DYN_MAX_OUTPUT_TOKENS_CLAMP` is enabled.
+pub fn max_output_tokens_clamp_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| parse_truthy(std::env::var(MAX_OUTPUT_TOKENS_CLAMP_ENV).ok().as_deref()))
+}
+
+/// Largest value the validators reject above: the configured limit, or (when
+/// clamping) only the hard ceiling, because values in between are clamped instead.
+pub fn max_output_tokens_reject_limit() -> u32 {
+    if max_output_tokens_clamp_enabled() {
+        MAX_OUTPUT_TOKENS
+    } else {
+        max_output_tokens_limit()
+    }
+}
+
+/// Pure clamp: `value` above `limit` (and not above the hard ceiling) becomes `limit`.
+/// Omitted values, values within the limit, and values above the hard ceiling
+/// (left for the validators to reject) are unchanged.
+fn clamp_to_limit(value: Option<u32>, limit: Option<u32>) -> Option<u32> {
+    match (value, limit) {
+        (Some(v), Some(limit)) if v > limit && v <= MAX_OUTPUT_TOKENS => Some(limit),
+        _ => value,
+    }
+}
+
+/// Clamp a client's output-token budget to `DYN_MAX_OUTPUT_TOKENS` when
+/// `DYN_MAX_OUTPUT_TOKENS_CLAMP` is on. Returns the original value if it was lowered.
+/// Call before validation and preprocessing.
+pub fn clamp_max_output_tokens(value: &mut Option<u32>, field: &str) -> Option<u32> {
+    if !max_output_tokens_clamp_enabled() {
+        return None;
+    }
+    let original = (*value)?;
+    let clamped = clamp_to_limit(*value, configured_max_output_tokens());
+    if clamped == *value {
+        return None;
+    }
+    *value = clamped;
+    log_clamped(field, original, clamped);
+    Some(original)
+}
+
+fn log_clamped(field: &str, original: u32, clamped: Option<u32>) {
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            field,
+            requested = original,
+            clamped_to = ?clamped,
+            "clamped client output-token budget to {MAX_OUTPUT_TOKENS_ENV}; further clamps are logged at debug"
+        );
+    } else {
+        tracing::debug!(
+            field,
+            requested = original,
+            clamped_to = ?clamped,
+            "clamped client output-token budget"
+        );
+    }
+}
+
 /// Validates max_tokens parameter
 pub fn validate_max_tokens(max_tokens: Option<u32>) -> Result<(), anyhow::Error> {
     if let Some(tokens) = max_tokens
@@ -923,7 +999,7 @@ pub fn validate_max_tokens(max_tokens: Option<u32>) -> Result<(), anyhow::Error>
     {
         anyhow::bail!("Max tokens must be greater than 0, got {}", tokens);
     }
-    let limit = max_output_tokens_limit();
+    let limit = max_output_tokens_reject_limit();
     if let Some(tokens) = max_tokens
         && tokens > limit
     {
@@ -944,7 +1020,7 @@ pub fn validate_max_completion_tokens(
             tokens
         );
     }
-    let limit = max_output_tokens_limit();
+    let limit = max_output_tokens_reject_limit();
     if let Some(tokens) = max_completion_tokens
         && tokens > limit
     {
@@ -1257,6 +1333,33 @@ mod tests {
             parse_max_output_tokens(Some("99999999")),
             Some(MAX_OUTPUT_TOKENS)
         );
+    }
+
+    #[test]
+    fn clamp_to_limit_lowers_only_values_between_limit_and_hard_ceiling() {
+        let limit = Some(131_072);
+        assert_eq!(clamp_to_limit(Some(930_275), limit), Some(131_072));
+        assert_eq!(clamp_to_limit(Some(131_073), limit), Some(131_072));
+        assert_eq!(clamp_to_limit(Some(1_048_576), limit), Some(131_072));
+        assert_eq!(clamp_to_limit(Some(131_072), limit), Some(131_072));
+        assert_eq!(clamp_to_limit(Some(8), limit), Some(8));
+        assert_eq!(clamp_to_limit(Some(0), limit), Some(0));
+        assert_eq!(clamp_to_limit(None, limit), None);
+        // Above the hard ceiling: left for the validators to reject.
+        assert_eq!(clamp_to_limit(Some(1_048_577), limit), Some(1_048_577));
+        // No configured limit: nothing to clamp to.
+        assert_eq!(clamp_to_limit(Some(930_275), None), Some(930_275));
+    }
+
+    #[test]
+    fn parse_truthy_accepts_common_spellings() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_truthy(Some(v)), "{v}");
+        }
+        for v in ["0", "false", "", "off", "maybe"] {
+            assert!(!parse_truthy(Some(v)), "{v}");
+        }
+        assert!(!parse_truthy(None));
     }
 
     #[test]

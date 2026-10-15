@@ -350,7 +350,15 @@ async fn handler_anthropic_messages(
             "max_tokens: must be greater than 0",
         ));
     }
-    let max_output_tokens = crate::protocols::openai::validate::max_output_tokens_limit();
+    // DYN_MAX_OUTPUT_TOKENS_CLAMP: lower an oversized budget instead of rejecting it.
+    {
+        let mut budget = Some(request.max_tokens);
+        crate::protocols::openai::validate::clamp_max_output_tokens(&mut budget, "max_tokens");
+        if let Some(clamped) = budget {
+            request.max_tokens = clamped;
+        }
+    }
+    let max_output_tokens = crate::protocols::openai::validate::max_output_tokens_reject_limit();
     if request.max_tokens > max_output_tokens {
         inflight_guard.mark_error(ErrorType::Validation);
         return Err(anthropic_error(
