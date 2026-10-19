@@ -210,7 +210,8 @@ mod tests {
     async fn slow_consumer_shows_as_consumer_delay() {
         let s = run(5, 100, 0).await;
         assert!(s.complete);
-        assert!(s.consumer_delay >= Duration::from_millis(400) && s.consumer_delay <= Duration::from_millis(410), "{:?}", s.consumer_delay);
+        // five chunks, each followed by a 100 ms pause before the next poll (the last pause precedes the end-of-body poll)
+        assert!(s.consumer_delay >= Duration::from_millis(500) && s.consumer_delay <= Duration::from_millis(510), "{:?}", s.consumer_delay);
         assert!(s.max_consumer_delay >= Duration::from_millis(100));
         assert!(s.data_wait < Duration::from_millis(5), "{:?}", s.data_wait);
     }
