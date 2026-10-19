@@ -22,6 +22,7 @@ mod anthropic;
 pub mod metadata;
 mod openai;
 
+pub mod body_timing;
 pub mod busy_threshold;
 pub mod disconnect;
 pub mod error;

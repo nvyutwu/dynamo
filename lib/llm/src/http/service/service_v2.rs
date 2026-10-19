@@ -1377,6 +1377,8 @@ impl HttpServiceConfigBuilder {
             append_route_docs(&mut all_docs, &mut seen_route_docs, route_docs)?;
             inference_router = inference_router.merge(route);
         }
+        // Request-body read timing (DYN_BODY_TIMING=1); innermost so it runs inside the http-request span.
+        inference_router = inference_router.layer(axum::middleware::from_fn(super::body_timing::time_request_body));
         inference_router = inference_router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_inference_request_span)
