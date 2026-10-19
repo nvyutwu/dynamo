@@ -19,7 +19,9 @@
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::body::{Body, BodyDataStream, Bytes};
 use axum::extract::Request;
