@@ -36,6 +36,11 @@ overrides:
     source: "NVIDIA CUDA Toolkit EULA — https://docs.nvidia.com/cuda/eula/index.html"
 
   - ecosystem: python
+    name: cupti-python
+    license: LicenseRef-NVIDIA-Proprietary
+    source: "NVIDIA CUDA Toolkit EULA — https://docs.nvidia.com/cuda/eula/index.html (PyPI metadata has no license; verify against the wheel .dist-info/LICENSE.txt)"
+
+  - ecosystem: python
     name: nvidia-cuda-nvrtc
     license: LicenseRef-NVIDIA-Proprietary
     source: "NVIDIA CUDA Toolkit EULA — https://docs.nvidia.com/cuda/eula/index.html"
@@ -472,6 +477,26 @@ overrides:
   # --- Additional NVIDIA dpkg meta-packages ---
   - { ecosystem: dpkg, name: cuda-command-line-tools-12-9,      license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
   - { ecosystem: dpkg, name: cuda-command-line-tools-13-0,      license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+
+  # --- CUDA 13.4 apt packages (vLLM runtime base is CUDA 13.4.1) ---
+  # dpkg metadata for these reports GPL-3.0-only; they ship under the NVIDIA CUDA
+  # Toolkit EULA, same as the -13-0 and -12-9 entries above.
+  - { ecosystem: dpkg, name: cuda-crt-13-4,                    license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-cudart-13-4,                 license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-cudart-dev-13-4,             license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-culibos-dev-13-4,            license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-cuobjdump-13-4,              license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-driver-dev-13-4,             license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-nvcc-13-4,                   license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-nvrtc-13-4,                  license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-nvrtc-dev-13-4,              license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: cuda-toolkit-13-4-config-common,  license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: libcublas-13-4,                   license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: libcublas-dev-13-4,               license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: libcurand-13-4,                   license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: libcurand-dev-13-4,               license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: libnvptxcompiler-13-4,            license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
+  - { ecosystem: dpkg, name: libnvvm-13-4,                     license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA CUDA Toolkit EULA" }
 
   # --- sglang Rust ecosystem additions ---
   # sgl-model-gateway is sglang's Rust serving gateway crate, packaged inside
