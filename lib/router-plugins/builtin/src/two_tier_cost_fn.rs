@@ -9,9 +9,12 @@
 //!
 //! 1. Load tier: if active-request spread exceeds `balance_abs_threshold` and the largest count
 //!    exceeds `balance_rel_threshold` times the smallest, select the least-loaded worker.
-//! 2. Cache tier: otherwise, if the largest device-KV overlap is strictly greater than
-//!    `cache_threshold` of the request's block count, select the least-loaded worker holding that
-//!    maximum overlap.
+//! 2. Cache tier: otherwise, if the largest *effective* KV overlap is strictly greater than
+//!    `cache_threshold` of the request's block count (greater than or equal with
+//!    `cache_threshold_inclusive`), select the least-loaded worker holding that
+//!    maximum overlap. Effective overlap is device-resident blocks plus host-pinned (CPU offload)
+//!    blocks scaled by `host_cache_weight`, so a worker holding the prefix in CPU can win the cache
+//!    tier over one holding nothing. With the default weight, equal device overlap ranks higher.
 //! 3. Otherwise, select the least-loaded worker.
 //!
 //! Both load gates must hold to take step 1, so load displaces cache affinity only when the
@@ -21,7 +24,20 @@
 //! `experimental/sgl-router`'s `cache_aware_zmq` policy, using Dynamo's authoritative device-KV
 //! overlap instead of that router's own approximate cache history. The thresholds are exposed as
 //! instance parameters defaulting to that router's values, so an instance with no `parameters`
-//! mapping reproduces it exactly.
+//! mapping preserves those load gates and the strict cache threshold. Host overlap adds
+//! the router-configured credit described below.
+//!
+//! `host_cache_weight` defaults to [`KvRouterConfig::host_cache_hit_weight`], which
+//! `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` sets (0.75 by default) and which Dynamo's built-in selector
+//! already applies to the same quantity — so the two tiers agree on what a CPU hit is worth unless
+//! an instance deliberately overrides it. Set the weight to 0.0 to restore device-only ranking.
+//!
+//! Every tunable also has an environment override, named `DYN_ROUTER_TWO_TIER_` plus the field name in
+//! upper case (`DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD`, `..._CACHE_THRESHOLD_INCLUSIVE`,
+//! `..._BALANCE_ABS_THRESHOLD`, `..._BALANCE_REL_THRESHOLD`, `..._HOST_CACHE_WEIGHT`).
+//! An override wins over the instance's `parameters` and the default, applies to every instance of
+//! this policy, and is validated the same way. It exists because deployments bake the policy YAML
+//! into the image, so the environment is the only knob that can change without a rebuild.
 //!
 //! Ties between equally ranked workers resolve on candidate row order, which the host leaves
 //! unspecified. This matches the ported implementation; note that Dynamo's built-in selector
@@ -31,8 +47,8 @@ use std::sync::Arc;
 
 use dynamo_kv_router::KvRouterConfig;
 use dynamo_kv_router::plugins::worker_selection::{
-    WorkerCacheInputs, WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker,
-    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError,
+    WorkerCacheInput, WorkerCacheInputs, WorkerInputView, WorkerInputs, WorkerLoadInput,
+    WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError,
     WorkerSelectionPolicyFactory,
 };
 use dynamo_kv_router::plugins::{
@@ -44,10 +60,16 @@ use dynamo_kv_router::plugins::{
 pub const POLICY_TYPE: &str = "dynamo-two-tier-cost-fn";
 
 /// Keep these equal to `experimental/sgl-router`'s `cache_aware_zmq` defaults, so an instance
-/// with no `parameters` mapping reproduces that policy exactly.
+/// with no `parameters` mapping keeps those load gates and cache threshold.
 const DEFAULT_CACHE_THRESHOLD: f64 = 0.5;
 const DEFAULT_BALANCE_ABS_THRESHOLD: usize = 32;
 const DEFAULT_BALANCE_REL_THRESHOLD: f64 = 1.1;
+
+const ENV_CACHE_THRESHOLD: &str = "DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD";
+const ENV_CACHE_THRESHOLD_INCLUSIVE: &str = "DYN_ROUTER_TWO_TIER_CACHE_THRESHOLD_INCLUSIVE";
+const ENV_BALANCE_ABS_THRESHOLD: &str = "DYN_ROUTER_TWO_TIER_BALANCE_ABS_THRESHOLD";
+const ENV_BALANCE_REL_THRESHOLD: &str = "DYN_ROUTER_TWO_TIER_BALANCE_REL_THRESHOLD";
+const ENV_HOST_CACHE_WEIGHT: &str = "DYN_ROUTER_TWO_TIER_HOST_CACHE_WEIGHT";
 
 /// Tunables for [`POLICY_TYPE`], named after their `sgl-router` counterparts.
 ///
@@ -56,26 +78,111 @@ const DEFAULT_BALANCE_REL_THRESHOLD: f64 = 1.1;
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct Parameters {
-    /// Fraction of the request's blocks that must be device-resident on the best worker before the
-    /// cache tier applies. Compared strictly.
+    /// Fraction of the request's blocks represented by effective overlap on the best worker before the
+    /// cache tier applies. Compared strictly unless `cache_threshold_inclusive` is set.
     cache_threshold: f64,
+    /// Compare the cache ratio with `>=` instead of the upstream `>`.
+    cache_threshold_inclusive: bool,
     /// Minimum active-request spread before the load tier applies.
     balance_abs_threshold: usize,
     /// Minimum ratio of largest to smallest active-request count before the load tier applies.
     balance_rel_threshold: f64,
+    /// Weight applied to host-pinned (CPU offload) overlap when ranking cache affinity.
+    ///
+    /// `None` — inherit `KvRouterConfig::host_cache_hit_weight`, i.e. whatever
+    /// `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` is set to. Set explicitly only when this policy must
+    /// value CPU residency differently from the built-in selector.
+    host_cache_weight: Option<f64>,
 }
 
 impl Default for Parameters {
     fn default() -> Self {
         Self {
             cache_threshold: DEFAULT_CACHE_THRESHOLD,
+            cache_threshold_inclusive: false,
             balance_abs_threshold: DEFAULT_BALANCE_ABS_THRESHOLD,
             balance_rel_threshold: DEFAULT_BALANCE_REL_THRESHOLD,
+            host_cache_weight: None,
         }
     }
 }
 
+/// Read one override. Unset or blank means "no override"; anything else must parse.
+fn env_override<T: std::str::FromStr>(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<Option<T>, WorkerSelectionPolicyProviderError> {
+    let Some(raw) = lookup(name) else {
+        return Ok(None);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse().map(Some).map_err(|_| {
+        WorkerSelectionPolicyProviderError::new(format!("{name}={raw:?} is not a valid value"))
+    })
+}
+
+/// Like [`env_override`] for flags: accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`.
+fn env_flag(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<Option<bool>, WorkerSelectionPolicyProviderError> {
+    let Some(raw) = lookup(name) else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(WorkerSelectionPolicyProviderError::new(format!(
+            "{name}={raw:?} is not a boolean (use 1/0, true/false, yes/no or on/off)"
+        ))),
+    }
+}
+
 impl Parameters {
+    /// Apply the `DYN_ROUTER_TWO_TIER_*` overrides on top of the YAML (or default) values and
+    /// return the names of the variables that were applied, for the startup log. Validation runs
+    /// afterwards on the merged values, so an override is held to the same bounds as YAML.
+    fn apply_env_overrides(
+        &mut self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Vec<&'static str>, WorkerSelectionPolicyProviderError> {
+        let mut applied = Vec::new();
+        if let Some(value) = env_override(&lookup, ENV_CACHE_THRESHOLD)? {
+            self.cache_threshold = value;
+            applied.push(ENV_CACHE_THRESHOLD);
+        }
+        if let Some(value) = env_flag(&lookup, ENV_CACHE_THRESHOLD_INCLUSIVE)? {
+            self.cache_threshold_inclusive = value;
+            applied.push(ENV_CACHE_THRESHOLD_INCLUSIVE);
+        }
+        if let Some(value) = env_override(&lookup, ENV_BALANCE_ABS_THRESHOLD)? {
+            self.balance_abs_threshold = value;
+            applied.push(ENV_BALANCE_ABS_THRESHOLD);
+        }
+        if let Some(value) = env_override(&lookup, ENV_BALANCE_REL_THRESHOLD)? {
+            self.balance_rel_threshold = value;
+            applied.push(ENV_BALANCE_REL_THRESHOLD);
+        }
+        if let Some(value) = env_override(&lookup, ENV_HOST_CACHE_WEIGHT)? {
+            self.host_cache_weight = Some(value);
+            applied.push(ENV_HOST_CACHE_WEIGHT);
+        }
+        Ok(applied)
+    }
+
+    /// Whether `cache_ratio` clears the cache-tier gate.
+    fn cache_tier_fires(&self, cache_ratio: f64) -> bool {
+        if self.cache_threshold_inclusive {
+            cache_ratio >= self.cache_threshold
+        } else {
+            cache_ratio > self.cache_threshold
+        }
+    }
+
     fn validate(&self) -> Result<(), WorkerSelectionPolicyProviderError> {
         if !self.cache_threshold.is_finite() || !(0.0..=1.0).contains(&self.cache_threshold) {
             return Err(WorkerSelectionPolicyProviderError::new(
@@ -87,6 +194,13 @@ impl Parameters {
                 "balance_rel_threshold must be a finite number greater than or equal to 1.0",
             ));
         }
+        if let Some(weight) = self.host_cache_weight
+            && (!weight.is_finite() || weight < 0.0)
+        {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "host_cache_weight must be a finite number greater than or equal to 0.0",
+            ));
+        }
         Ok(())
     }
 }
@@ -95,11 +209,20 @@ fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> 
     rows.min_by_key(|&row| load[row].active_requests())
 }
 
+/// Blocks this worker can reuse, counting CPU-offloaded blocks at `host_cache_weight`.
+///
+/// Device and host overlap are disjoint prefix measurements from the same indexer, so they add
+/// rather than max. A weight of 0.0 reproduces the device-only ranking this policy shipped with.
+fn effective_overlap(cache: WorkerCacheInput<'_>, host_cache_weight: f64) -> f64 {
+    cache.device_overlap_blocks() + host_cache_weight * cache.host_overlap_blocks()
+}
+
 fn select_row(
     parameters: &Parameters,
     cache: WorkerCacheInputs<'_>,
     load: &[WorkerLoadInput],
     request_blocks: u64,
+    host_cache_weight: f64,
 ) -> Option<usize> {
     if cache.is_empty() || cache.len() != load.len() {
         return None;
@@ -115,18 +238,18 @@ fn select_row(
 
     let max_overlap = cache
         .iter()
-        .map(|item| item.device_overlap_blocks())
+        .map(|item| effective_overlap(item, host_cache_weight))
         .max_by(f64::total_cmp)?;
     let cache_ratio = if request_blocks == 0 {
         0.0
     } else {
         max_overlap / request_blocks as f64
     };
-    if cache_ratio > parameters.cache_threshold {
+    if parameters.cache_tier_fires(cache_ratio) {
         return least_loaded(
             load,
             cache.iter().enumerate().filter_map(|(row, item)| {
-                (item.device_overlap_blocks() == max_overlap).then_some(row)
+                (effective_overlap(item, host_cache_weight) == max_overlap).then_some(row)
             }),
         );
     }
@@ -136,6 +259,9 @@ fn select_row(
 
 struct TwoTierCostFnPicker {
     parameters: Parameters,
+    /// Resolved once at construction: the instance override when given, else the router config's
+    /// `host_cache_hit_weight`.
+    host_cache_weight: f64,
 }
 
 impl WorkerPicker for TwoTierCostFnPicker {
@@ -154,24 +280,71 @@ impl WorkerPicker for TwoTierCostFnPicker {
         let load = input
             .load()
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
-        select_row(&self.parameters, cache, load, context.request_blocks())
-            .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+        select_row(
+            &self.parameters,
+            cache,
+            load,
+            context.request_blocks(),
+            self.host_cache_weight,
+        )
+        .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
     }
 }
 
 fn provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    let parameters: Parameters = parameters.deserialize()?;
-    parameters.validate()?;
+    let mut parameters: Parameters = parameters.deserialize()?;
+    let env_overrides = parameters.apply_env_overrides(|name| {
+        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    })?;
+    parameters.validate().map_err(|error| {
+        WorkerSelectionPolicyProviderError::new(format!(
+            "{error}; applied environment overrides: {env_overrides:?}"
+        ))
+    })?;
+    let host_cache_weight_from_env = env_overrides.contains(&ENV_HOST_CACHE_WEIGHT);
+
+    // Report resolved parameters; queueing-profile logs do not identify the worker selector.
+    tracing::info!(
+        policy_type = POLICY_TYPE,
+        cache_threshold = parameters.cache_threshold,
+        cache_threshold_inclusive = parameters.cache_threshold_inclusive,
+        balance_abs_threshold = parameters.balance_abs_threshold,
+        balance_rel_threshold = parameters.balance_rel_threshold,
+        host_cache_weight = ?parameters.host_cache_weight,
+        env_overrides = ?env_overrides,
+        "Two-tier worker-selection policy enabled"
+    );
 
     Ok(Arc::new(
         move |config: &KvRouterConfig, worker_type, _partition| {
+            let host_cache_weight = parameters
+                .host_cache_weight
+                .unwrap_or(config.host_cache_hit_weight);
+            // Attribute the resolved weight so a YAML override cannot conceal a router-wide
+            // environment change during an experiment.
+            tracing::info!(
+                policy_type = POLICY_TYPE,
+                worker_type = worker_type.as_str(),
+                host_cache_weight,
+                host_cache_weight_source = if host_cache_weight_from_env {
+                    ENV_HOST_CACHE_WEIGHT
+                } else if parameters.host_cache_weight.is_some() {
+                    "policy_yaml"
+                } else {
+                    "DYN_ROUTER_HOST_CACHE_HIT_WEIGHT"
+                },
+                "Two-tier worker-selection policy instantiated"
+            );
             WorkerSelectionPolicy::new(
                 config.clone(),
                 worker_type.as_str(),
                 Vec::new(),
-                Box::new(TwoTierCostFnPicker { parameters }),
+                Box::new(TwoTierCostFnPicker {
+                    parameters,
+                    host_cache_weight,
+                }),
             )
         },
     ))
@@ -228,6 +401,26 @@ mod tests {
     }
 
     fn select_with(parameters: Parameters, workers: [(u64, usize, usize); 2]) -> WorkerWithDpRank {
+        select_tiers(
+            parameters,
+            workers.map(|(id, device_blocks, active)| (id, device_blocks, 0, active)),
+        )
+    }
+
+    /// Select among workers given as
+    /// `(worker_id, device_blocks, host_pinned_blocks, active_requests)`.
+    fn select_tiers(
+        parameters: Parameters,
+        workers: [(u64, usize, usize, usize); 2],
+    ) -> WorkerWithDpRank {
+        select_tiers_with_config(parameters, workers, KvRouterConfig::default())
+    }
+
+    fn select_tiers_with_config(
+        parameters: Parameters,
+        workers: [(u64, usize, usize, usize); 2],
+        config: KvRouterConfig,
+    ) -> WorkerWithDpRank {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
             token_seq: None,
@@ -251,12 +444,17 @@ mod tests {
             worker_loads: Default::default(),
             resp_tx: None,
         };
-        for (id, overlap_blocks, active_requests) in workers {
+        for (id, device_blocks, host_blocks, active_requests) in workers {
             request
                 .overlap
                 .tier_overlap_blocks
                 .device
-                .insert(worker(id), overlap_blocks);
+                .insert(worker(id), device_blocks);
+            request
+                .overlap
+                .tier_overlap_blocks
+                .host_pinned
+                .insert(worker(id), host_blocks);
             request.worker_loads.insert(
                 worker(id),
                 WorkerLoadProjection {
@@ -265,12 +463,19 @@ mod tests {
                 },
             );
         }
-        let configs = HashMap::from(workers.map(|(id, _, _)| (id, TestWorker)));
+        let configs = HashMap::from(workers.map(|(id, _, _, _)| (id, TestWorker)));
+        // Use the same weight precedence as the production factory.
+        let host_cache_weight = parameters
+            .host_cache_weight
+            .unwrap_or(config.host_cache_hit_weight);
         WorkerSelectionPolicy::new(
-            KvRouterConfig::default(),
+            config,
             "test",
             Vec::new(),
-            Box::new(TwoTierCostFnPicker { parameters }),
+            Box::new(TwoTierCostFnPicker {
+                parameters,
+                host_cache_weight,
+            }),
         )
         .select_worker(WorkerSelectionInput::configured(
             &configs,
@@ -308,6 +513,101 @@ mod tests {
     }
 
     #[test]
+    fn host_overlap_can_win_the_cache_tier() {
+        // B holds nothing on device but eight of ten blocks in CPU offload. At the inherited
+        // weight of 0.75 that is an effective 6.0 blocks, a ratio of 0.6 above the 0.5 threshold,
+        // so B wins despite carrying more load. Before this change B scored 0 and A took it.
+        assert_eq!(
+            select_tiers(Parameters::default(), [(A, 0, 0, 0), (B, 0, 8, 4)]),
+            worker(B)
+        );
+    }
+
+    #[test]
+    fn host_cache_weight_zero_restores_device_only_ranking() {
+        // The escape hatch: weight 0.0 reproduces the behaviour this policy shipped with, so a
+        // deployment that does not want CPU residency to influence routing can turn it off
+        // without reverting the code.
+        let device_only = Parameters {
+            host_cache_weight: Some(0.0),
+            ..Parameters::default()
+        };
+        assert_eq!(
+            select_tiers(device_only, [(A, 0, 0, 0), (B, 0, 8, 4)]),
+            worker(A)
+        );
+    }
+
+    #[test]
+    fn device_blocks_outrank_the_same_count_of_host_blocks() {
+        // Equal block counts, different tiers: A's six device blocks score 6.0 against B's six
+        // host blocks at 4.5, so A wins even though B is idle and A carries four requests. A CPU
+        // hit must never be treated as interchangeable with a device hit.
+        assert_eq!(
+            select_tiers(Parameters::default(), [(A, 6, 0, 4), (B, 0, 6, 0)]),
+            worker(A)
+        );
+    }
+
+    #[test]
+    fn device_and_host_continuation_overlap_add() {
+        // Neither tier alone clears five blocks; their disjoint continuation does.
+        assert_eq!(
+            select_tiers(Parameters::default(), [(A, 0, 0, 0), (B, 3, 4, 4)]),
+            worker(B)
+        );
+    }
+
+    #[test]
+    fn load_imbalance_still_displaces_host_affinity() {
+        assert_eq!(
+            select_tiers(Parameters::default(), [(A, 0, 0, 0), (B, 0, 10, 40)]),
+            worker(A)
+        );
+    }
+
+    #[test]
+    fn configured_host_weight_is_inherited_and_policy_override_wins() {
+        let workers = [(A, 0, 0, 0), (B, 0, 8, 4)];
+        let config = KvRouterConfig {
+            host_cache_hit_weight: 0.5,
+            ..Default::default()
+        };
+        // Four effective blocks no longer reach the cache threshold.
+        assert_eq!(
+            select_tiers_with_config(Parameters::default(), workers, config.clone()),
+            worker(A)
+        );
+        assert_eq!(
+            select_tiers_with_config(
+                Parameters {
+                    host_cache_weight: Some(1.0),
+                    ..Default::default()
+                },
+                workers,
+                config,
+            ),
+            worker(B)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_host_cache_weight() {
+        let weight = |v| {
+            Parameters {
+                host_cache_weight: Some(v),
+                ..Default::default()
+            }
+            .validate()
+        };
+        assert!(weight(-0.1).is_err());
+        assert!(weight(f64::NAN).is_err());
+        assert!(weight(f64::INFINITY).is_err());
+        assert!(weight(0.0).is_ok());
+        assert!(weight(1.0).is_ok());
+    }
+
+    #[test]
     fn rejects_out_of_range_parameters() {
         let cache = |v| {
             Parameters {
@@ -327,6 +627,146 @@ mod tests {
         assert!(cache(-0.1).is_err() && cache(1.1).is_err() && cache(f64::NAN).is_err());
         assert!(ratio(0.9).is_err() && ratio(f64::NAN).is_err());
         assert!(Parameters::default().validate().is_ok());
+    }
+
+    /// An environment lookup backed by fixed pairs, so tests never touch the process environment.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn env_overrides_replace_yaml_and_defaults() {
+        // YAML set two fields; every override wins over YAML and default alike.
+        let mut parameters = Parameters {
+            cache_threshold: 0.6,
+            balance_abs_threshold: 8,
+            ..Parameters::default()
+        };
+        let applied = parameters
+            .apply_env_overrides(env(&[
+                (ENV_CACHE_THRESHOLD, "0.4"),
+                (ENV_CACHE_THRESHOLD_INCLUSIVE, "true"),
+                (ENV_BALANCE_ABS_THRESHOLD, " 16 "),
+                (ENV_BALANCE_REL_THRESHOLD, "1.5"),
+                (ENV_HOST_CACHE_WEIGHT, "1.0"),
+            ]))
+            .unwrap();
+        assert_eq!(
+            applied,
+            [
+                ENV_CACHE_THRESHOLD,
+                ENV_CACHE_THRESHOLD_INCLUSIVE,
+                ENV_BALANCE_ABS_THRESHOLD,
+                ENV_BALANCE_REL_THRESHOLD,
+                ENV_HOST_CACHE_WEIGHT,
+            ]
+        );
+        assert_eq!(parameters.cache_threshold, 0.4);
+        assert!(parameters.cache_threshold_inclusive);
+        assert_eq!(parameters.balance_abs_threshold, 16);
+        assert_eq!(parameters.balance_rel_threshold, 1.5);
+        assert_eq!(parameters.host_cache_weight, Some(1.0));
+        assert!(parameters.validate().is_ok());
+    }
+
+    #[test]
+    fn unset_or_blank_env_keeps_yaml_values() {
+        let mut parameters = Parameters {
+            cache_threshold: 0.3,
+            host_cache_weight: Some(0.5),
+            ..Parameters::default()
+        };
+        let applied = parameters
+            .apply_env_overrides(env(&[
+                (ENV_CACHE_THRESHOLD, "  "),
+                (ENV_CACHE_THRESHOLD_INCLUSIVE, ""),
+            ]))
+            .unwrap();
+        assert!(applied.is_empty());
+        assert_eq!(parameters.cache_threshold, 0.3);
+        assert!(!parameters.cache_threshold_inclusive);
+        assert_eq!(parameters.host_cache_weight, Some(0.5));
+    }
+
+    #[test]
+    fn malformed_env_is_rejected_by_name() {
+        for (name, value) in [
+            (ENV_CACHE_THRESHOLD, "0.4x"),
+            (ENV_CACHE_THRESHOLD_INCLUSIVE, "maybe"),
+            (ENV_BALANCE_ABS_THRESHOLD, "-1"),
+            (ENV_BALANCE_ABS_THRESHOLD, "1.5"),
+            (ENV_BALANCE_REL_THRESHOLD, "fast"),
+            (ENV_HOST_CACHE_WEIGHT, "heavy"),
+        ] {
+            let error = Parameters::default()
+                .apply_env_overrides(env(&[(name, value)]))
+                .unwrap_err();
+            assert!(error.to_string().contains(name), "{name}={value}: {error}");
+        }
+    }
+
+    #[test]
+    fn env_overrides_are_validated_like_yaml() {
+        // These parse, but are out of bounds: the merged parameters must still fail validation.
+        for (name, value) in [
+            (ENV_CACHE_THRESHOLD, "1.5"),
+            (ENV_CACHE_THRESHOLD, "NaN"),
+            (ENV_BALANCE_REL_THRESHOLD, "0.5"),
+            (ENV_HOST_CACHE_WEIGHT, "-1"),
+        ] {
+            let mut parameters = Parameters::default();
+            parameters
+                .apply_env_overrides(env(&[(name, value)]))
+                .unwrap();
+            assert!(parameters.validate().is_err(), "{name}={value}");
+        }
+    }
+
+    #[test]
+    fn inclusive_threshold_admits_the_boundary() {
+        // Five of ten blocks is exactly 0.5: load decides by default, the cache tier when inclusive.
+        let workers = [(A, 0, 0), (B, 5, 4)];
+        assert_eq!(select(workers), worker(A));
+        let inclusive = Parameters {
+            cache_threshold_inclusive: true,
+            ..Parameters::default()
+        };
+        assert_eq!(select_with(inclusive, workers), worker(B));
+    }
+
+    #[test]
+    fn inclusive_threshold_applies_to_weighted_host_overlap() {
+        let parameters = Parameters {
+            host_cache_weight: Some(0.5),
+            ..Default::default()
+        };
+        let workers = [(A, 0, 0, 0), (B, 0, 10, 4)];
+        assert_eq!(select_tiers(parameters, workers), worker(A));
+        assert_eq!(
+            select_tiers(
+                Parameters {
+                    cache_threshold_inclusive: true,
+                    ..parameters
+                },
+                workers,
+            ),
+            worker(B)
+        );
+    }
+
+    #[test]
+    fn lower_threshold_from_env_routes_to_the_cache_holder() {
+        // Five of ten blocks: below the strict 0.5 default, above an overridden 0.4.
+        let workers = [(A, 0, 0), (B, 5, 4)];
+        let mut parameters = Parameters::default();
+        parameters
+            .apply_env_overrides(env(&[(ENV_CACHE_THRESHOLD, "0.4")]))
+            .unwrap();
+        assert_eq!(select_with(parameters, workers), worker(B));
     }
 
     #[test]
