@@ -51,6 +51,11 @@ from .prefill_worker_utils import parse_image_item
 
 logger = logging.getLogger(__name__)
 
+# HF model_type strings of the K3 family start with this prefix (variants share the processor and the placeholder
+# config). The adapter below must accept every one, or image requests reach vLLM with the frontend's
+# <|media_pad|> token and fail prompt replacement.
+_K3_FAMILY_PREFIX = "kimi_k3"
+
 IMAGE_URL_KEY = "image_url"
 VIDEO_URL_KEY = "video_url"
 AUDIO_URL_KEY = "audio_url"
@@ -415,7 +420,7 @@ class VllmMultimodalRequestProcessor:
         model_type = getattr(hf_config, "model_type", None)
         if model_type is None:
             return None
-        if model_type not in {"kimi_k3", "kimi_k31"}:
+        if not str(model_type).startswith(_K3_FAMILY_PREFIX):
             self._k3_expansion_cached = True
             return None
 
