@@ -143,10 +143,15 @@ def sglang_default_mla_attention_backend(server_args: Any) -> str | None:
     try:
         model_config = get_sglang_model_config(server_args)
         hf_config = getattr(model_config, "hf_config", None)
-        if "KimiK3ForConditionalGeneration" in (
-            getattr(hf_config, "architectures", None) or []
+        architectures = getattr(hf_config, "architectures", None) or []
+        if any(
+            architecture in architectures
+            for architecture in (
+                "KimiK3ForConditionalGeneration",
+                "KimiK31ForConditionalGeneration",
+            )
         ):
-            # Kimi-K3 resolves separate prefill/decode backends for DCP. The
+            # Kimi-K3/K3.1 resolve separate prefill/decode backends for DCP. The
             # platform default (fa3 on Hopper) is not its decode backend.
             # Defer to the engine's resolved configuration instead of guessing
             # or running SGLang's kernel capability checks during CLI parsing.
