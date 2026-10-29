@@ -95,18 +95,16 @@ dynamo:
 vllm:
   cuda13.0:
     base_image: nvcr.io/nvidia/cuda-dl-base
-    runtime_image: vllm/vllm-openai
+    runtime_image: 210086341041.dkr.ecr.us-west-2.amazonaws.com/ai-dynamo/rainhollow
     base_image_tag: 25.11-cuda13.0-devel-ubuntu24.04
-    runtime_image_tag: v0.32.0-ubuntu2404
+    runtime_image_tag: vllm-upstream-private-20261028-34c09519a7-fi-6833-7064@sha256:bc216f68c2cef5adafb1c43a2c2a51b0a3cbf56954ec8361d28c5d713dee57e1
     vllm_omni_ref: "v0.32.0rc1"
-    # Baseline is vllm-openai's TRUE base, nvidia/cuda:13.0.2-base-ubuntu24.04
-    # (Docker Hub), NOT a self-baseline of the third-party vllm/vllm-openai image.
-    # vllm-openai is built FROM nvidia/cuda, so this attributes everything vLLM
-    # adds over the clean NVIDIA CUDA floor (uv/rust stack, framework, codecs)
-    # rather than hiding it. Per-arch stem; the licenses stage appends
-    # -${TARGETARCH}.cdx.json. (GPL media codecs from vllm-openai are purged in
-    # the runtime image — see the codec-purge follow-up.)
-    baseline_sbom: cuda@2ab6381d
+    # The private runtime uses CUDA 13.4.1. Keep the CUDA 13.0 build toolchain:
+    # its Rust CUDA bindings reject 13.4, while the wheels load CUDA dynamically.
+    # Both upstream architectures retain the exact seven-layer prefix of
+    # nvidia/cuda:13.4.1-base-ubuntu24.04. Subtract only that NVIDIA CUDA floor;
+    # vLLM, FlashInfer, codecs, and all other additions remain attributed here.
+    baseline_sbom: cuda@3eb2d952
   xpu:
     base_image: vllm/vllm-openai-xpu
     runtime_image: vllm/vllm-openai-xpu
