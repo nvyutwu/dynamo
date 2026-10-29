@@ -865,6 +865,37 @@ only that check. The router reevaluates workers on the next worker-load or runti
 update; the call does not synchronously recompute the busy set and does not change startup-only router
 options such as `--router-mode kv` or `--router-track-output-blocks`.
 
+### Model-specific sampling validation
+
+<ParamField path="DYN_KIMI_K3_IMMUTABLE_PARAMS" type="boolean" default="false">
+  Opt-in K3-family sampling contract. Enable this switch only on a dedicated frontend:
+  it applies to every model served by that process. The value is cached on first use.
+
+  | Parameter | Accepted explicit values |
+  | --- | --- |
+  | `temperature` | Any value in `[0, 1]`, inclusive |
+  | `top_p` | `0.95` |
+  | `presence_penalty` | `0` |
+  | `frequency_penalty` | `0` |
+  | `n` | `1` |
+
+  Chat Completions, Completions, and Responses reject other values with HTTP 400
+  before generation or streaming headers. Error messages name the parameter,
+  required value or range, and supplied value. For example:
+
+  ```json
+  {
+    "code": 400,
+    "type": "Bad Request",
+    "message": "Validation: `top_p` is fixed at 0.95 for this model; received 0.8. Omit `top_p` or set it to 0.95."
+  }
+  ```
+
+  Omitted or null values are accepted. This switch validates requests; configure
+  generation defaults separately on the worker. With the switch unset or false,
+  standard parameter validation remains in effect.
+</ParamField>
+
 ### Frontend feature switches
 
 Environment variables controlling frontend extensions and protocol admission. The variables below

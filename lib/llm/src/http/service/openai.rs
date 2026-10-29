@@ -4637,6 +4637,14 @@ pub fn validate_responses_fields(request: &NvCreateResponse) -> Result<(), Error
         )
     };
 
+    validate::validate_kimi_k3_immutable_params(
+        request.inner.temperature,
+        request.inner.top_p,
+        request.presence_penalty,
+        request.frequency_penalty,
+        request.n,
+    )
+    .map_err(&map_err)?;
     validate::validate_temperature(request.inner.temperature).map_err(&map_err)?;
     validate::validate_top_p(request.inner.top_p).map_err(&map_err)?;
     validate::validate_max_tokens(request.inner.max_output_tokens).map_err(&map_err)?;
@@ -6512,6 +6520,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             thinking_token_budget: None,
+            ..Default::default()
         }
     }
 

@@ -1389,3 +1389,144 @@ async fn tool_name_limit_is_shared_across_protocols() {
     })
     .await;
 }
+
+fn run_immutable_sampling_http_child(enabled: bool) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "immutable_sampling_http_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(
+            "DYN_KIMI_K3_IMMUTABLE_PARAMS",
+            if enabled { "1" } else { "0" },
+        )
+        .output()
+        .expect("start isolated immutable-sampling HTTP test");
+    assert!(
+        output.status.success(),
+        "HTTP policy test (enabled={enabled}) failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn immutable_sampling_http_enabled_returns_actionable_400_before_dispatch() {
+    run_immutable_sampling_http_child(true);
+}
+
+#[test]
+fn immutable_sampling_http_disabled_preserves_existing_parameter_ranges() {
+    run_immutable_sampling_http_child(false);
+}
+
+fn immutable_sampling_requests(stream: bool) -> [(&'static str, Value); 3] {
+    [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": MODEL, "messages": [{"role": "user", "content": "ping"}],
+                "stream": stream, "temperature": 0.6
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({
+                "model": MODEL, "input": "ping", "stream": stream, "temperature": 0.6
+            }),
+        ),
+        (
+            "/v1/completions",
+            json!({
+                "model": MODEL, "prompt": "ping", "stream": stream, "temperature": 0.6
+            }),
+        ),
+    ]
+}
+
+// Each subprocess owns the LazyLock gate from its first read. Other HTTP tests
+// keep their original environment, including when the suite runs in parallel.
+#[tokio::test]
+#[ignore = "run by the two isolated-process HTTP policy tests"]
+async fn immutable_sampling_http_child() {
+    let enabled = std::env::var("DYN_KIMI_K3_IMMUTABLE_PARAMS").unwrap() == "1";
+    tokio::time::timeout(Duration::from_secs(60), async {
+        temp_env::async_with_vars(BASE_ENV, async {
+            let script = load_agent_fixture("text.sse").await.unwrap();
+            let svc = HarnessService::start(vec![script; 64]).await;
+            let rejected = [
+                ("top_p", json!(0.8), "fixed at 0.95"),
+                ("presence_penalty", json!(0.5), "fixed at 0"),
+                ("frequency_penalty", json!(-0.5), "fixed at 0"),
+                ("n", json!(2), "fixed at 1"),
+                ("temperature", json!(1.1), "between 0 and 1 (inclusive)"),
+                ("temperature", json!(2.0), "between 0 and 1 (inclusive)"),
+            ];
+            for stream in [false, true] {
+                for (path, body) in immutable_sampling_requests(stream) {
+                    for (parameter, value, correction) in &rejected {
+                        let mut body = body.clone();
+                        body[*parameter] = value.clone();
+                        if path == "/v1/completions" && !enabled {
+                            // This harness registers only a chat engine. Verify the
+                            // completion adapter directly for accepted requests.
+                            let request: dynamo_llm::protocols::openai::completions::NvCreateCompletionRequest =
+                                serde_json::from_value(body).unwrap();
+                            dynamo_llm::engines::ValidateRequest::validate(&request).unwrap();
+                            continue;
+                        }
+                        let response = post_json(&svc, path, body).await;
+                        if enabled {
+                            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                            assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+                            let error: Value = bounded(response.json()).await.unwrap();
+                            assert_eq!(error["code"], 400);
+                            let message = error["message"].as_str().unwrap();
+                            assert!(message.starts_with("Validation: "), "{error}");
+                            assert!(message.contains(&format!("`{parameter}`")), "{error}");
+                            assert!(message.contains(correction), "{error}");
+                            assert!(
+                                message.contains(&format!("received {}", value.as_f64().unwrap())),
+                                "{error}"
+                            );
+                            if *parameter != "temperature" {
+                                assert!(message.contains(&format!("Omit `{parameter}` or set it to")), "{error}");
+                            }
+                            assert!(svc.engine.take_requests().await.is_empty());
+                        } else {
+                            assert_eq!(response.status(), reqwest::StatusCode::OK);
+                            bounded(response.bytes()).await.unwrap();
+                            assert_eq!(svc.engine.take_requests().await.len(), 1);
+                        }
+                    }
+                }
+            }
+            // Omission and every representative temperature in the allowed range
+            // must pass through to generation, including streaming requests.
+            for stream in [false, true] {
+                for (path, body) in immutable_sampling_requests(stream).into_iter().take(2) {
+                    for temperature in [None, Some(0.0), Some(0.2), Some(0.6), Some(1.0)] {
+                        let mut body = body.clone();
+                        body.as_object_mut().unwrap().remove("temperature");
+                        if let Some(temperature) = temperature {
+                            body["temperature"] = json!(temperature);
+                            body["top_p"] = json!(0.95);
+                            body["presence_penalty"] = json!(0);
+                            body["frequency_penalty"] = json!(0);
+                            body["n"] = json!(1);
+                        }
+                        let response = post_json(&svc, path, body).await;
+                        assert_eq!(response.status(), reqwest::StatusCode::OK);
+                        bounded(response.bytes()).await.unwrap();
+                        let requests = svc.engine.take_requests().await;
+                        assert_eq!(requests.len(), 1);
+                        assert_eq!(requests[0].inner.temperature, temperature.map(|t| t as f32));
+                    }
+                }
+            }
+            svc.shutdown().await;
+        }).await;
+    }).await.expect("immutable-sampling HTTP checks exceeded sixty seconds");
+}

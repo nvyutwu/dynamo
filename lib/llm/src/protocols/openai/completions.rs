@@ -508,6 +508,13 @@ impl OpenAIOutputOptionsProvider for NvCreateCompletionRequest {
 impl ValidateRequest for NvCreateCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        validate::validate_kimi_k3_immutable_params(
+            self.inner.temperature,
+            self.inner.top_p,
+            self.inner.presence_penalty,
+            self.inner.frequency_penalty,
+            self.inner.n,
+        )?;
         validate::validate_guided_decoding(self)?;
         validate::validate_model(&self.inner.model)?;
 

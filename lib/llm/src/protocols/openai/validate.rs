@@ -148,6 +148,72 @@ where
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy(DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS));
 
+/// Opt-in sampling contract for a dedicated K3-family frontend. Omitted values
+/// are accepted; generation defaults are configured separately on the worker.
+static KIMI_K3_IMMUTABLE_PARAMS: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_IMMUTABLE_PARAMS"));
+
+/// Validate explicit sampling values under the opt-in K3-family contract.
+/// Omitted values remain unset so the worker can apply generation defaults.
+pub fn validate_kimi_k3_immutable_params(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    n: Option<u8>,
+) -> Result<(), anyhow::Error> {
+    validate_kimi_k3_immutable_params_with_gate(
+        temperature,
+        top_p,
+        presence_penalty,
+        frequency_penalty,
+        n,
+        *KIMI_K3_IMMUTABLE_PARAMS,
+    )
+}
+
+fn validate_kimi_k3_immutable_params_with_gate(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    n: Option<u8>,
+    enforce: bool,
+) -> Result<(), anyhow::Error> {
+    if !enforce {
+        return Ok(());
+    }
+    if let Some(value) = temperature
+        && !(0.0..=1.0).contains(&value)
+    {
+        anyhow::bail!(
+            "`temperature` must be between 0 and 1 (inclusive) for this model; received {value}."
+        );
+    }
+    for (parameter, actual, required) in [
+        ("top_p", top_p, 0.95),
+        ("presence_penalty", presence_penalty, 0.0),
+        ("frequency_penalty", frequency_penalty, 0.0),
+    ] {
+        if let Some(value) = actual
+            && value != required
+        {
+            anyhow::bail!(
+                "`{parameter}` is fixed at {required} for this model; received {value}. \
+                 Omit `{parameter}` or set it to {required}."
+            );
+        }
+    }
+    if let Some(value) = n
+        && value != 1
+    {
+        anyhow::bail!(
+            "`n` is fixed at 1 for this model; received {value}. Omit `n` or set it to 1."
+        );
+    }
+    Ok(())
+}
+
 /// Validates that no unsupported fields are present in the request.
 ///
 /// Fields in `PASSTHROUGH_EXTRA_FIELDS` are validated by downstream handlers.
@@ -1164,6 +1230,81 @@ pub fn validate_chat_only_generation_flags(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn immutable_sampling_accepts_omitted_values_and_temperature_range() {
+        super::validate_kimi_k3_immutable_params_with_gate(None, None, None, None, None, true)
+            .unwrap();
+        for temperature in [0.0, 0.2, 0.6, 1.0] {
+            super::validate_kimi_k3_immutable_params_with_gate(
+                Some(temperature),
+                Some(0.95),
+                Some(0.0),
+                Some(0.0),
+                Some(1),
+                true,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn immutable_sampling_errors_explain_the_value_and_correction() {
+        for (top_p, presence, frequency, n, parameter, received, required) in [
+            (Some(0.8), None, None, None, "top_p", "0.8", "0.95"),
+            (None, Some(0.5), None, None, "presence_penalty", "0.5", "0"),
+            (
+                None,
+                None,
+                Some(-0.5),
+                None,
+                "frequency_penalty",
+                "-0.5",
+                "0",
+            ),
+            (None, None, None, Some(2), "n", "2", "1"),
+        ] {
+            let error = super::validate_kimi_k3_immutable_params_with_gate(
+                None, top_p, presence, frequency, n, true,
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "`{parameter}` is fixed at {required} for this model; received {received}. \
+                 Omit `{parameter}` or set it to {required}."
+                )
+            );
+        }
+        for temperature in [-0.1, 1.1, 2.0] {
+            let error = super::validate_kimi_k3_immutable_params_with_gate(
+                Some(temperature),
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("`temperature` must be between 0 and 1 (inclusive)"));
+            assert!(!error.contains("immutable"));
+        }
+    }
+
+    #[test]
+    fn immutable_sampling_policy_is_opt_in() {
+        super::validate_kimi_k3_immutable_params_with_gate(
+            Some(2.0),
+            Some(0.8),
+            Some(0.5),
+            Some(0.5),
+            Some(2),
+            false,
+        )
+        .unwrap();
+    }
+
     use std::collections::HashMap;
 
     use serde_json::json;

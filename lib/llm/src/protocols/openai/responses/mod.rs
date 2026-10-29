@@ -77,6 +77,16 @@ pub struct NvCreateResponse {
     /// `thinking_token_budget` sampling parameter when supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_token_budget: Option<u32>,
+
+    /// Compatibility fields captured for opt-in immutable-parameter validation.
+    /// These fields were previously ignored by the Responses adapter and are
+    /// not forwarded as new sampling controls when the policy is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u8>,
 }
 
 #[derive(ToSchema, Deserialize, Validate, Debug, Clone)]
@@ -1529,6 +1539,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             thinking_token_budget: None,
+            ..Default::default()
         }
     }
 
@@ -2554,6 +2565,7 @@ mod tests {
                 nvext: None,
                 chat_template_args: None,
                 thinking_token_budget: None,
+                ..Default::default()
             };
 
             let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
