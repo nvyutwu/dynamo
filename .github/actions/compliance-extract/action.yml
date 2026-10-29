@@ -94,6 +94,9 @@ inputs:
       baseline_unavailable marker.
     required: false
     default: ''
+  day0_repo_read_access_token:
+    description: 'Read token for the private Rainhollow frontend crates repository'
+    required: true
 
 runs:
   using: 'composite'
@@ -129,6 +132,7 @@ runs:
         SCCACHE_REGION: ${{ inputs.sccache_region }}
         GIT_SHA: ${{ inputs.git_sha }}
         EPP_IMAGE: ${{ inputs.epp_image }}
+        DAY0_REPO_READ_ACCESS_TOKEN: ${{ inputs.day0_repo_read_access_token }}
       run: |
         # Reuse the warm cache the build just populated by matching ALL the
         # cache-key-affecting build-args the build passed. Otherwise the shared
@@ -149,6 +153,7 @@ runs:
         # Only forward the credentials when S3 sccache is actually configured
         # (bucket set) — a bucket-less caller's build has no use for them.
         SECRET_ARGS=""
+        SECRET_ARGS+=" --secret id=day0-repo-read-access-token,env=DAY0_REPO_READ_ACCESS_TOKEN"
         if [ -n "${SCCACHE_BUCKET:-}" ]; then
           TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-}"
           if [ -n "$TOKEN_FILE" ] && [ -f "$TOKEN_FILE" ] && [ -n "${AWS_ROLE_ARN:-}" ]; then
@@ -355,12 +360,14 @@ runs:
         SCCACHE_REGION: ${{ inputs.sccache_region }}
         GIT_SHA: ${{ inputs.git_sha }}
         EPP_IMAGE: ${{ inputs.epp_image }}
+        DAY0_REPO_READ_ACCESS_TOKEN: ${{ inputs.day0_repo_read_access_token }}
       run: |
         # ENABLE_SOURCE_ARCHIVAL=true to actually run sources_collect; the other
         # build-args match the build so this shares the warm cache (same reason
         # as the compliance_artifact extract above). Same IRSA secrets too, so a
         # cache-missed stage rebuild can still authenticate sccache (see above).
         SECRET_ARGS=""
+        SECRET_ARGS+=" --secret id=day0-repo-read-access-token,env=DAY0_REPO_READ_ACCESS_TOKEN"
         if [ -n "${SCCACHE_BUCKET:-}" ]; then
           TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-}"
           if [ -n "$TOKEN_FILE" ] && [ -f "$TOKEN_FILE" ] && [ -n "${AWS_ROLE_ARN:-}" ]; then

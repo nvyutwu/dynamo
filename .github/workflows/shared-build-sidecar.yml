@@ -50,6 +50,9 @@ on:
         required: false
         type: string
         default: ''
+    secrets:
+      DAY0_REPO_READ_ACCESS_TOKEN:
+        required: true
     outputs:
       target_tag_plain:
         description: 'Plain sidecar image tag prefix'
@@ -138,6 +141,7 @@ jobs:
           push_image: true
           no_load: true
           use_sccache: false
+          day0_repo_read_access_token: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
 
       - name: Refresh BuildKit builder
         uses: $/.github/actions/builder-refresher
@@ -164,11 +168,14 @@ jobs:
       - name: Extract sidecar binaries (amd64)
         id: binary-artifact
         shell: bash
+        env:
+          DAY0_REPO_READ_ACCESS_TOKEN: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p sidecar-binaries
           docker buildx build \
             --target sidecar-binaries \
+            --secret id=day0-repo-read-access-token,env=DAY0_REPO_READ_ACCESS_TOKEN \
             --platform linux/amd64 \
             -f lib/sidecar/Dockerfile \
             --output type=local,dest=sidecar-binaries \
@@ -233,6 +240,7 @@ jobs:
           diff_base_artifact_id: ${{ steps.resolve-diff-base.outputs.base_artifact_id }}
           diff_base_run_id: ${{ steps.resolve-diff-base.outputs.base_run_id }}
           gh_token: ${{ secrets.GITHUB_TOKEN }}
+          day0_repo_read_access_token: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
           framework: dynamo-sidecar
           target: runtime
           dockerfile: lib/sidecar/Dockerfile

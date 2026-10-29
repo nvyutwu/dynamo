@@ -418,6 +418,8 @@ jobs:
     if: needs.changed-files.outputs.rust == 'true'
     runs-on:
       group: Fastchecker
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     strategy:
       matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples'] }
     permissions:
@@ -426,6 +428,22 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         lfs: true
+    - name: Configure private Rainhollow crate access
+      env:
+        DAY0_REPO_READ_ACCESS_TOKEN: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${DAY0_REPO_READ_ACCESS_TOKEN}" ]]; then
+          echo "::error::Required Actions secret DAY0_REPO_READ_ACCESS_TOKEN is not configured"
+          exit 1
+        fi
+        auth_config="${RUNNER_TEMP}/rainhollow-git-auth"
+        auth_header="$(printf 'x-access-token:%s' "${DAY0_REPO_READ_ACCESS_TOKEN}" | base64 | tr -d '\n')"
+        umask 077
+        git config --file "${auth_config}" \
+          http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader \
+          "AUTHORIZATION: basic ${auth_header}"
+        echo "GIT_CONFIG_GLOBAL=${auth_config}" >> "${GITHUB_ENV}"
     - name: Set up system dependencies
       run: |
         # Install protoc for Rust build dependencies (NOTE: much faster than apt install)
@@ -543,11 +561,19 @@ jobs:
         cargo test --locked -p dynamo-llm --no-default-features \
           --features kv-router-stress --bench kv_router_bench --no-run
 
+    - name: Remove private Rainhollow crate credentials
+      if: always()
+      run: |
+        git config --file "${RUNNER_TEMP}/rainhollow-git-auth" --unset-all \
+          http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader || true
+
   rust-clippy:
     needs: changed-files
     if: needs.changed-files.outputs.rust == 'true'
     runs-on:
       group: Fastchecker
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     strategy:
       matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples'] }
     permissions:
@@ -556,6 +582,22 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         lfs: true
+    - name: Configure private Rainhollow crate access
+      env:
+        DAY0_REPO_READ_ACCESS_TOKEN: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${DAY0_REPO_READ_ACCESS_TOKEN}" ]]; then
+          echo "::error::Required Actions secret DAY0_REPO_READ_ACCESS_TOKEN is not configured"
+          exit 1
+        fi
+        auth_config="${RUNNER_TEMP}/rainhollow-git-auth"
+        auth_header="$(printf 'x-access-token:%s' "${DAY0_REPO_READ_ACCESS_TOKEN}" | base64 | tr -d '\n')"
+        umask 077
+        git config --file "${auth_config}" \
+          http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader \
+          "AUTHORIZATION: basic ${auth_header}"
+        echo "GIT_CONFIG_GLOBAL=${auth_config}" >> "${GITHUB_ENV}"
     - name: Verify Cargo lock file is in sync
       working-directory: ${{ matrix.dir }}
       run: cargo metadata --locked --format-version 1
@@ -624,3 +666,8 @@ jobs:
       run: |
         cargo-machete --version || cargo install cargo-machete@0.9.1
         cargo machete
+    - name: Remove private Rainhollow crate credentials
+      if: always()
+      run: |
+        git config --file "${RUNNER_TEMP}/rainhollow-git-auth" --unset-all \
+          http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader || true

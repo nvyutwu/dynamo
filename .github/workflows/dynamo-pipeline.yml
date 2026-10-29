@@ -75,6 +75,8 @@ on:
         required: false
       HF_TOKEN:
         required: false
+      DAY0_REPO_READ_ACCESS_TOKEN:
+        required: true
 
 
 jobs:

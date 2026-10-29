@@ -78,9 +78,14 @@ COPY --from=dynamo container/compliance/cargo_sbom.py /tmp/cargo_sbom.py
 # Build the binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETARCH} \
+    --mount=type=secret,id=day0-repo-read-access-token,required=true \
     --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true && \
+    export GIT_CONFIG_COUNT=1 && \
+    export GIT_CONFIG_KEY_0=http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader && \
+    export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$(cat /run/secrets/day0-repo-read-access-token)" | base64 | tr -d '\n')" && \
     export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-rust-epp-${TARGETARCH}}" && \
     if [ "$USE_SCCACHE" = "true" ]; then \
         eval $(/tmp/use-sccache.sh setup-env); \
