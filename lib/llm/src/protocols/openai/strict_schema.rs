@@ -31,11 +31,43 @@ const TYPES: &[&str] = &[
     "null", "boolean", "object", "array", "number", "integer", "string",
 ];
 
+/// Environment switch that turns on OpenAI strict function-schema validation.
+///
+/// Strict validation is opt-in. Clients of the K3 model family send `strict: true`
+/// with tool schemas whose objects are not closed (`additionalProperties: false`),
+/// and the Responses API treats every tool without an explicit `strict` as strict.
+/// Rejecting those schemas with HTTP 400 differs from the K3 production frontend and
+/// from engines that do not validate (which accept them), so the default is lenient.
+const STRICT_FUNCTION_SCHEMA_ENV: &str = "DYN_STRICT_FUNCTION_SCHEMA";
+
+fn parse_strict_flag(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+// The validator's own unit tests exercise the strict rules, so they run with it enabled.
+#[cfg(test)]
+fn strict_validation_enabled() -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn strict_validation_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_strict_flag(std::env::var(STRICT_FUNCTION_SCHEMA_ENV).ok().as_deref()))
+}
+
 pub(super) fn validate_strict_function(
     function: &FunctionObject,
     skip_strict_schema_validation: bool,
 ) -> Result<()> {
-    if function.strict != Some(true) || skip_strict_schema_validation {
+    if function.strict != Some(true)
+        || skip_strict_schema_validation
+        || !strict_validation_enabled()
+    {
         return Ok(());
     }
     let Some(schema) = &function.parameters else {
@@ -578,6 +610,17 @@ fn validate_root(nodes: &[(String, &Value, usize)], targets: &[Option<usize>]) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn strict_validation_flag_is_opt_in() {
+        assert!(!parse_strict_flag(None));
+        assert!(!parse_strict_flag(Some("")));
+        assert!(!parse_strict_flag(Some("0")));
+        assert!(!parse_strict_flag(Some("false")));
+        assert!(parse_strict_flag(Some("1")));
+        assert!(parse_strict_flag(Some(" True ")));
+        assert!(parse_strict_flag(Some("on")));
+    }
 
     fn check(schema: Value) -> Result<()> {
         validate_schema(&schema)
