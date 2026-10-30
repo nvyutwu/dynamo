@@ -37,8 +37,8 @@ overrides:
 
   - ecosystem: python
     name: cupti-python
-    license: LicenseRef-NVIDIA-Proprietary
-    source: "NVIDIA CUDA Toolkit EULA — https://docs.nvidia.com/cuda/eula/index.html (PyPI metadata has no license; verify against the wheel .dist-info/LICENSE.txt)"
+    license: LicenseRef-NVIDIA-SOFTWARE-LICENSE
+    source: "NVIDIA Software License Agreement — https://docs.nvidia.com/cupti-python/nvidia-cupti-python-license.html"
 
   - ecosystem: python
     name: nvidia-cuda-nvrtc
