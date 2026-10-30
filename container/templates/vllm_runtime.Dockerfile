@@ -18,6 +18,7 @@ FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS pre_runtime
 {% set has_transformers_pin = context.vllm[device_key].transformers_version is defined -%}
 ARG PYTHON_VERSION
 ARG ENABLE_GPU_MEMORY_SERVICE
+ARG ENABLE_VLLM_OMNI
 ARG VLLM_OMNI_REF
 {% if has_transformers_pin -%}
 ARG TRANSFORMERS_VERSION
@@ -265,16 +266,18 @@ RUN set -eux; \
     ldconfig -p | grep -q 'libturbojpeg.so.0'; \
     rm -rf /var/lib/apt/lists/*
 
-# Layer the released vLLM-Omni package matching the pinned upstream ref while
-# constraining packages already solved in the upstream vLLM image.
+# Layer vLLM-Omni only for bases whose dependency stack supports it. The CUDA
+# private base opts out so its validated Transformers version is preserved.
 RUN --mount=type=bind,source=./container/deps/vllm/protected_packages.txt,target=/tmp/vllm_omni_protected_packages.txt \
     --mount=type=bind,source=./container/deps/vllm/protected_overrides.txt,target=/tmp/vllm_omni_protected_overrides.txt \
     --mount=type=bind,source=./container/deps/vllm/install_vllm_omni.sh,target=/tmp/install_vllm_omni.sh \
     --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=locked \
     set -eux; \
     export UV_CACHE_DIR=/root/.cache/uv; \
-    export VLLM_OMNI_TARGET_DEVICE={{ device }}; \
-    bash /tmp/install_vllm_omni.sh
+    if [ "${ENABLE_VLLM_OMNI}" = "true" ]; then \
+        export VLLM_OMNI_TARGET_DEVICE={{ device }}; \
+        bash /tmp/install_vllm_omni.sh; \
+    fi
 
 {% if device == "xpu" %}
 # Remove conflicting standard triton package for XPU and reinstall triton-xpu
