@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use dynamo_runtime::protocols::annotated::{Annotated, AnnotationsProvider};
 use serde::{Deserialize, Serialize};
@@ -149,7 +152,27 @@ impl NvCreateChatCompletionRequest {
     /// Resolve the request's reasoning controls into `chat_template_args`.
     /// Runs once at the HTTP boundary, so every render path reads one answer.
     /// Model-specific overrides still apply later in the default preprocessor.
+    /// A request with no effort gets the `DYN_KIMI_K3_DEFAULT_THINKING_EFFORT`
+    /// default, if set, unless it turns thinking off.
     pub fn normalize_reasoning_template_args(&mut self) -> anyhow::Result<()> {
+        self.normalize_reasoning_template_args_inner(*DEFAULT_THINKING_EFFORT)
+    }
+
+    /// [`Self::normalize_reasoning_template_args`] with the serve-time default
+    /// thinking effort passed explicitly, so tests do not depend on the
+    /// process-global environment.
+    fn normalize_reasoning_template_args_inner(
+        &mut self,
+        default_thinking_effort: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.resolve_reasoning_template_args()?;
+        if let Some(effort) = default_thinking_effort {
+            apply_default_thinking_effort(&mut self.chat_template_args, effort);
+        }
+        Ok(())
+    }
+
+    fn resolve_reasoning_template_args(&mut self) -> anyhow::Result<()> {
         let thinking_mode = self
             .thinking
             .as_ref()
@@ -249,6 +272,78 @@ impl NvCreateChatCompletionRequest {
 /// same decision as a string; families split over which one they read.
 const THINKING_TOGGLES: [&str; 2] = ["thinking", "enable_thinking"];
 const THINKING_KEYS: [&str; 3] = ["thinking", "enable_thinking", "thinking_mode"];
+
+/// Operator env: the thinking effort the K3-family renderer uses when a request
+/// specifies none. Accepts `low`, `medium`, `high` or `max`; unset, empty or
+/// any other value leaves the renderer default (`max`).
+const DEFAULT_THINKING_EFFORT_ENV: &str = "DYN_KIMI_K3_DEFAULT_THINKING_EFFORT";
+const DEFAULT_THINKING_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+
+/// Serve-time default thinking effort, read once. An invalid non-empty value is
+/// warned about once and ignored rather than failing requests. The frontend is
+/// deployed per model, so only the deployment that sets it is affected.
+static DEFAULT_THINKING_EFFORT: LazyLock<Option<&'static str>> = LazyLock::new(|| {
+    let raw = std::env::var(DEFAULT_THINKING_EFFORT_ENV).ok();
+    let parsed = parse_default_thinking_effort(raw.as_deref());
+    if parsed.is_none()
+        && let Some(value) = raw.as_deref()
+        && !value.trim().is_empty()
+    {
+        tracing::warn!(
+            value,
+            "ignoring invalid {DEFAULT_THINKING_EFFORT_ENV}; expected one of {DEFAULT_THINKING_EFFORTS:?}"
+        );
+    }
+    parsed
+});
+
+/// Parse a `DYN_KIMI_K3_DEFAULT_THINKING_EFFORT` value. Surrounding whitespace
+/// is ignored; anything outside [`DEFAULT_THINKING_EFFORTS`] yields `None`.
+fn parse_default_thinking_effort(raw: Option<&str>) -> Option<&'static str> {
+    let value = raw?.trim();
+    DEFAULT_THINKING_EFFORTS
+        .into_iter()
+        .find(|effort| *effort == value)
+}
+
+/// Inject the serve-time default as `thinking_effort` when the resolved
+/// arguments carry no effort and do not turn thinking off. By now a nested
+/// `thinking.effort` and a top-level `reasoning_effort` have both been folded
+/// into `reasoning_effort`, so checking the two keys the K3-family renderer
+/// reads (`thinking_effort`, then `reasoning_effort`) means a per-request effort
+/// always wins. `thinking_effort` is not a thinking-control key for the
+/// preprocessor, so the injected value does not suppress model defaults there.
+fn apply_default_thinking_effort(
+    args: &mut Option<HashMap<String, serde_json::Value>>,
+    effort: &str,
+) {
+    if let Some(args) = args.as_ref() {
+        let has_effort = ["thinking_effort", "reasoning_effort"]
+            .iter()
+            .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+        if has_effort || thinking_disabled(args) {
+            return;
+        }
+    }
+    args.get_or_insert_with(HashMap::new).insert(
+        "thinking_effort".to_string(),
+        serde_json::Value::String(effort.to_string()),
+    );
+}
+
+/// Whether the resolved arguments turn thinking off: a boolean toggle decides
+/// first, then the `thinking_mode` string.
+fn thinking_disabled(args: &HashMap<String, serde_json::Value>) -> bool {
+    THINKING_TOGGLES
+        .iter()
+        .find_map(|key| args.get(*key).and_then(|value| value.as_bool()))
+        .map(|on| !on)
+        .unwrap_or_else(|| {
+            args.get("thinking_mode")
+                .and_then(|value| value.as_str())
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("disabled"))
+        })
+}
 
 fn set_thinking(args: &mut HashMap<String, serde_json::Value>, on: bool) {
     args.insert("thinking".to_string(), serde_json::Value::Bool(on));
@@ -2102,6 +2197,154 @@ mod tests {
         .unwrap();
         let error = request.normalize_reasoning_template_args().unwrap_err();
         assert!(error.to_string().contains("`thinking.effort`"), "{error}");
+    }
+
+    /// Normalize `body` with an explicit serve-time default thinking effort.
+    fn normalized_with_default_effort(
+        body: serde_json::Value,
+        default_effort: Option<&str>,
+    ) -> NvCreateChatCompletionRequest {
+        let mut body = body;
+        body["model"] = json!("test-model");
+        body["messages"] = json!([{"role": "user", "content": "Hello"}]);
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(body).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args_inner(default_effort)
+            .expect("request should normalize");
+        request
+    }
+
+    #[test]
+    fn test_default_thinking_effort_applies_when_request_sets_no_effort() {
+        for body in [
+            json!({}),
+            json!({"thinking": {"type": "enabled"}}),
+            json!({"thinking": {"keep": "all"}}),
+            json!({"thinking": {"type": "adaptive"}}),
+            json!({"chat_template_args": {"thinking": true}}),
+            json!({"chat_template_args": {"thinking_effort": null, "reasoning_effort": null}}),
+        ] {
+            for effort in ["low", "max"] {
+                let request = normalized_with_default_effort(body.clone(), Some(effort));
+                let args = request.chat_template_args.as_ref().unwrap();
+                assert_eq!(args.get("thinking_effort"), Some(&json!(effort)), "{body}");
+                // A request-level effort is never fabricated.
+                assert!(
+                    args.get("reasoning_effort").is_none_or(|v| v.is_null()),
+                    "{body}"
+                );
+                assert!(request.inner.reasoning_effort.is_none(), "{body}");
+            }
+        }
+        // Nothing else is added to an otherwise empty request.
+        let request = normalized_with_default_effort(json!({}), Some("low"));
+        assert_eq!(
+            request.chat_template_args,
+            Some(HashMap::from([(
+                "thinking_effort".to_string(),
+                json!("low")
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_request_effort_wins_over_default_thinking_effort() {
+        for (body, key, expected) in [
+            // Nested effort, folded into `reasoning_effort` by normalization.
+            (
+                json!({"thinking": {"type": "enabled", "effort": "high"}}),
+                "reasoning_effort",
+                "high",
+            ),
+            (
+                json!({"thinking": {"keep": "all", "effort": "max"}}),
+                "reasoning_effort",
+                "max",
+            ),
+            // Top-level `reasoning_effort`.
+            (
+                json!({"reasoning_effort": "high"}),
+                "reasoning_effort",
+                "high",
+            ),
+            (
+                json!({"reasoning_effort": "none"}),
+                "reasoning_effort",
+                "none",
+            ),
+            // Explicit template args.
+            (
+                json!({"chat_template_args": {"reasoning_effort": "medium"}}),
+                "reasoning_effort",
+                "medium",
+            ),
+            (
+                json!({"chat_template_args": {"thinking_effort": "high"}}),
+                "thinking_effort",
+                "high",
+            ),
+        ] {
+            let request = normalized_with_default_effort(body.clone(), Some("low"));
+            let args = request.chat_template_args.as_ref().unwrap();
+            assert_eq!(args.get(key), Some(&json!(expected)), "{body}");
+            if key != "thinking_effort" {
+                assert!(!args.contains_key("thinking_effort"), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_default_thinking_effort_skipped_when_thinking_disabled() {
+        for body in [
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"thinking": false}),
+            json!({"chat_template_args": {"thinking": false}}),
+            json!({"chat_template_args": {"enable_thinking": false}}),
+            json!({"chat_template_args": {"thinking_mode": "disabled"}}),
+        ] {
+            let request = normalized_with_default_effort(body.clone(), Some("low"));
+            let args = request.chat_template_args.as_ref().unwrap();
+            assert_eq!(args.get("thinking"), Some(&json!(false)), "{body}");
+            assert!(!args.contains_key("thinking_effort"), "{body}");
+            assert!(!args.contains_key("reasoning_effort"), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_no_default_thinking_effort_leaves_request_unchanged() {
+        let request = normalized_with_default_effort(json!({}), None);
+        assert!(request.chat_template_args.is_none());
+
+        let request =
+            normalized_with_default_effort(json!({"thinking": {"type": "enabled"}}), None);
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert!(!args.contains_key("thinking_effort"));
+        assert!(!args.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn test_parse_default_thinking_effort() {
+        for (raw, expected) in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            (" max\n", "max"),
+        ] {
+            assert_eq!(parse_default_thinking_effort(Some(raw)), Some(expected));
+        }
+        for invalid in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("none"),
+            Some("xhigh"),
+            Some("HIGH"),
+            Some("0.5"),
+        ] {
+            assert_eq!(parse_default_thinking_effort(invalid), None, "{invalid:?}");
+        }
     }
 
     #[test]
