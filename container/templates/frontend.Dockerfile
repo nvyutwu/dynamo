@@ -139,6 +139,7 @@ ENV PATH="/opt/dynamo/venv/bin:$PATH"
 COPY --chown=dynamo: --from=dynamo_base /opt/uv/bin/uv /opt/uv/bin/uvx /opt/uv/bin/
 ENV PATH=/opt/uv/bin:${PATH}
 COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
+COPY --chmod=644 container/config/worker-selection-two-tier.yaml /etc/dynamo/worker-selection-two-tier.yaml
 # crick wheel pre-built in the crick_builder stage; see comment near the top.
 COPY --chown=dynamo: --from=crick_builder /wheels/ /opt/dynamo/wheelhouse/extra/
 

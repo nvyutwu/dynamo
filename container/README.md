@@ -87,6 +87,12 @@ The `run.sh` script and rendering scripts are conveniences that simplify common 
 
 ## Development Targets Feature Matrix
 
+The vLLM runtime and standalone frontend images include
+`/etc/dynamo/worker-selection-two-tier.yaml`. To select the built-in CPU/GPU
+cache policy, set `DYN_ROUTER_POLICY_CONFIG` to that path on the frontend.
+The file is packaged without enabling the policy by default. The runtime wheel
+must retain its default `custom-policy` feature so the provider is linked.
+
 **Note**: In Dynamo, "targets" and "Docker stages" are synonymous. Each target corresponds to a stage in the multi-stage Docker build. Similarly, "frameworks" and "engines" are synonymous (vLLM, TensorRT-LLM, SGLang).
 
 | Feature | **runtime + `run.sh`** | **local-dev (`run.sh` or Dev Container)** | **dev + `run.sh`** (legacy) |
