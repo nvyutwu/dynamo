@@ -22,6 +22,7 @@ Runtime data-contract notes (not code-level shims):
 
 import argparse
 import importlib
+import importlib.util
 import inspect
 import logging
 import uuid
@@ -169,6 +170,27 @@ def sglang_default_mla_attention_backend(server_args: Any) -> str | None:
         )
         return None
     return backend if isinstance(backend, str) else None
+
+
+# SGLang module that adds decode context parallel to the DSA attention backend.
+_SGLANG_DSA_DCP_MODULE = "sglang.srt.layers.attention.dsa.dsa_dcp"
+
+
+@lru_cache(maxsize=1)
+def sglang_dsa_supports_decode_context_parallel() -> bool:
+    """Return whether SGLang's DSA backend implements MLA DCP decode.
+
+    SGLang #43735 added this module, the sparse decode log-sum-exp and the
+    cross-rank merge, together with launch checks for unsupported combinations.
+    Probe the implementation rather than comparing downstream version strings.
+    Fallback for SGLang 0.5.21: reject DSA DCP when the module is absent. Remove
+    the probe when all supported SGLang builds include the DSA DCP implementation
+    (upstream 0.5.22+).
+    """
+    try:
+        return importlib.util.find_spec(_SGLANG_DSA_DCP_MODULE) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def publish_server_args(server_args: Any, *, role: str) -> None:
@@ -398,6 +420,18 @@ def supports_external_mm_hashes(engine: Any) -> bool:
         return False
 
     tokenizer_manager = getattr(engine, "tokenizer_manager", None)
+    mm_processor = getattr(tokenizer_manager, "mm_processor", None)
+    if getattr(mm_processor, "uses_wide_image_identity", False) is True and callable(
+        getattr(mm_processor, "reject_caller_image_identity", None)
+    ):
+        # Kimi processors own content+config+grid identities and explicitly
+        # reject caller hashes, even though Engine accepts the generic kwarg.
+        logging.info(
+            "SGLang %s owns image identity; not forwarding external MM hashes",
+            type(mm_processor).__name__,
+        )
+        return False
+
     tokenize_one = getattr(tokenizer_manager, "_tokenize_one_request", None)
     if tokenize_one is None or getattr(
         tokenize_one, "_dynamo_rebuilds_external_mm_padding", False
