@@ -11,7 +11,7 @@
 //! corresponding entry to the macro invocation below to keep Python exceptions
 //! in sync.
 
-use dynamo_runtime::error::{BackendError, DynamoError, ErrorClass};
+use dynamo_runtime::error::{BackendError, DynamoError, ErrorClass, ErrorType};
 use dynamo_runtime::protocols::annotated::Annotated;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -301,10 +301,113 @@ fn build_http_like_error(code: u16, message: String) -> DynamoError {
         .build()
 }
 
+/// vLLM signals request faults with `VLLMClientError` subclasses
+/// (`VLLMValidationError`, `VLLMNotFoundError`, `VLLMUnprocessableEntityError`).
+/// They are not `ValueError`/`TypeError` and carry no `.code`/`.status`, so
+/// without this they fall through to `Unknown` and the client gets a sanitized
+/// 500 that hides the reason. Classes are matched by name along the MRO so
+/// Dynamo does not import vLLM; a `VLLMValidationError` without the
+/// `VLLMClientError` base (older vLLM) is matched by its own name.
+///
+/// Every vLLM client error maps to `Backend(InvalidArgument)` with the
+/// `{message, code: 400}` envelope, which the frontend reads for the status
+/// even when the error crosses the wire as a string. Only validation errors,
+/// which describe the request (for example "At most 8 image(s) may be provided
+/// in one prompt."), also set the public message; other client errors can
+/// quote fetched URLs, so their text stays diagnostic.
+pub(crate) fn vllm_client_error_to_dynamo(py: Python<'_>, err: &PyErr) -> Option<DynamoError> {
+    let class_names: Vec<String> = err
+        .get_type(py)
+        .getattr("__mro__")
+        .ok()
+        .and_then(|mro| mro.extract::<Vec<Bound<'_, PyAny>>>().ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|class| class.getattr("__name__").ok()?.extract::<String>().ok())
+        .collect();
+    let has_class = |name: &str| class_names.iter().any(|class| class == name);
+    let validation = has_class("VLLMValidationError");
+    if !validation && !has_class("VLLMClientError") {
+        return None;
+    }
+    let message = err
+        .value(py)
+        .str()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let envelope = serde_json::json!({ "message": message, "code": 400 }).to_string();
+    let builder = DynamoError::builder()
+        .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+        .message(envelope);
+    Some(if validation {
+        builder.public_message(message).build()
+    } else {
+        builder.build()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    pyo3::create_exception!(
+        vllm_exceptions,
+        VLLMClientError,
+        pyo3::exceptions::PyException
+    );
+    pyo3::create_exception!(vllm_exceptions, VLLMValidationError, VLLMClientError);
+    pyo3::create_exception!(vllm_exceptions, VLLMNotFoundError, VLLMClientError);
+    pyo3::create_exception!(
+        vllm_exceptions,
+        VLLMServerError,
+        pyo3::exceptions::PyException
+    );
+    pyo3::create_exception!(
+        vllm_exceptions,
+        SchemaValidationError,
+        pyo3::exceptions::PyException
+    );
+
+    #[test]
+    fn vllm_client_errors_map_to_invalid_argument() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let error = VLLMValidationError::new_err("At most 8 images may be provided");
+            let mapped = vllm_client_error_to_dynamo(py, &error).expect("validation error");
+            assert!(matches!(
+                mapped.error_type(),
+                ErrorType::Backend(BackendError::InvalidArgument)
+            ));
+            let payload: serde_json::Value = serde_json::from_str(mapped.message()).unwrap();
+            assert_eq!(payload["code"], 400);
+            assert_eq!(payload["message"], "At most 8 images may be provided");
+            assert_eq!(
+                mapped.public_message(),
+                Some("At most 8 images may be provided")
+            );
+
+            // Any other client error is a 400 without a public message.
+            let error = VLLMNotFoundError::new_err("http://internal/image.png: 404");
+            let mapped = vllm_client_error_to_dynamo(py, &error).expect("client error");
+            assert!(matches!(
+                mapped.error_type(),
+                ErrorType::Backend(BackendError::InvalidArgument)
+            ));
+            let payload: serde_json::Value = serde_json::from_str(mapped.message()).unwrap();
+            assert_eq!(payload["code"], 400);
+            assert_eq!(mapped.public_message(), None);
+
+            // Server errors and unrelated validation errors are not client errors.
+            for error in [
+                VLLMServerError::new_err("engine dead"),
+                SchemaValidationError::new_err("config"),
+                pyo3::exceptions::PyRuntimeError::new_err("boom"),
+            ] {
+                assert!(vllm_client_error_to_dynamo(py, &error).is_none());
+            }
+        });
+    }
 
     #[derive(Deserialize)]
     struct LegacyDynamoError {

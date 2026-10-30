@@ -41,7 +41,9 @@ use pythonize::{depythonize, pythonize};
 
 use crate::ModelInput;
 use crate::context::Context as PyContext;
-use crate::errors::{http_like_error_to_dynamo, py_exception_to_backend_error};
+use crate::errors::{
+    http_like_error_to_dynamo, py_exception_to_backend_error, vllm_client_error_to_dynamo,
+};
 use crate::llm::kv::KvEventPublisher as PyKvEventPublisher;
 use crate::llm::preprocessor::{MediaDecoder, MediaFetcher};
 use crate::to_pyerr;
@@ -1710,6 +1712,11 @@ fn py_err_to_dynamo(err: PyErr) -> DynamoError {
             return error;
         }
 
+        // vLLM client errors (`VLLMValidationError`, ...) are request faults.
+        if let Some(error) = vllm_client_error_to_dynamo(py, &err) {
+            return error;
+        }
+
         if err.is_instance_of::<pyo3::exceptions::PyGeneratorExit>(py) {
             return DynamoError::builder()
                 .error_type(ErrorType::Backend(BackendError::EngineShutdown))
@@ -1741,4 +1748,30 @@ fn py_err_to_dynamo(err: PyErr) -> DynamoError {
             .message(err.to_string())
             .build()
     })
+}
+
+#[cfg(test)]
+mod validation_error_tests {
+    use super::*;
+
+    pyo3::create_exception!(
+        validation_error_tests,
+        VLLMClientError,
+        pyo3::exceptions::PyException
+    );
+    pyo3::create_exception!(validation_error_tests, VLLMValidationError, VLLMClientError);
+
+    #[test]
+    fn worker_validation_error_maps_to_400_with_message() {
+        pyo3::prepare_freethreaded_python();
+        let error = VLLMValidationError::new_err("At most 8 images may be provided");
+        let mapped = py_err_to_dynamo(error);
+        assert!(matches!(
+            mapped.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        ));
+        let payload: serde_json::Value = serde_json::from_str(mapped.message()).unwrap();
+        assert_eq!(payload["code"], 400);
+        assert_eq!(payload["message"], "At most 8 images may be provided");
+    }
 }

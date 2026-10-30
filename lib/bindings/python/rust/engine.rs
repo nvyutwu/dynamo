@@ -37,7 +37,8 @@ use dynamo_runtime::pipeline::ManyIn;
 
 use super::context::{Context, callable_accepts_kwarg};
 use super::errors::{
-    http_like_error_to_dynamo, py_exception_to_backend_error, worker_unavailable_to_dynamo,
+    http_like_error_to_dynamo, py_exception_to_backend_error, vllm_client_error_to_dynamo,
+    worker_unavailable_to_dynamo,
 };
 use crate::python_payload::{
     EncodedPythonResponse, PythonPayload, PythonResponseItem, WaitClassification,
@@ -504,6 +505,11 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
             return error;
         }
 
+        // vLLM client errors (`VLLMValidationError`, ...) are request faults.
+        if let Some(error) = vllm_client_error_to_dynamo(py, &error) {
+            return error;
+        }
+
         if error.is_instance_of::<pyo3::exceptions::PyGeneratorExit>(py) {
             return DynamoError::builder()
                 .error_type(ErrorType::Backend(BackendError::EngineShutdown))
@@ -874,7 +880,28 @@ impl AsyncEngine<ManyIn<PythonPayload>, ManyOut<PythonResponseItem>, Error>
 #[cfg(test)]
 mod tests {
     use crate::errors::error_class_for_http_status;
-    use dynamo_runtime::error::ErrorClass;
+    use dynamo_runtime::error::{BackendError, ErrorClass, ErrorType};
+
+    pyo3::create_exception!(
+        validation_error_tests,
+        VLLMClientError,
+        pyo3::exceptions::PyException
+    );
+    pyo3::create_exception!(validation_error_tests, VLLMValidationError, VLLMClientError);
+
+    #[test]
+    fn worker_validation_error_maps_to_400_with_message() {
+        pyo3::prepare_freethreaded_python();
+        let error = VLLMValidationError::new_err("At most 8 images may be provided");
+        let mapped = super::map_python_exception(error);
+        assert!(matches!(
+            mapped.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        ));
+        let payload: serde_json::Value = serde_json::from_str(mapped.message()).unwrap();
+        assert_eq!(payload["code"], 400);
+        assert_eq!(payload["message"], "At most 8 images may be provided");
+    }
 
     #[test]
     fn http_statuses_map_to_semantic_classes() {
