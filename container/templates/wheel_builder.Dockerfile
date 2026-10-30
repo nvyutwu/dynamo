@@ -627,10 +627,15 @@ ARG TARGETARCH
 ARG ENABLE_MEDIA_FFMPEG
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=day0-repo-read-access-token,required=true \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
     --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true && \
+    export GIT_CONFIG_COUNT=1 && \
+    export GIT_CONFIG_KEY_0=http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader && \
+    export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$(cat /run/secrets/day0-repo-read-access-token)" | base64 | tr -d '\n')" && \
     export UV_CACHE_DIR=/root/.cache/uv && \
     export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
     if [ "$USE_SCCACHE" = "true" ]; then \
@@ -755,6 +760,11 @@ ARG ENABLE_SOURCE_ARCHIVAL=false
 # builds (e.g. multiple frameworks in CI) read the same cache concurrently.
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
+    --mount=type=secret,id=day0-repo-read-access-token,required=true \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true && \
+    export GIT_CONFIG_COUNT=1 && \
+    export GIT_CONFIG_KEY_0=http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader && \
+    export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$(cat /run/secrets/day0-repo-read-access-token)" | base64 | tr -d '\n')" && \
     if [ "$ENABLE_SOURCE_ARCHIVAL" = "true" ]; then \
         mkdir -p /tmp/dynamo-vendor-full && \
         cd /opt/dynamo && \

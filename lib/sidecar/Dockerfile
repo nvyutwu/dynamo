@@ -106,7 +106,12 @@ ARG CARGO_CYCLONEDX_VERSION=0.5.9
 RUN --mount=type=cache,id=dynamo-sidecar-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=dynamo-sidecar-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=dynamo-sidecar-cargo-tools-${TARGETARCH},target=/tmp/cargo-tools,sharing=locked \
+    --mount=type=secret,id=day0-repo-read-access-token,required=true \
     set -e; \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true; \
+    export GIT_CONFIG_COUNT=1; \
+    export GIT_CONFIG_KEY_0=http.https://github.com/ai-dynamo/frontend-crates-221fead8.git.extraheader; \
+    export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$(cat /run/secrets/day0-repo-read-access-token)" | base64 | tr -d '\n')"; \
     RUSTARCH=$(case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
         amd64) echo "x86_64-unknown-linux-gnu" ;; \
         arm64) echo "aarch64-unknown-linux-gnu" ;; \

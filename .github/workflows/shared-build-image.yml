@@ -191,6 +191,8 @@ on:
         required: false
       HF_TOKEN:
         required: false
+      DAY0_REPO_READ_ACCESS_TOKEN:
+        required: true
     outputs:
       target_tag_plain:
         description: 'Plain runtime image tag prefix'
@@ -385,6 +387,7 @@ jobs:
           IMAGE_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
           AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
           SCCACHE_S3_BUCKET: ${{ secrets.SCCACHE_S3_BUCKET }}
+          DAY0_REPO_READ_ACCESS_TOKEN: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
         timeout-minutes: 60
         run: |
           set -x
@@ -492,6 +495,7 @@ jobs:
           cuda_version: ${{ matrix.cuda_version }}
           aws_default_region: ${{ vars.AWS_DEFAULT_REGION }}
           sccache_s3_bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+          day0_repo_read_access_token: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
           no_cache: ${{ inputs.no_cache }}
           extra_tags: ${{ steps.extra-tags.outputs.tags }}
           push_image: ${{ inputs.push_image }}
@@ -584,6 +588,7 @@ jobs:
           diff_base_artifact_id: ${{ steps.resolve-diff-base.outputs.base_artifact_id }}
           diff_base_run_id: ${{ steps.resolve-diff-base.outputs.base_run_id }}
           gh_token: ${{ secrets.GITHUB_TOKEN }}
+          day0_repo_read_access_token: ${{ secrets.DAY0_REPO_READ_ACCESS_TOKEN }}
           framework: ${{ inputs.framework }}
           target: ${{ inputs.target }}
           platform: ${{ inputs.platform }}

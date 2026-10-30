@@ -26,6 +26,7 @@ endif
 MULTIARCH_PLATFORMS ?= linux/amd64,linux/arm64
 DOCKER_PROXY ?=
 EXTRA_BUILD_ARGS ?=
+DAY0_REPO_READ_SECRET_ARGS := --secret id=day0-repo-read-access-token,env=DAY0_REPO_READ_ACCESS_TOKEN
 
 # sccache configuration (CI only)
 USE_SCCACHE ?=
@@ -91,6 +92,7 @@ image-build: ## Build the Docker image
 		--build-context dynamo=$(DYNAMO_DIR) \
 		--build-arg RUST_IMAGE=$(RUST_IMAGE) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		$(DAY0_REPO_READ_SECRET_ARGS) \
 		$(EXTRA_BUILD_ARGS) $(PUSH) $(LOAD) .
 
 .PHONY: image-push
@@ -127,6 +129,7 @@ image-multiarch: ## Build multi-arch image (requires --push)
 		--build-context dynamo=$(DYNAMO_DIR) \
 		--build-arg RUST_IMAGE=$(RUST_IMAGE) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		$(DAY0_REPO_READ_SECRET_ARGS) \
 		$(SCCACHE_ARGS) $(EXTRA_BUILD_ARGS) $(PUSH) .
 
 .PHONY: image-multiarch-push
