@@ -1901,50 +1901,27 @@ fn resolve_qwen_video_processor_contract(
     Ok(vllm_contract.or(sglang_contract))
 }
 
-/// Trailing segments of a K3 prompt that form the assistant generation stub
-/// (`<|open|>think<|sep|>` or `<|open|>response<|sep|>`), which the vendor API
-/// leaves out of client-facing `prompt_tokens`.
+/// Trailing segments of a K3 prompt that the renderer identifies as the
+/// assistant generation stub. The vendor API excludes this measured suffix
+/// from client-facing `prompt_tokens`, while internal counts include it.
 ///
-/// A segmented prompt reports its own stub, which is empty for continuations
-/// and when no generation prompt was added, so prompt text that merely ends with
-/// the stub's characters is never counted. Only an unsegmented
-/// (template-rendered) prompt falls back to matching the rendered tail.
+/// Renderer metadata is required: continuations, prompts without a generation
+/// stub, and unsegmented templates leave usage unchanged. Matching literal tail
+/// text is insufficient evidence that those tokens form a generation stub.
 fn k3_generation_stub_segments(
     prompt: &RenderedPrompt,
 ) -> Option<Vec<crate::tokenizers::EncodeSegment<'_>>> {
-    if prompt.segments().is_some() {
-        if prompt.pending_segments() == 0 {
-            return None;
-        }
-        return prompt.pending_encode_segments();
+    if prompt.pending_segments() == 0 {
+        return None;
     }
-    const OPEN: &str = "<|open|>";
-    const SEP: &str = "<|sep|>";
-    let text = prompt.as_str().trim_end();
-    let channel = ["think", "response"]
-        .into_iter()
-        .find(|channel| text.ends_with(&format!("{OPEN}{channel}{SEP}")))?;
-    // OPEN and SEP are control tokens; the channel name is ordinary text.
-    Some(vec![
-        crate::tokenizers::EncodeSegment {
-            text: OPEN,
-            allow_special: true,
-        },
-        crate::tokenizers::EncodeSegment {
-            text: channel,
-            allow_special: false,
-        },
-        crate::tokenizers::EncodeSegment {
-            text: SEP,
-            allow_special: true,
-        },
-    ])
+    prompt.pending_encode_segments()
 }
 
 #[cfg(test)]
 mod k3_generation_stub_tests {
     use super::k3_generation_stub_segments;
-    use dynamo_renderer::{RenderedPrompt, RenderedSegment};
+    use crate::engines::ValidateRequest;
+    use dynamo_renderer::{OAIPromptFormatter, RenderedPrompt, RenderedSegment};
 
     fn seg(text: &str, allow_special: bool) -> RenderedSegment {
         RenderedSegment {
@@ -2004,12 +1981,45 @@ mod k3_generation_stub_tests {
     }
 
     #[test]
-    fn unsegmented_prompt_falls_back_to_rendered_tail() {
-        let prompt = RenderedPrompt::text("hi<|open|>think<|sep|>\n".to_string());
-        assert_eq!(texts(&prompt), Some(stub("think")));
-        let prompt = RenderedPrompt::text("hi<|open|>response<|sep|>".to_string());
-        assert_eq!(texts(&prompt), Some(stub("response")));
-        assert_eq!(texts(&RenderedPrompt::text("hi".to_string())), None);
+    fn unsegmented_literal_stub_tails_subtract_nothing() {
+        for text in [
+            "hi<|open|>think<|sep|>\n",
+            "hi<|open|>response<|sep|>",
+            "hi<|open|>response<|sep|> \t",
+            "hi",
+        ] {
+            assert_eq!(texts(&RenderedPrompt::text(text.to_string())), None);
+        }
+    }
+
+    #[test]
+    fn native_renderer_generation_metadata_controls_stub_accounting() {
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+
+        let formatter =
+            dynamo_renderer::kimi_k3::KimiK3Formatter::new(false).with_extended_efforts(true);
+        for (thinking, channel) in [(true, "think"), (false, "response")] {
+            for add_generation_prompt in [true, false] {
+                let mut request: NvCreateChatCompletionRequest =
+                    serde_json::from_value(serde_json::json!({
+                        "model": "rainhollow",
+                        "messages": [{"role": "user", "content": "say <|open|>think<|sep|>"}],
+                        "thinking": thinking,
+                        "add_generation_prompt": add_generation_prompt
+                    }))
+                    .unwrap();
+                request.normalize_reasoning_template_args().unwrap();
+                request.validate().unwrap();
+                let prompt = formatter.render_prompt(&request).unwrap();
+                if add_generation_prompt {
+                    assert_eq!(prompt.pending_segments(), 3);
+                    assert_eq!(texts(&prompt), Some(stub(channel)));
+                } else {
+                    assert_eq!(prompt.pending_segments(), 0);
+                    assert_eq!(texts(&prompt), None);
+                }
+            }
+        }
     }
 }
 
