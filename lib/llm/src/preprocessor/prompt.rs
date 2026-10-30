@@ -1145,6 +1145,25 @@ mod parity_cpu_production_adapter_tests {
     }
 
     #[test]
+    fn parity_cpu_vendor_nested_effort_reaches_actual_renderer() {
+        let mut request = request(None);
+        request.thinking = Some(json!({"effort": "low"}));
+        request.inner.reasoning_effort = Some(dynamo_protocols::types::ReasoningEffort::Max);
+        request.chat_template_args = Some(std::collections::HashMap::from([(
+            "thinking_effort".into(),
+            json!("high"),
+        )]));
+        request.normalize_reasoning_template_args().unwrap();
+        request.validate().unwrap();
+        let formatter =
+            dynamo_renderer::kimi_k3::KimiK3Formatter::new(false).with_extended_efforts(true);
+        let rendered = formatter.render(&request).unwrap();
+        assert!(rendered.contains("`thinking_effort=low`"), "{rendered}");
+        assert!(!rendered.contains("`thinking_effort=high`"));
+        assert!(!rendered.contains("`thinking_effort=max`"));
+    }
+
+    #[test]
     fn parity_cpu_export_concrete_nv_adapter_cases() {
         let Some(path) = std::env::var_os("PARITY_CASES") else {
             return;

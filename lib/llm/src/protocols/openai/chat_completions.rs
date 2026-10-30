@@ -179,17 +179,20 @@ impl NvCreateChatCompletionRequest {
             .map(openai_thinking_mode)
             .transpose()?
             .flatten();
-        // Vendor-format `thinking.effort` outranks the top-level grade, and is
-        // ignored when thinking is disabled.
-        if !matches!(thinking_mode, Some(OpenAiThinkingMode::Disabled))
-            && let Some(effort) = self
-                .thinking
+        // Vendor effort wins over both the top-level grade and template grade.
+        // Disabled thinking ignores effort. Keep the normalized top-level grade
+        // for workers that consume that representation rather than template args.
+        let thinking_effort = if matches!(thinking_mode, Some(OpenAiThinkingMode::Disabled)) {
+            None
+        } else {
+            self.thinking
                 .as_ref()
                 .map(openai_thinking_effort)
                 .transpose()?
                 .flatten()
-        {
-            self.inner.reasoning_effort = Some(effort);
+        };
+        if let Some(effort) = thinking_effort.as_ref() {
+            self.inner.reasoning_effort = Some(effort.clone());
         }
         // vLLM's order: an explicit top-level grade wins, else the nested one.
         let reasoning_effort = self
@@ -259,6 +262,10 @@ impl NvCreateChatCompletionRequest {
         if let Some(effort) = reasoning_effort {
             args.insert("reasoning_effort".to_string(), effort);
         }
+        // K3-family renderers read this key before `reasoning_effort`.
+        if let Some(effort) = thinking_effort {
+            args.insert("thinking_effort".to_string(), serde_json::to_value(effort)?);
+        }
 
         // The raw `thinking` payload has been folded into `chat_template_args`;
         // drop it so it isn't double-shipped downstream (and so it can't be
@@ -307,11 +314,10 @@ fn parse_default_thinking_effort(raw: Option<&str>) -> Option<&'static str> {
 }
 
 /// Inject the serve-time default as `thinking_effort` when the resolved
-/// arguments carry no effort and do not turn thinking off. By now a nested
-/// `thinking.effort` and a top-level `reasoning_effort` have both been folded
-/// into `reasoning_effort`, so checking the two keys the K3-family renderer
-/// reads (`thinking_effort`, then `reasoning_effort`) means a per-request effort
-/// always wins. `thinking_effort` is not a thinking-control key for the
+/// arguments carry no effort and do not turn thinking off. Nested vendor effort
+/// populates both grade keys; a top-level grade populates `reasoning_effort`.
+/// Checking the two keys the K3-family renderer reads (`thinking_effort`, then
+/// `reasoning_effort`) means a per-request effort always wins. `thinking_effort` is not a thinking-control key for the
 /// preprocessor, so the injected value does not suppress model defaults there.
 fn apply_default_thinking_effort(
     args: &mut Option<HashMap<String, serde_json::Value>>,
@@ -376,7 +382,7 @@ fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<Open
     };
     // Vendor-format objects such as `{"keep": "all"}` omit `type`; it defaults to `enabled`.
     let thinking_type = match thinking_object.get("type") {
-        None | Some(serde_json::Value::Null) => "enabled",
+        None => "enabled",
         Some(value) => value.as_str().ok_or_else(|| {
             anyhow::anyhow!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`")
         })?,
@@ -393,14 +399,18 @@ fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<Open
 fn openai_thinking_effort(
     value: &serde_json::Value,
 ) -> anyhow::Result<Option<dynamo_protocols::types::ReasoningEffort>> {
-    let Some(effort) = value.get("effort").filter(|effort| !effort.is_null()) else {
+    let Some(effort) = value.get("effort") else {
         return Ok(None);
     };
-    serde_json::from_value(effort.clone()).map(Some).map_err(|_| {
-        anyhow::anyhow!(
-            "`thinking.effort` must be one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; received {effort}"
-        )
-    })
+    // Nested vendor grades are narrower than the generic OpenAI field. The
+    // selected renderer still validates whether this model supports `medium`.
+    if !effort
+        .as_str()
+        .is_some_and(|effort| matches!(effort, "low" | "medium" | "high" | "max"))
+    {
+        anyhow::bail!("`thinking.effort` must be `low`, `medium`, `high`, or `max`");
+    }
+    Ok(Some(serde_json::from_value(effort.clone())?))
 }
 
 /// A response structure for unary chat completion responses, embedding OpenAI's
@@ -2251,7 +2261,7 @@ mod tests {
     #[test]
     fn test_request_effort_wins_over_default_thinking_effort() {
         for (body, key, expected) in [
-            // Nested effort, folded into `reasoning_effort` by normalization.
+            // Nested effort sets the canonical key and legacy wire grade.
             (
                 json!({"thinking": {"type": "enabled", "effort": "high"}}),
                 "reasoning_effort",
@@ -2288,7 +2298,13 @@ mod tests {
             let request = normalized_with_default_effort(body.clone(), Some("low"));
             let args = request.chat_template_args.as_ref().unwrap();
             assert_eq!(args.get(key), Some(&json!(expected)), "{body}");
-            if key != "thinking_effort" {
+            if body.pointer("/thinking/effort").is_some() {
+                assert_eq!(
+                    args.get("thinking_effort"),
+                    Some(&json!(expected)),
+                    "{body}"
+                );
+            } else if key != "thinking_effort" {
                 assert!(!args.contains_key("thinking_effort"), "{body}");
             }
         }
@@ -2742,5 +2758,120 @@ mod tests {
             .extract_stop_conditions()
             .expect("Failed to extract stop conditions");
         assert_eq!(stop_conditions.max_thinking_tokens, None);
+    }
+}
+
+#[cfg(test)]
+mod vendor_thinking_regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(thinking: serde_json::Value) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "rainhollow", "messages": [{"role": "user", "content": "hello"}],
+            "thinking": thinking
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn nested_effort_overrides_template_effort_and_operator_default() {
+        let mut request = request(json!({"effort": "low"}));
+        request.inner.reasoning_effort = Some(dynamo_protocols::types::ReasoningEffort::Max);
+        request.chat_template_args = Some(HashMap::from([
+            ("thinking_effort".into(), json!("high")),
+            ("reasoning_effort".into(), json!("medium")),
+        ]));
+        request
+            .normalize_reasoning_template_args_inner(Some("max"))
+            .unwrap();
+        let args = request.chat_template_args.unwrap();
+        assert_eq!(args["thinking_effort"], json!("low"));
+        assert_eq!(args["reasoning_effort"], json!("low"));
+        assert_eq!(
+            request.inner.reasoning_effort,
+            Some(dynamo_protocols::types::ReasoningEffort::Low)
+        );
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn omitted_type_and_effort_preserve_default_behavior() {
+        for thinking in [json!({}), json!({"keep": "all"})] {
+            let mut request = request(thinking);
+            request
+                .normalize_reasoning_template_args_inner(None)
+                .unwrap();
+            let args = request.chat_template_args.unwrap();
+            assert_eq!(args["thinking"], json!(true));
+            assert!(!args.contains_key("thinking_effort"));
+            assert!(!args.contains_key("reasoning_effort"));
+        }
+    }
+
+    #[test]
+    fn explicit_invalid_type_is_rejected() {
+        for kind in [json!(null), json!(true), json!(1), json!("auto")] {
+            let error = request(json!({"type": kind}))
+                .normalize_reasoning_template_args_inner(None)
+                .unwrap_err();
+            assert!(error.to_string().contains("`thinking.type`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_invalid_effort_is_rejected() {
+        for effort in [
+            json!(null),
+            json!(false),
+            json!(1),
+            json!({}),
+            json!([]),
+            json!("none"),
+            json!("minimal"),
+            json!("xhigh"),
+            json!("bogus"),
+        ] {
+            let error = request(json!({"effort": effort}))
+                .normalize_reasoning_template_args_inner(None)
+                .unwrap_err();
+            assert!(error.to_string().contains("`thinking.effort`"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("`low`, `medium`, `high`, or `max`"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_efforts_are_forwarded() {
+        for effort in ["low", "medium", "high", "max"] {
+            let mut request = request(json!({"effort": effort}));
+            request
+                .normalize_reasoning_template_args_inner(None)
+                .unwrap();
+            assert_eq!(
+                request.chat_template_args.unwrap()["thinking_effort"],
+                json!(effort)
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_thinking_ignores_nested_effort_without_overriding_template() {
+        for effort in [json!(null), json!({}), json!("bogus"), json!("low")] {
+            let mut request = request(json!({"type": "disabled", "effort": effort}));
+            request.chat_template_args =
+                Some(HashMap::from([("thinking_effort".into(), json!("high"))]));
+            request
+                .normalize_reasoning_template_args_inner(Some("max"))
+                .unwrap();
+            let args = request.chat_template_args.unwrap();
+            assert_eq!(args["thinking"], json!(false));
+            assert_eq!(args["thinking_effort"], json!("high"));
+            assert!(request.inner.reasoning_effort.is_none());
+        }
     }
 }

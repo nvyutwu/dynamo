@@ -1587,3 +1587,81 @@ async fn vendor_thinking_object_defaults_and_effort_reach_engine() {
     })
     .await;
 }
+
+#[tokio::test]
+#[serial]
+async fn vendor_thinking_regression_malformed_fields_return400_before_dispatch() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        temp_env::async_with_vars(BASE_ENV, async {
+            let script = load_agent_fixture("text.sse").await.unwrap();
+            let svc = HarnessService::start(vec![script; 24]).await;
+            for stream in [false, true] {
+                for (thinking, field) in [
+                    (json!({"type": null}), "thinking.type"),
+                    (json!({"type": true}), "thinking.type"),
+                    (json!({"effort": null}), "thinking.effort"),
+                    (json!({"effort": false}), "thinking.effort"),
+                    (json!({"effort": "none"}), "thinking.effort"),
+                    (json!({"effort": "xhigh"}), "thinking.effort"),
+                ] {
+                    let response = post_json(
+                        &svc,
+                        "/v1/chat/completions",
+                        json!({
+                            "model": MODEL, "messages": [{"role": "user", "content": "ping"}],
+                            "stream": stream, "thinking": thinking
+                        }),
+                    )
+                    .await;
+                    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                    let error: Value = bounded(response.json()).await.unwrap();
+                    assert!(
+                        error["message"].as_str().unwrap().contains(field),
+                        "{error}"
+                    );
+                    assert!(svc.engine.take_requests().await.is_empty());
+                }
+            }
+            svc.shutdown().await;
+        })
+        .await;
+    })
+    .await
+    .expect("bounded malformed thinking HTTP checks");
+}
+
+#[tokio::test]
+#[serial]
+async fn vendor_thinking_regression_precedence_reaches_worker() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        temp_env::async_with_vars(BASE_ENV, async {
+            let script = load_agent_fixture("text.sse").await.unwrap();
+            let svc = HarnessService::start(vec![script; 4]).await;
+            for stream in [false, true] {
+                let response = post_json(
+                    &svc,
+                    "/v1/chat/completions",
+                    json!({
+                        "model": MODEL, "messages": [{"role": "user", "content": "ping"}],
+                        "stream": stream, "thinking": {"effort": "low"},
+                        "reasoning_effort": "max",
+                        "chat_template_kwargs": {"thinking_effort": "high"}
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                bounded(response.bytes()).await.unwrap();
+                let requests = svc.engine.take_requests().await;
+                assert_eq!(requests.len(), 1);
+                let args = requests[0].chat_template_args.as_ref().unwrap();
+                assert_eq!(args["thinking_effort"], json!("low"));
+                assert_eq!(args["reasoning_effort"], json!("low"));
+                assert!(requests[0].thinking.is_none());
+            }
+            svc.shutdown().await;
+        })
+        .await;
+    })
+    .await
+    .expect("bounded thinking precedence HTTP checks");
+}
