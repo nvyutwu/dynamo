@@ -156,6 +156,18 @@ impl NvCreateChatCompletionRequest {
             .map(openai_thinking_mode)
             .transpose()?
             .flatten();
+        // Vendor-format `thinking.effort` outranks the top-level grade, and is
+        // ignored when thinking is disabled.
+        if !matches!(thinking_mode, Some(OpenAiThinkingMode::Disabled))
+            && let Some(effort) = self
+                .thinking
+                .as_ref()
+                .map(openai_thinking_effort)
+                .transpose()?
+                .flatten()
+        {
+            self.inner.reasoning_effort = Some(effort);
+        }
         // vLLM's order: an explicit top-level grade wins, else the nested one.
         let reasoning_effort = self
             .inner
@@ -267,8 +279,12 @@ fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<Open
             "`thinking` must be a boolean or an object with `type` set to `enabled`, `disabled`, or `adaptive`"
         );
     };
-    let Some(thinking_type) = thinking_object.get("type").and_then(|v| v.as_str()) else {
-        anyhow::bail!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`");
+    // Vendor-format objects such as `{"keep": "all"}` omit `type`; it defaults to `enabled`.
+    let thinking_type = match thinking_object.get("type") {
+        None | Some(serde_json::Value::Null) => "enabled",
+        Some(value) => value.as_str().ok_or_else(|| {
+            anyhow::anyhow!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`")
+        })?,
     };
     match thinking_type {
         "enabled" => Ok(Some(OpenAiThinkingMode::Enabled)),
@@ -276,6 +292,20 @@ fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<Open
         "adaptive" => Ok(Some(OpenAiThinkingMode::Adaptive)),
         _ => anyhow::bail!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`"),
     }
+}
+
+/// The vendor-format nested grade, as in `{"type": "enabled", "effort": "low"}`.
+fn openai_thinking_effort(
+    value: &serde_json::Value,
+) -> anyhow::Result<Option<dynamo_protocols::types::ReasoningEffort>> {
+    let Some(effort) = value.get("effort").filter(|effort| !effort.is_null()) else {
+        return Ok(None);
+    };
+    serde_json::from_value(effort.clone()).map(Some).map_err(|_| {
+        anyhow::anyhow!(
+            "`thinking.effort` must be one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; received {effort}"
+        )
+    })
 }
 
 /// A response structure for unary chat completion responses, embedding OpenAI's
@@ -1968,6 +1998,106 @@ mod tests {
         assert_eq!(args.get("reasoning_effort"), Some(&json!("max")));
     }
 
+    fn normalized_thinking_request(body: serde_json::Value) -> NvCreateChatCompletionRequest {
+        let mut body = body;
+        body["model"] = json!("test-model");
+        body["messages"] = json!([{"role": "user", "content": "Hello"}]);
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(body).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking payload should normalize");
+        request
+    }
+
+    #[test]
+    fn test_thinking_object_without_type_defaults_to_enabled() {
+        // Vendor-format clients omit `type` and rely on its `enabled` default.
+        let request = normalized_thinking_request(json!({"thinking": {"keep": "all"}}));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&json!(true)));
+        assert_eq!(args.get("enable_thinking"), Some(&json!(true)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
+        // No effort was supplied, so the renderer keeps its own default.
+        assert!(!args.contains_key("reasoning_effort"));
+        assert!(request.inner.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn test_thinking_object_with_unknown_type_is_rejected() {
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "auto", "keep": "all"}
+        }))
+        .unwrap();
+        let error = request.normalize_reasoning_template_args().unwrap_err();
+        assert!(
+            error.to_string().contains("`thinking.type` must be"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_thinking_effort_reaches_template_args() {
+        for thinking in [
+            json!({"type": "enabled", "keep": "all", "effort": "low"}),
+            json!({"keep": "all", "effort": "low"}),
+        ] {
+            let request = normalized_thinking_request(json!({"thinking": thinking}));
+            let args = request.chat_template_args.as_ref().unwrap();
+            assert_eq!(args.get("thinking"), Some(&json!(true)));
+            assert_eq!(args.get("reasoning_effort"), Some(&json!("low")));
+        }
+    }
+
+    #[test]
+    fn test_thinking_effort_takes_precedence_over_reasoning_effort() {
+        // Vendor platform rule: the nested effort wins over the top-level field.
+        let request = normalized_thinking_request(json!({
+            "thinking": {"type": "enabled", "keep": "all", "effort": "low"},
+            "reasoning_effort": "max"
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("reasoning_effort"), Some(&json!("low")));
+        assert_eq!(
+            request.inner.reasoning_effort,
+            Some(dynamo_protocols::types::ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_applies_without_thinking_effort() {
+        let request = normalized_thinking_request(json!({
+            "thinking": {"type": "enabled", "keep": "all"},
+            "reasoning_effort": "high"
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("reasoning_effort"), Some(&json!("high")));
+    }
+
+    #[test]
+    fn test_thinking_effort_is_ignored_when_disabled() {
+        let request = normalized_thinking_request(json!({
+            "thinking": {"type": "disabled", "effort": "low"}
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&json!(false)));
+        assert!(!args.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn test_thinking_effort_rejects_unknown_grade() {
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "effort": "bogus"}
+        }))
+        .unwrap();
+        let error = request.normalize_reasoning_template_args().unwrap_err();
+        assert!(error.to_string().contains("`thinking.effort`"), "{error}");
+    }
+
     #[test]
     fn test_openai_thinking_adaptive_normalizes_to_template_mode() {
         let json_str = json!({
@@ -2284,7 +2414,7 @@ mod tests {
             json!("enabled"),
             json!({"type": "auto"}),
             json!({"type": true}),
-            json!({}),
+            json!({"type": "enabled", "effort": "bogus"}),
         ] {
             let json_str = json!({
                 "model": "deepseek-ai/DeepSeek-V4-Pro",

@@ -1530,3 +1530,60 @@ async fn immutable_sampling_http_child() {
         }).await;
     }).await.expect("immutable-sampling HTTP checks exceeded sixty seconds");
 }
+
+// Vendor-format `thinking` objects: `type` defaults to `enabled`, and a nested
+// `effort` reaches the renderer ahead of the top-level `reasoning_effort`.
+#[tokio::test]
+#[serial]
+async fn vendor_thinking_object_defaults_and_effort_reach_engine() {
+    temp_env::async_with_vars(BASE_ENV, async {
+        let cases = [
+            (json!({"thinking": {"keep": "all"}}), None),
+            (
+                json!({"thinking": {"type": "enabled", "keep": "all", "effort": "low"}, "reasoning_effort": "max"}),
+                Some("low"),
+            ),
+            (json!({"reasoning_effort": "high"}), Some("high")),
+        ];
+        let script = load_agent_fixture("text.sse").await.unwrap();
+        let svc = HarnessService::start(vec![script; cases.len() * 2]).await;
+        for (extra, effort) in &cases {
+            for stream in [false, true] {
+                let mut body = json!({
+                    "model": MODEL, "messages": [{"role": "user", "content": "ping"}],
+                    "stream": stream
+                });
+                for (key, value) in extra.as_object().unwrap() {
+                    body[key] = value.clone();
+                }
+                let response = post_json(&svc, "/v1/chat/completions", body).await;
+                let status = response.status();
+                let text = bounded(response.text()).await.unwrap();
+                assert_eq!(status, reqwest::StatusCode::OK, "{extra} stream={stream}: {text}");
+                let requests = svc.engine.take_requests().await;
+                assert_eq!(requests.len(), 1);
+                let args = requests[0].chat_template_args.as_ref().unwrap();
+                assert_eq!(args.get("thinking"), Some(&json!(true)), "{extra}");
+                assert_eq!(
+                    args.get("reasoning_effort").and_then(Value::as_str),
+                    *effort,
+                    "{extra} stream={stream}"
+                );
+            }
+        }
+        for stream in [false, true] {
+            let body = json!({
+                "model": MODEL, "messages": [{"role": "user", "content": "ping"}],
+                "stream": stream, "thinking": {"type": "enabled", "effort": "bogus"}
+            });
+            let response = post_json(&svc, "/v1/chat/completions", body).await;
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let error: Value = bounded(response.json()).await.unwrap();
+            let message = error["message"].as_str().unwrap();
+            assert!(message.contains("`thinking.effort`"), "{error}");
+            assert!(svc.engine.take_requests().await.is_empty());
+        }
+        svc.shutdown().await;
+    })
+    .await;
+}
