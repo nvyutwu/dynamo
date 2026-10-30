@@ -835,6 +835,12 @@ async def test_parse_args_rejects_mla_dcp_on_dsa_backend(
         "dynamo.sglang._compat.sglang_get_default_attn_backend",
         lambda *_: "flashinfer",
     )
+    # DSA is rejected only on SGLang builds without DSA DCP decode (< 0.5.22).
+    # Pin that condition so the test does not depend on the installed SGLang.
+    monkeypatch.setattr(
+        "dynamo.sglang.args.sglang_dsa_supports_decode_context_parallel",
+        lambda: False,
+    )
     hf_config = SimpleNamespace(
         architectures=["DeepseekV32ForCausalLM"], index_topk=2048
     )
