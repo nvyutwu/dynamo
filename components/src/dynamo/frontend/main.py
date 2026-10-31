@@ -19,6 +19,7 @@
 import argparse
 import asyncio
 import importlib.metadata
+import importlib.util
 import logging
 import os
 import signal
@@ -303,7 +304,10 @@ def parse_args() -> tuple[FrontendConfig, Optional[Namespace], Optional[Namespac
         try:
             from vllm.engine.arg_utils import AsyncEngineArgs
 
-            if Version(importlib.metadata.version("vllm")).release >= (0, 29):
+            if importlib.util.find_spec("vllm.entrypoints.common.cli_args"):
+                # Newer vLLM moved FrontendArgs out of entrypoints.launchers.
+                from vllm.entrypoints.common.cli_args import FrontendArgs
+            elif Version(importlib.metadata.version("vllm")).release >= (0, 29):
                 from vllm.entrypoints.launchers.cli_args import FrontendArgs
             else:
                 from vllm.entrypoints.openai.cli_args import FrontendArgs
