@@ -1097,7 +1097,7 @@ mod parity_cpu_production_adapter_tests {
         let strip = env_is_truthy("DYN_KIMI_K3_STRIP_EMPTY_TOOL_DESCRIPTION");
         assert_eq!(tools[0]["function"].get("description").is_none(), strip);
         let formatter =
-            dynamo_renderer::kimi_k3::KimiK3Formatter::new(false).with_extended_efforts(true);
+            dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
         let rendered = formatter.render(&request).unwrap();
         assert_eq!(rendered.contains("\"description\""), !strip);
         assert!(rendered.contains("lookup"));
@@ -1156,7 +1156,7 @@ mod parity_cpu_production_adapter_tests {
         request.normalize_reasoning_template_args().unwrap();
         request.validate().unwrap();
         let formatter =
-            dynamo_renderer::kimi_k3::KimiK3Formatter::new(false).with_extended_efforts(true);
+            dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
         let rendered = formatter.render(&request).unwrap();
         assert!(rendered.contains("`thinking_effort=low`"), "{rendered}");
         assert!(!rendered.contains("`thinking_effort=high`"));
@@ -1181,7 +1181,7 @@ mod parity_cpu_production_adapter_tests {
                 match request.validate() {
                     Err(error)=>rows.push(json!({"id":case["id"],"exclude_tools":exclude,"validation_error":error.to_string()})),
                     Ok(())=>{
-                        let formatter=dynamo_renderer::kimi_k3::KimiK3Formatter::new(exclude).with_extended_efforts(true);
+                        let formatter=dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(exclude);
                         match formatter.render_prompt(&request) {
                             Ok(prompt)=>rows.push(json!({"id":case["id"],"exclude_tools":exclude,"segments":prompt.segments().unwrap().iter().map(|seg|json!({"text":seg.text,"allow_special":seg.allow_special})).collect::<Vec<_>>()})),
                             Err(error)=>rows.push(json!({"id":case["id"],"exclude_tools":exclude,"render_error":error.to_string()})),

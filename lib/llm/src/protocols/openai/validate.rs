@@ -1806,6 +1806,7 @@ mod parity_cpu_history_policy_tests {
                             name: "get_weather".to_string(),
                             arguments: arguments.to_string(),
                         },
+                        custom: None,
                     },
                 ]),
                 ..Default::default()
