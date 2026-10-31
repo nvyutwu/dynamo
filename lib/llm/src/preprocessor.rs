@@ -1996,8 +1996,7 @@ mod k3_generation_stub_tests {
     fn native_renderer_generation_metadata_controls_stub_accounting() {
         use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 
-        let formatter =
-            dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
+        let formatter = dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
         for (thinking, channel) in [(true, "think"), (false, "response")] {
             for add_generation_prompt in [true, false] {
                 let mut request: NvCreateChatCompletionRequest =

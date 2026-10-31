@@ -57,7 +57,9 @@ fn strict_validation_enabled() -> bool {
 fn strict_validation_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| parse_strict_flag(std::env::var(STRICT_FUNCTION_SCHEMA_ENV).ok().as_deref()))
+    *ENABLED.get_or_init(|| {
+        parse_strict_flag(std::env::var(STRICT_FUNCTION_SCHEMA_ENV).ok().as_deref())
+    })
 }
 
 pub(super) fn validate_strict_function(

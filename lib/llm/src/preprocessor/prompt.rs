@@ -1096,8 +1096,7 @@ mod parity_cpu_production_adapter_tests {
         let tools = serde_json::to_value(request.tools().unwrap()).unwrap();
         let strip = env_is_truthy("DYN_KIMI_K3_STRIP_EMPTY_TOOL_DESCRIPTION");
         assert_eq!(tools[0]["function"].get("description").is_none(), strip);
-        let formatter =
-            dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
+        let formatter = dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
         let rendered = formatter.render(&request).unwrap();
         assert_eq!(rendered.contains("\"description\""), !strip);
         assert!(rendered.contains("lookup"));
@@ -1155,8 +1154,7 @@ mod parity_cpu_production_adapter_tests {
         )]));
         request.normalize_reasoning_template_args().unwrap();
         request.validate().unwrap();
-        let formatter =
-            dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
+        let formatter = dynamo_renderer::kimi_k3::KimiK3Formatter::new_k31(false);
         let rendered = formatter.render(&request).unwrap();
         assert!(rendered.contains("`thinking_effort=low`"), "{rendered}");
         assert!(!rendered.contains("`thinking_effort=high`"));
