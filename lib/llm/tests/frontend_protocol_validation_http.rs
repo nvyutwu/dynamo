@@ -34,11 +34,14 @@ mod scripted_chat_engine;
 use http_harness::{HarnessService, MODEL, load_agent_fixture};
 use scripted_chat_engine::{Script, ScriptedChatEngine};
 
-const BASE_ENV: [(&str, Option<&str>); 4] = [
+// Strict function-schema validation is opt-in on the rainhollow branch
+// (DYN_STRICT_FUNCTION_SCHEMA); these tests exercise the strict rules.
+const BASE_ENV: [(&str, Option<&str>); 5] = [
     (DYN_ENABLE_ANTHROPIC_API, Some("1")),
     (DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("0")),
     (DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS, None),
     (DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION, None),
+    ("DYN_STRICT_FUNCTION_SCHEMA", Some("1")),
 ];
 
 fn nvext_disabled_env() -> Vec<(&'static str, Option<&'static str>)> {

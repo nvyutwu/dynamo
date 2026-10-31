@@ -38,6 +38,7 @@ const TYPES: &[&str] = &[
 /// and the Responses API treats every tool without an explicit `strict` as strict.
 /// Rejecting those schemas with HTTP 400 differs from the K3 production frontend and
 /// from engines that do not validate (which accept them), so the default is lenient.
+#[cfg_attr(test, allow(dead_code))]
 const STRICT_FUNCTION_SCHEMA_ENV: &str = "DYN_STRICT_FUNCTION_SCHEMA";
 
 fn parse_strict_flag(value: Option<&str>) -> bool {

@@ -907,6 +907,13 @@ are disabled by default. Truthy values are `1`, `true`, `yes`, or `on`, case-ins
   backend. Named passthrough fields remain subject to their normal validation and handling.
 </ParamField>
 
+<ParamField path="DYN_STRICT_FUNCTION_SCHEMA" type="boolean" default="false">
+  Rainhollow builds only: strict function-schema preflight is opt-in. Unless this switch is truthy,
+  the frontend accepts tools with `strict: true` whose schemas are not closed, as the 1.6.1
+  rainhollow frontend did. When it is truthy, `DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION` below
+  still disables the preflight. The value is cached on first use.
+</ParamField>
+
 <ParamField path="DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION" type="boolean" default="false">
   When truthy, the frontend skips Dynamo's preflight validation of function parameter schemas
   with explicit `strict: true`. This applies to `/v1/chat/completions`, `/v1/responses` (including
