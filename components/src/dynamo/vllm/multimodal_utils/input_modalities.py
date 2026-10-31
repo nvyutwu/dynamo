@@ -4,6 +4,9 @@
 """Publish effective engine input limits rather than inferring from a model alias."""
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 INPUT_MODALITY_LIMITS_RUNTIME_KEY = "input_modality_limits"
 
@@ -11,8 +14,17 @@ INPUT_MODALITY_LIMITS_RUNTIME_KEY = "input_modality_limits"
 def publish_input_modality_limits(runtime_config, vllm_config, *, registry=None):
     model_config = vllm_config.model_config
     multimodal = getattr(model_config, "is_multimodal_model", None)
-    if multimodal is None:
-        # Older/config-less adapters do not declare a capability. Missing is unknown.
+    if callable(multimodal):
+        # Tolerate a method form, as _is_multimodal_model does (vLLM uses a property).
+        multimodal = multimodal()
+    if not isinstance(multimodal, bool):
+        # Older/config-less adapters (and test doubles) do not declare a capability.
+        # Missing or non-boolean is unknown: publish nothing.
+        if multimodal is not None:
+            logger.debug(
+                "is_multimodal_model is %s, not bool; input modality limits not published",
+                type(multimodal).__name__,
+            )
         return
     limits = {}
     if multimodal:
