@@ -19,6 +19,9 @@ use super::{
     tools::{ToolChoiceError, validate_openai_tool_choice},
 };
 
+static KIMI_K3_LENIENT_TOOL_ARGS: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_LENIENT_TOOL_ARGS"));
+
 //
 // Hyperparameter Contraints
 //
@@ -657,14 +660,34 @@ pub fn validate_stop(stop: &Option<dynamo_protocols::types::Stop>) -> Result<(),
 pub fn validate_messages(
     messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
 ) -> Result<(), anyhow::Error> {
+    validate_messages_with_lenient_tool_args(messages, *KIMI_K3_LENIENT_TOOL_ARGS)
+}
+
+/// Inner form of [`validate_messages`] with the K3 lenient-tool-args gate passed
+/// explicitly so tests can exercise both branches without touching the
+/// process-global `KIMI_K3_LENIENT_TOOL_ARGS` `LazyLock`.
+fn validate_messages_with_lenient_tool_args(
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
+    lenient_tool_args: bool,
+) -> Result<(), anyhow::Error> {
     if messages.is_empty() {
         anyhow::bail!("Messages array cannot be empty");
     }
     // Prior assistant tool-call messages in the request must carry arguments
     // as a JSON object string; reject bad non-empty shapes before chat-template rendering.
-    // This was caught in MiniMax-M3 multi-turn tool-call tests
+    // This was caught in MiniMax-M3 multi-turn tool-call tests.
+    // Skipped when `DYN_KIMI_K3_LENIENT_TOOL_ARGS` is truthy: on the K3 path
+    // these args are history context that is never re-parsed, so malformed
+    // arguments must be accepted (Kimi-Vendor-Verifier `k3_tool_bad_arguments`).
     for (message_index, message) in messages.iter().enumerate() {
-        if let dynamo_protocols::types::ChatCompletionRequestMessage::Assistant(assistant) = message
+        if let dynamo_protocols::types::ChatCompletionRequestMessage::Tool(tool) = message
+            && tool.tool_call_id.trim().is_empty()
+        {
+            anyhow::bail!("`messages[{message_index}].tool_call_id` cannot be empty");
+        }
+        if !lenient_tool_args
+            && let dynamo_protocols::types::ChatCompletionRequestMessage::Assistant(assistant) =
+                message
             && let Some(tool_calls) = &assistant.tool_calls
         {
             for (tool_call_index, tool_call) in tool_calls.iter().enumerate() {
@@ -1723,5 +1746,65 @@ mod tests {
         let at_max: Vec<u32> = (0..MAX_STOP_SEQUENCES as u32).collect();
         let ok_fields = HashMap::from([("stop_token_ids".to_string(), json!(at_max))]);
         validate_no_unsupported_fields(&ok_fields).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parity_cpu_history_policy_tests {
+    use super::*;
+    fn assistant_with_tool_args(
+        arguments: &str,
+    ) -> dynamo_protocols::types::ChatCompletionRequestMessage {
+        dynamo_protocols::types::ChatCompletionRequestMessage::Assistant(
+            dynamo_protocols::types::ChatCompletionRequestAssistantMessage {
+                tool_calls: Some(vec![
+                    dynamo_protocols::types::ChatCompletionMessageToolCall {
+                        id: "call_1".to_string(),
+                        r#type: dynamo_protocols::types::FunctionType::Function,
+                        function: dynamo_protocols::types::FunctionCall {
+                            name: "get_weather".to_string(),
+                            arguments: arguments.to_string(),
+                        },
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn validate_messages_rejects_malformed_tool_args_by_default() {
+        // Truncated JSON object — the MiniMax-M3 guard must still reject this.
+        let messages = vec![assistant_with_tool_args(r#"{"location":"x"#)];
+        let err = validate_messages_with_lenient_tool_args(&messages, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be a valid JSON object string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_messages_accepts_malformed_tool_args_when_lenient() {
+        // With the K3 lenient gate on, the same malformed history args pass.
+        let messages = vec![assistant_with_tool_args(r#"{"location":"x"#)];
+        validate_messages_with_lenient_tool_args(&messages, true).unwrap();
+    }
+
+    #[test]
+    fn validate_messages_still_checks_tool_call_id_when_lenient() {
+        // The lenient gate only relaxes tool-arg JSON parsing; the empty
+        // tool_call_id check on `tool` messages is unaffected.
+        let messages = vec![dynamo_protocols::types::ChatCompletionRequestMessage::Tool(
+            dynamo_protocols::types::ChatCompletionRequestToolMessage {
+                tool_call_id: "  ".to_string(),
+                ..Default::default()
+            },
+        )];
+        let err = validate_messages_with_lenient_tool_args(&messages, true).unwrap_err();
+        assert!(
+            err.to_string().contains("tool_call_id"),
+            "unexpected error: {err}"
+        );
     }
 }

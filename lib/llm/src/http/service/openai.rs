@@ -11295,3 +11295,55 @@ mod tests {
         assert!(response.inner.usage.is_none());
     }
 }
+
+#[cfg(test)]
+mod input_modality_protocol_tests {
+    use super::*;
+    use serde_json::json;
+    #[tokio::test]
+    async fn actual_input_modality_preprocessor_error_maps_to400_before_stream_headers() {
+        for streaming in [false, true] {
+            for (modality, part) in [
+                (
+                    "audio",
+                    json!({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}),
+                ),
+                (
+                    "audio",
+                    json!({"type":"audio_url","audio_url":{"url":"https://must-not-fetch.invalid/audio"}}),
+                ),
+                (
+                    "video",
+                    json!({"type":"video_url","video_url":{"url":"https://must-not-fetch.invalid/video"}}),
+                ),
+            ] {
+                let (error,calls)=crate::preprocessor::input_modality_admission_tests::actual_input_modality_rejection(streaming,part).await;
+                let response = ErrorMessage::from_anyhow(error, "Failed to generate completions");
+                assert_eq!(response.0, StatusCode::BAD_REQUEST);
+                assert!(
+                    response
+                        .1
+                        .message()
+                        .contains(&format!("does not support {modality}"))
+                );
+                assert_eq!(calls, 0);
+            }
+        }
+    }
+    #[test]
+    fn responses_unsupported_input_modalities_return400_before_dispatch() {
+        for streaming in [false, true] {
+            for part in [
+                json!({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}),
+                json!({"type":"input_video","video_url":"https://must-not-fetch.invalid/video"}),
+                json!({"type":"audio_url","audio_url":{"url":"https://must-not-fetch.invalid/audio"}}),
+                json!({"type":"video_url","video_url":{"url":"https://must-not-fetch.invalid/video"}}),
+            ] {
+                let body=serde_json::to_vec(&json!({"model":"test-model","stream":streaming,"input":[{"role":"user","content":[part]}]})).unwrap();
+                let error = parse_json_request::<NvCreateResponse>("responses", &body).unwrap_err();
+                assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                assert!(error.1.message().contains("deserialize"));
+            }
+        }
+    }
+}

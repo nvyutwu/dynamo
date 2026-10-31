@@ -14,6 +14,8 @@
 //!
 //! Everything else imports from `dynamo_renderer` directly.
 
+use std::sync::LazyLock;
+
 use anyhow::{Context, Result};
 use minijinja::value::Value;
 
@@ -22,6 +24,11 @@ use dynamo_renderer::{
     PromptInput, RenderedPrompt, RenderedSegment, TextInput, TokenInput, deepseek_formatter_for,
     kimi_k3_formatter_for, may_be_fix_tool_schema,
 };
+
+use dynamo_runtime::config::env_is_truthy;
+
+static STRIP_EMPTY_TOOL_DESCRIPTION: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy("DYN_KIMI_K3_STRIP_EMPTY_TOOL_DESCRIPTION"));
 
 use crate::model_card::{ModelDeploymentCard, PromptFormatterArtifact};
 use crate::protocols::openai::{
@@ -233,6 +240,54 @@ pub(crate) fn normalize_tool_call_arguments(
     Ok(())
 }
 
+/// Post-`may_be_fix_tool_schema` policy: when `strip` is true, drop empty/null
+/// tool descriptions (K3 vendor parity); otherwise return the fixed tools Value
+/// untouched (the default for every model). `may_be_fix_tool_schema` yields a
+/// minijinja Value, so this round-trips through serde_json to edit the
+/// post-backfill data. Pure (flag passed in) so it is unit-testable without the
+/// process-global env read.
+fn apply_k3_tool_description_policy(fixed: Value, strip: bool) -> Value {
+    if !strip {
+        return fixed;
+    }
+    let Ok(mut fixed_json) = serde_json::to_value(&fixed) else {
+        return fixed;
+    };
+    strip_empty_tool_descriptions(&mut fixed_json);
+    Value::from_serialize(&fixed_json)
+}
+
+/// Remove a tool `description` that is empty (`""`) or null from each tool in a
+/// tools array, in place. Real, non-empty descriptions are kept verbatim and no
+/// other field is touched, so upstream key ordering is preserved. Handles both
+/// the Chat Completions shape (`description` under `function`) and the Responses
+/// tool shape (top-level `description`). See [`STRIP_EMPTY_TOOL_DESCRIPTION`].
+fn strip_empty_tool_descriptions(tools: &mut serde_json::Value) {
+    let Some(array) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in array {
+        if let Some(function) = tool
+            .get_mut("function")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            remove_empty_description(function);
+        }
+        if let Some(object) = tool.as_object_mut() {
+            remove_empty_description(object);
+        }
+    }
+}
+
+fn remove_empty_description(object: &mut serde_json::Map<String, serde_json::Value>) {
+    let is_empty = object
+        .get("description")
+        .is_some_and(|value| value.is_null() || value.as_str() == Some(""));
+    if is_empty {
+        object.remove("description");
+    }
+}
+
 impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
     fn model(&self) -> String {
         self.inner.model.clone()
@@ -248,14 +303,14 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
     }
 
     fn tools(&self) -> Option<Value> {
-        if self.inner.tools.is_none() {
-            None
-        } else {
-            // Try to fix the tool schema if it is missing type and properties
-            Some(may_be_fix_tool_schema(
-                serde_json::to_value(&self.inner.tools).unwrap(),
-            )?)
-        }
+        self.inner.tools.as_ref()?;
+        // Try to fix the tool schema if it is missing type and properties. This
+        // also backfills `description: ""` for tools declared without one.
+        let fixed = may_be_fix_tool_schema(serde_json::to_value(&self.inner.tools).unwrap())?;
+        Some(apply_k3_tool_description_policy(
+            fixed,
+            *STRIP_EMPTY_TOOL_DESCRIPTION,
+        ))
     }
 
     fn tool_choice(&self) -> Option<Value> {
@@ -913,5 +968,213 @@ mod tests {
         assert!(segments[0].allow_special);
         assert_eq!(segments[1].text, "hello world");
         assert!(!segments[1].allow_special);
+    }
+}
+
+#[cfg(test)]
+mod k3_description_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn as_json(value: Value) -> serde_json::Value {
+        serde_json::to_value(&value).unwrap()
+    }
+
+    /// Shape as produced by `may_be_fix_tool_schema`: a tool declared without a
+    /// description has `"description": ""` backfilled.
+    fn backfilled_tools() -> serde_json::Value {
+        json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_desc",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "null_desc",
+                    "description": null,
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }
+        ])
+    }
+
+    // (a) flag on -> empty/null descriptions dropped; name/parameters/type kept.
+    #[test]
+    fn policy_on_strips_empty_and_null_descriptions_keeping_other_fields() {
+        let fixed = Value::from_serialize(backfilled_tools());
+        let out = as_json(apply_k3_tool_description_policy(fixed, true));
+        let arr = out.as_array().unwrap();
+        for tool in arr {
+            let function = tool.get("function").unwrap();
+            assert!(
+                function.get("description").is_none(),
+                "empty/null description must be dropped: {tool}"
+            );
+            assert!(function.get("name").is_some(), "name retained");
+            assert!(function.get("parameters").is_some(), "parameters retained");
+            assert_eq!(tool.get("type").unwrap(), "function");
+        }
+        assert_eq!(arr[0]["function"]["name"], "no_desc");
+        assert_eq!(arr[1]["function"]["name"], "null_desc");
+    }
+
+    // (b) flag on -> a real description is kept verbatim.
+    #[test]
+    fn policy_on_keeps_real_description() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]);
+        let out = as_json(apply_k3_tool_description_policy(
+            Value::from_serialize(&tools),
+            true,
+        ));
+        assert_eq!(out[0]["function"]["description"], "Get weather");
+    }
+
+    // (c) flag off -> byte-identical to today; the backfilled empty description
+    // is preserved (no stripping).
+    #[test]
+    fn policy_off_preserves_empty_description() {
+        let out = as_json(apply_k3_tool_description_policy(
+            Value::from_serialize(backfilled_tools()),
+            false,
+        ));
+        assert_eq!(out[0]["function"]["description"], "");
+    }
+
+    // Direct strip: null description dropped, top-level (Responses shape) covered.
+    #[test]
+    fn strip_drops_null_and_top_level_description() {
+        let mut tools = json!([
+            {"type": "function", "function": {"name": "a", "description": null, "parameters": {}}},
+            {"type": "function", "name": "b", "description": "", "parameters": {}}
+        ]);
+        strip_empty_tool_descriptions(&mut tools);
+        assert!(tools[0]["function"].get("description").is_none());
+        assert_eq!(tools[0]["function"]["name"], "a");
+        assert!(
+            tools[1].get("description").is_none(),
+            "top-level empty description dropped"
+        );
+        assert_eq!(tools[1]["name"], "b");
+    }
+}
+
+#[cfg(test)]
+mod parity_cpu_production_adapter_tests {
+    use super::*;
+    use crate::engines::ValidateRequest;
+    use dynamo_renderer::OAIPromptFormatter;
+    use serde_json::json;
+
+    fn request(arguments: Option<&str>) -> NvCreateChatCompletionRequest {
+        let messages = match arguments {
+            None => json!([{"role":"user","content":"hello"}]),
+            Some(arguments) => json!([
+                {"role":"user","content":"hello"},
+                {"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":arguments}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"ok"}
+            ]),
+        };
+        serde_json::from_value(json!({"model":"rainhollow","messages":messages,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]})).unwrap()
+    }
+
+    #[test]
+    fn parity_cpu_concrete_nv_description_policy_is_used_by_renderer() {
+        let request = request(None);
+        request.validate().unwrap();
+        let tools = serde_json::to_value(request.tools().unwrap()).unwrap();
+        let strip = env_is_truthy("DYN_KIMI_K3_STRIP_EMPTY_TOOL_DESCRIPTION");
+        assert_eq!(tools[0]["function"].get("description").is_none(), strip);
+        let formatter =
+            dynamo_renderer::kimi_k3::KimiK3Formatter::new(false).with_extended_efforts(true);
+        let rendered = formatter.render(&request).unwrap();
+        assert_eq!(rendered.contains("\"description\""), !strip);
+        assert!(rendered.contains("lookup"));
+    }
+
+    #[test]
+    fn parity_cpu_concrete_nv_history_validation_gate() {
+        let lenient = env_is_truthy("DYN_KIMI_K3_LENIENT_TOOL_ARGS");
+        for args in ["{invalid json}", "[]", "null", "\"not an object\""] {
+            let request = request(Some(args));
+            let result = request.validate();
+            assert_eq!(
+                result.is_ok(),
+                lenient,
+                "lenient={lenient}, result={result:?}"
+            );
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("messages[1].tool_calls[0].function.arguments")
+                );
+            }
+        }
+        request(Some("{}")).validate().unwrap();
+    }
+
+    #[test]
+    fn parity_cpu_concrete_nv_empty_tool_id_remains_rejected() {
+        let mut request = request(Some("{}"));
+        if let dynamo_protocols::types::ChatCompletionRequestMessage::Tool(tool) =
+            &mut request.inner.messages[2]
+        {
+            tool.tool_call_id = "  ".into();
+        } else {
+            panic!("expected tool message");
+        }
+        assert!(
+            request
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("tool_call_id")
+        );
+    }
+
+    #[test]
+    fn parity_cpu_export_concrete_nv_adapter_cases() {
+        let Some(path) = std::env::var_os("PARITY_CASES") else {
+            return;
+        };
+        let fixtures = std::fs::read_to_string(path).unwrap();
+        let mut rows = Vec::new();
+        for line in fixtures.lines() {
+            let case: serde_json::Value = serde_json::from_str(line).unwrap();
+            let mut input = case["request"].clone();
+            input["model"] = json!("rainhollow");
+            for exclude in [true, false] {
+                let mut request: NvCreateChatCompletionRequest =
+                    serde_json::from_value(input.clone()).unwrap();
+                request.normalize_reasoning_template_args().unwrap();
+                match request.validate() {
+                    Err(error)=>rows.push(json!({"id":case["id"],"exclude_tools":exclude,"validation_error":error.to_string()})),
+                    Ok(())=>{
+                        let formatter=dynamo_renderer::kimi_k3::KimiK3Formatter::new(exclude).with_extended_efforts(true);
+                        match formatter.render_prompt(&request) {
+                            Ok(prompt)=>rows.push(json!({"id":case["id"],"exclude_tools":exclude,"segments":prompt.segments().unwrap().iter().map(|seg|json!({"text":seg.text,"allow_special":seg.allow_special})).collect::<Vec<_>>()})),
+                            Err(error)=>rows.push(json!({"id":case["id"],"exclude_tools":exclude,"render_error":error.to_string()})),
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(
+            std::env::var("PARITY_SEGMENTS_OUT").unwrap(),
+            serde_json::to_string_pretty(&rows).unwrap(),
+        )
+        .unwrap();
     }
 }

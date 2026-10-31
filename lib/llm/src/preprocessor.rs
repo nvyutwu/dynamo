@@ -11,10 +11,14 @@
 //!
 //! The Preprocessor will accept any IngressRequest and transform it to a BackendRequest.
 
+pub(crate) mod input_modalities;
 pub mod media;
 #[cfg(feature = "mm-routing")]
 pub mod mm_routing;
 pub mod prompt;
+use input_modalities::{
+    INPUT_MODALITY_LIMITS_RUNTIME_KEY, InputModalityLimits, validate_input_modalities,
+};
 pub mod speculative_prefill;
 pub(crate) mod structural_tag;
 pub(crate) mod tool_choice;
@@ -1787,6 +1791,7 @@ pub struct OpenAIPreprocessor {
     media_loader: Option<MediaLoader>,
     /// Engine-published request-token admission policy.
     token_budget: Option<TokenBudget>,
+    input_modality_limits: Option<InputModalityLimits>,
     /// Model context limit used by the embedding truncation contract.
     context_length: u32,
     /// Tracks warmups and cancels them when this preprocessor is retired.
@@ -2680,6 +2685,11 @@ impl OpenAIPreprocessor {
                 None
             }
         };
+        // Missing metadata preserves N-2 legacy behavior. A present malformed
+        // authoritative contract must not silently disable admission checks.
+        let input_modality_limits = runtime_config
+            .get_engine_specific::<InputModalityLimits>(INPUT_MODALITY_LIMITS_RUNTIME_KEY)
+            .context("invalid backend input_modality_limits contract")?;
         let kv_cache_block_size = mdc.kv_cache_block_size as usize;
         let context_length = mdc.effective_context_length();
 
@@ -2986,6 +2996,7 @@ impl OpenAIPreprocessor {
             normalize_tool_call_args,
             media_loader,
             token_budget,
+            input_modality_limits,
             context_length,
             speculative_prefill_tasks: speculative_prefill::PrefillTasks::new(
                 speculative_prefill_cancel.as_ref(),
@@ -7758,6 +7769,19 @@ impl
         let (mut request, context) = request.into_parts();
         let lifecycle = preprocessing_lifecycle(&context);
         let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
+
+        // The selected cohort's backend contract applies to Chat and converted
+        // Responses requests before rendering, media fetch or worker dispatch.
+        validate_input_modalities(&request.inner.messages, self.input_modality_limits.as_ref())
+            .map_err(|message| {
+                // The validator emits only controlled modality/count/limit text,
+                // never a URL, inline media, model path or client-supplied string.
+                DynamoError::builder()
+                    .error_type(ErrorType::InvalidArgument)
+                    .message(message.clone())
+                    .public_message(message)
+                    .build()
+            })?;
 
         // Preserve original inbound streaming flag before any internal overrides
         let request_id = context.id().to_string();
@@ -17282,5 +17306,142 @@ mod tests {
             image,
             video(2)
         ]));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod input_modality_admission_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingBackend(Arc<AtomicUsize>);
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
+        for RecordingBackend
+    {
+        async fn generate(
+            &self,
+            _: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("test backend reached")
+        }
+    }
+    fn configured_preprocessor(contract: Option<serde_json::Value>) -> Arc<OpenAIPreprocessor> {
+        let mut card = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        if let Some(contract) = contract {
+            card.runtime_config
+                .set_engine_specific(INPUT_MODALITY_LIMITS_RUNTIME_KEY, contract)
+                .unwrap();
+        }
+        OpenAIPreprocessor::new(card).unwrap()
+    }
+    pub(crate) async fn actual_input_modality_rejection(
+        streaming: bool,
+        part: serde_json::Value,
+    ) -> (Error, usize) {
+        let preprocessor = configured_preprocessor(Some(json!({"image":10})));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let next: Arc<
+            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+        > = Arc::new(RecordingBackend(calls.clone()));
+        let request:NvCreateChatCompletionRequest=serde_json::from_value(json!({"model":"test-model","stream":streaming,"messages":[{"role":"user","content":[part]}]})).unwrap();
+        let Err(error) =
+            Operator::generate(preprocessor.as_ref(), PipelineContext::new(request), next).await
+        else {
+            panic!("unsupported input passed admission")
+        };
+        (error, calls.load(Ordering::SeqCst))
+    }
+    #[tokio::test]
+    async fn unsupported_input_modalities_reject_before_worker_dispatch_with_http400() {
+        let preprocessor = configured_preprocessor(Some(json!({"image":10})));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let next: Arc<
+            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+        > = Arc::new(RecordingBackend(calls.clone()));
+        for streaming in [false, true] {
+            for (modality, part) in [
+                (
+                    "audio",
+                    json!({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}),
+                ),
+                (
+                    "audio",
+                    json!({"type":"audio_url","audio_url":{"url":"https://must-not-fetch.invalid/audio"}}),
+                ),
+                (
+                    "video",
+                    json!({"type":"video_url","video_url":{"url":"https://must-not-fetch.invalid/video"}}),
+                ),
+                ("video", json!({"type":"video_url","uuid":"cached-video"})),
+            ] {
+                let request:NvCreateChatCompletionRequest=serde_json::from_value(json!({"model":"test-model","stream":streaming,"messages":[{"role":"user","content":[part]}]})).unwrap();
+                let Err(error) = Operator::generate(
+                    preprocessor.as_ref(),
+                    PipelineContext::new(request),
+                    next.clone(),
+                )
+                .await
+                else {
+                    panic!("unsupported input passed admission")
+                };
+                let typed = error.downcast_ref::<DynamoError>().unwrap();
+                assert_eq!(typed.error_type(), ErrorType::InvalidArgument);
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("does not support {modality}"))
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn input_modality_text_dispatches_for_declared_and_legacy_workers() {
+        for contract in [None, Some(json!({})), Some(json!({"image":10}))] {
+            let preprocessor = configured_preprocessor(contract);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let next: Arc<
+                dyn AsyncEngine<
+                        SingleIn<PreprocessedRequest>,
+                        ManyOut<Annotated<BackendOutput>>,
+                        Error,
+                    >,
+            > = Arc::new(RecordingBackend(calls.clone()));
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(
+                json!({"model":"test-model","messages":[{"role":"user","content":"Hello"}]}),
+            )
+            .unwrap();
+            let Err(error) =
+                Operator::generate(preprocessor.as_ref(), PipelineContext::new(request), next)
+                    .await
+            else {
+                panic!("sentinel backend should return an error")
+            };
+            assert!(
+                error.to_string().contains("test backend reached"),
+                "{error:#}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn malformed_input_modality_contract_fails_actual_preprocessor_construction() {
+        let mut card = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        card.runtime_config.runtime_data.insert(
+            INPUT_MODALITY_LIMITS_RUNTIME_KEY.into(),
+            json!({"image":-1}),
+        );
+        assert!(OpenAIPreprocessor::new(card).is_err());
     }
 }

@@ -93,6 +93,7 @@ from .kv_connector_protocols import (
 )
 from .multimodal_utils.cache_config import configure_multimodal_embedding_cache
 from .multimodal_utils.media_config import create_frontend_media_config
+from .multimodal_utils.input_modalities import publish_input_modality_limits
 from .multimodal_utils.models.nemotron_video_routing import (
     publish_vllm_nemotron_video_processor_contract,
 )
@@ -786,9 +787,9 @@ def setup_vllm_engine(
         bench = config._benchmark_additional_config
         if fpm_worker_id and bench["output_path"] == "/tmp/benchmark_results.json":
             short_id = fpm_worker_id[-8:]
-            os.environ[
-                ENV_FPM_BENCHMARK_OUTPUT_PATH
-            ] = f"/tmp/benchmark_results_{short_id}.json"
+            os.environ[ENV_FPM_BENCHMARK_OUTPUT_PATH] = (
+                f"/tmp/benchmark_results_{short_id}.json"
+            )
         vllm_config.additional_config["benchmark"] = bench
         logger.info("Benchmark config injected into additional_config")
 
@@ -930,6 +931,7 @@ async def register_vllm_model(
             (list of alternative AND-sets).
     """
     runtime_config = ModelRuntimeConfig()
+    publish_input_modality_limits(runtime_config, vllm_config)
     publish_vllm_structural_tag_reasoning_policy(runtime_config, vllm_config)
     publish_vllm_qwen_video_processor_contract(runtime_config, vllm_config)
     publish_vllm_nemotron_video_processor_contract(runtime_config, vllm_config)

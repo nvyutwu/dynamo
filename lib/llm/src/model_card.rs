@@ -1385,6 +1385,15 @@ impl ModelDeploymentCard {
                     VLLM_NEMOTRON_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY,
                 );
 
+                // Admission policy belongs to the same cohort as its preprocessor.
+                // Missing legacy metadata contributes no bytes; explicit contracts
+                // isolate incompatible input capabilities and configured limits.
+                append_runtime_contract_checksum(
+                    &mut bytes_to_hash,
+                    &self.runtime_config,
+                    crate::preprocessor::input_modalities::INPUT_MODALITY_LIMITS_RUNTIME_KEY,
+                );
+
                 // TODO: Do we want any other user_data or runtime_config?
 
                 blake3::hash(&bytes_to_hash).to_string()
@@ -3612,6 +3621,43 @@ mod ownership_tests {
         enabled.runtime_config.kv_event_publishing_enabled = Some(true);
 
         assert_eq!(disabled.mdcsum(), enabled.mdcsum());
+    }
+
+    #[test]
+    fn input_modality_contract_isolates_worker_sets() {
+        use crate::preprocessor::input_modalities::INPUT_MODALITY_LIMITS_RUNTIME_KEY;
+        let legacy = ModelDeploymentCard::with_name_only("model");
+        let mut images = ModelDeploymentCard::with_name_only("model");
+        images.runtime_config.runtime_data.insert(
+            INPUT_MODALITY_LIMITS_RUNTIME_KEY.to_string(),
+            serde_json::json!({"image": 10}),
+        );
+        let mut no_media = ModelDeploymentCard::with_name_only("model");
+        no_media.runtime_config.runtime_data.insert(
+            INPUT_MODALITY_LIMITS_RUNTIME_KEY.to_string(),
+            serde_json::json!({}),
+        );
+        assert_ne!(legacy.mdcsum(), images.mdcsum());
+        assert_ne!(legacy.mdcsum(), no_media.mdcsum());
+        assert_ne!(images.mdcsum(), no_media.mdcsum());
+        let wire = images.to_json().unwrap();
+        let restored = ModelDeploymentCard::load_from_json_str(&wire).unwrap();
+        assert_eq!(
+            images.runtime_config.runtime_data,
+            restored.runtime_config.runtime_data
+        );
+        assert_eq!(images.mdcsum(), restored.mdcsum());
+        let mut reordered = ModelDeploymentCard::with_name_only("model");
+        reordered.runtime_config.runtime_data.insert(
+            INPUT_MODALITY_LIMITS_RUNTIME_KEY.to_string(),
+            serde_json::from_str(r#"{"video":0,"image":10}"#).unwrap(),
+        );
+        let mut ordered = ModelDeploymentCard::with_name_only("model");
+        ordered.runtime_config.runtime_data.insert(
+            INPUT_MODALITY_LIMITS_RUNTIME_KEY.to_string(),
+            serde_json::from_str(r#"{"image":10,"video":0}"#).unwrap(),
+        );
+        assert_eq!(ordered.mdcsum(), reordered.mdcsum());
     }
 
     #[test]
