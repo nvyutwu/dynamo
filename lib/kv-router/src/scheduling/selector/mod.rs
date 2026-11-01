@@ -631,7 +631,8 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                         &input,
                         workers,
                         request,
-                        candidates,
+                        picker.as_ref(),
+                        picker_input,
                         row,
                         router_decision_trace_sample_rate(),
                     );

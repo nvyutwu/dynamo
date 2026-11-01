@@ -71,7 +71,14 @@ fn policy_with_rng(
     rng: Option<Arc<Mutex<fastrand::Rng>>>,
 ) -> WorkerSelectionPolicy {
     let scorer = scorer::build(&parameters, worker_label);
-    let picker = picker::DefaultPicker::new(parameters.router_temperature, rng);
+    // Resolved once per policy build; only the opt-in routing-decision trace reads them.
+    let trace_parameters = parameters
+        .snapshot()
+        .into_iter()
+        .filter_map(|(name, value)| value.as_f64().map(|value| (name, value)))
+        .collect();
+    let picker = picker::DefaultPicker::new(parameters.router_temperature, rng)
+        .with_trace_parameters(trace_parameters);
     WorkerSelectionPolicy::new(config, worker_label, vec![scorer], Box::new(picker))
         .with_exclusive_affinity(true)
 }

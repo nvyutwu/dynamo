@@ -6,7 +6,9 @@ use crate::kv_router::{
     FindBestMatchAdmission,
     routing_host::{kv_selection::SelectionOutcome, request_guard::RouteObservation},
 };
-use crate::protocols::common::timing::{RoutingDecisionCandidate, RoutingDecisionTrace};
+use crate::protocols::common::timing::{
+    RoutingDecisionCandidate, RoutingDecisionParameter, RoutingDecisionTrace,
+};
 
 fn request_trace_routing_decision(
     trace: dynamo_kv_router::protocols::RoutingDecisionTrace,
@@ -33,6 +35,14 @@ fn request_trace_routing_decision(
         shared_cache_multiplier: trace.shared_cache_multiplier,
         decode_active_request_weight: trace.decode_active_request_weight,
         router_temperature: trace.router_temperature,
+        policy_parameters: trace
+            .policy_parameters
+            .into_iter()
+            .map(|parameter| RoutingDecisionParameter {
+                name: parameter.name,
+                value: parameter.value,
+            })
+            .collect(),
         candidates: trace
             .candidates
             .into_iter()

@@ -4,7 +4,8 @@
 //! Minimum-cost selection, tie-breaking, and temperature sampling of scored candidates.
 
 use dynamo_kv_router::plugins::worker_selection::{
-    WorkerInputView, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicyError,
+    PickExplanation, WorkerInputView, WorkerPicker, WorkerSelectionContext,
+    WorkerSelectionPolicyError,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -65,6 +66,8 @@ pub(super) struct DefaultPicker {
     rng: Option<Arc<Mutex<fastrand::Rng>>>,
     entries: Vec<(usize, f64)>,
     probabilities: Vec<f64>,
+    /// The policy's resolved parameters, reported by the opt-in routing-decision trace.
+    trace_parameters: Vec<(String, f64)>,
 }
 
 impl DefaultPicker {
@@ -74,7 +77,13 @@ impl DefaultPicker {
             rng,
             entries: Vec::new(),
             probabilities: Vec::new(),
+            trace_parameters: Vec::new(),
         }
+    }
+
+    pub(super) fn with_trace_parameters(mut self, parameters: Vec<(String, f64)>) -> Self {
+        self.trace_parameters = parameters;
+        self
     }
 }
 
@@ -159,5 +168,26 @@ impl WorkerPicker for DefaultPicker {
             )
         };
         Ok(self.entries[selected].0)
+    }
+
+    /// The default policy's trace: minimum summed cost, or a softmax sample at nonzero
+    /// temperature, with the resolved scorer and picker parameters.
+    fn explain_pick(
+        &self,
+        _context: &WorkerSelectionContext<'_>,
+        _input: WorkerInputView<'_>,
+        _row: usize,
+    ) -> Option<PickExplanation> {
+        Some(PickExplanation {
+            policy: "default".to_string(),
+            reason: if self.temperature == 0.0 {
+                "minimum_cost".to_string()
+            } else {
+                "temperature_sample".to_string()
+            },
+            max_overlap_row: None,
+            row_overlap: Vec::new(),
+            parameters: self.trace_parameters.clone(),
+        })
     }
 }

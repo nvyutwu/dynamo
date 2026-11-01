@@ -81,6 +81,32 @@ pub trait WorkerFilter: Send {
     ) -> Result<bool, WorkerSelectionPolicyError>;
 }
 
+/// What a picker chose and why, for the opt-in routing-decision trace.
+///
+/// The host records every candidate's cache and load inputs and summed scorer cost itself. A
+/// policy explains its own rule here: which policy this is, which branch it took, the
+/// parameters that were in force, and -- when it ranks overlap differently from the raw
+/// `effective_overlap_blocks` -- its own per-row overlap score plus the row it considers the
+/// max-overlap (oracle) worker. Everything is optional; the host fills whatever is missing
+/// from the policy-independent candidate inputs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PickExplanation {
+    /// Policy identifier, e.g. the registered policy type.
+    pub policy: String,
+    /// Which branch of the policy produced the pick.
+    pub reason: String,
+    /// Row (in the picker's input order) the policy regards as holding the most reusable cache.
+    pub max_overlap_row: Option<usize>,
+    /// The policy's own overlap ranking per input row, in blocks. Empty = use the raw inputs.
+    pub row_overlap: Vec<f64>,
+    /// Resolved parameters and derived quantities, as (name, value) pairs. Names that match a
+    /// top-level trace weight (`overlap_score_credit`, `overlap_score_credit_decay`,
+    /// `prefill_load_scale`, `host_cache_hit_weight`, `disk_cache_hit_weight`,
+    /// `shared_cache_multiplier`, `decode_active_request_weight`, `router_temperature`) also
+    /// fill that field.
+    pub parameters: Vec<(String, f64)>,
+}
+
 /// Selects one row after all filters and scorers run.
 pub trait WorkerPicker: Send {
     /// Declare the optional worker-signal columns needed by this picker.
@@ -95,4 +121,18 @@ pub trait WorkerPicker: Send {
         context: &WorkerSelectionContext<'_>,
         input: WorkerInputView<'_>,
     ) -> Result<usize, WorkerSelectionPolicyError>;
+
+    /// Explain a pick for the opt-in routing-decision trace.
+    ///
+    /// Called only for sampled requests with `DYN_ROUTER_DECISION_TRACE_ENABLED` set, right
+    /// after `pick` returned `row` for this same `input`. Return `None` to leave the trace with
+    /// the generic candidate inputs and a `custom_picker` reason.
+    fn explain_pick(
+        &self,
+        _context: &WorkerSelectionContext<'_>,
+        _input: WorkerInputView<'_>,
+        _row: usize,
+    ) -> Option<PickExplanation> {
+        None
+    }
 }

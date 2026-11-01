@@ -1153,7 +1153,17 @@ pub struct RoutingDecisionTrace {
     pub shared_cache_multiplier: f64,
     pub decode_active_request_weight: f64,
     pub router_temperature: f64,
+    /// Parameters the policy reports for this decision (empty when it explains nothing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_parameters: Vec<RoutingDecisionParameter>,
     pub candidates: Vec<RoutingDecisionCandidate>,
+}
+
+/// One named numeric parameter or derived quantity a policy attaches to its decision trace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingDecisionParameter {
+    pub name: String,
+    pub value: f64,
 }
 
 /// The router inputs and policy cost for one eligible worker.

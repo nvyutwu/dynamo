@@ -12,9 +12,12 @@ use std::sync::LazyLock;
 
 use dynamo_truthy::env_is_truthy;
 
-use super::{MaterializedSelectionInput, ScoredWorkerCandidate, WorkerInputs};
+use super::{
+    MaterializedSelectionInput, ScoredWorkerCandidate, WorkerInputView, WorkerInputs, WorkerPicker,
+};
 use crate::protocols::{
-    RoutingDecisionCandidate, RoutingDecisionTrace, WorkerConfigLike, WorkerId, WorkerWithDpRank,
+    RoutingDecisionCandidate, RoutingDecisionParameter, RoutingDecisionTrace, WorkerConfigLike,
+    WorkerId, WorkerWithDpRank,
 };
 use crate::scheduling::types::SchedulingRequest;
 
@@ -65,13 +68,17 @@ pub(super) fn sampled_request(request_id: &str, sample_rate: f64) -> bool {
 ///
 /// Every candidate's cache and load inputs are read from the request snapshot the policy
 /// scored on, whatever inputs the picker itself declared. `total_cost_blocks` is the policy's
-/// summed scorer cost for that row.
+/// summed scorer cost for that row. The picker explains itself through
+/// [`WorkerPicker::explain_pick`]: policy id, branch taken, resolved parameters and,
+/// optionally, its own per-row overlap ranking and oracle row.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn decision_trace_for_selection<C: WorkerConfigLike>(
     worker_type: &'static str,
     input: &MaterializedSelectionInput<'_>,
     workers: &HashMap<WorkerId, C>,
     request: &SchedulingRequest,
-    scored: &[ScoredWorkerCandidate],
+    picker: &dyn WorkerPicker,
+    view: WorkerInputView<'_>,
     row: usize,
     sample_rate: f64,
 ) -> Option<RoutingDecisionTrace> {
@@ -79,29 +86,69 @@ pub(super) fn decision_trace_for_selection<C: WorkerConfigLike>(
     if !sampled_request(request_id, sample_rate) {
         return None;
     }
+    let scored = view.candidates();
     let selected = scored.get(row)?.worker;
+    let explanation = picker.explain_pick(&input.context, view, row);
+    let ranked_overlap = explanation
+        .as_ref()
+        .filter(|explanation| explanation.row_overlap.len() == scored.len())
+        .map(|explanation| explanation.row_overlap.as_slice());
     let mut candidates: Vec<RoutingDecisionCandidate> = scored
         .iter()
         .enumerate()
         .map(|(index, candidate)| {
-            decision_candidate(input, workers, request, candidate, index == row)
+            let mut traced = decision_candidate(input, workers, request, candidate, index == row);
+            if let Some(ranked) = ranked_overlap {
+                traced.effective_overlap_blocks = ranked[index];
+            }
+            traced
         })
         .collect();
     let selected_overlap = candidates[row].effective_overlap_blocks;
-    let max_row = (0..candidates.len()).max_by(|a, b| {
-        candidates[*a]
-            .effective_overlap_blocks
-            .total_cmp(&candidates[*b].effective_overlap_blocks)
-    })?;
+    let max_row = explanation
+        .as_ref()
+        .and_then(|explanation| explanation.max_overlap_row)
+        .filter(|max_row| *max_row < candidates.len())
+        .or_else(|| {
+            (0..candidates.len()).max_by(|a, b| {
+                candidates[*a]
+                    .effective_overlap_blocks
+                    .total_cmp(&candidates[*b].effective_overlap_blocks)
+            })
+        })?;
     let max_overlap_worker = scored[max_row].worker;
     let max_overlap_blocks = candidates[max_row].effective_overlap_blocks;
     candidates[max_row].max_overlap = true;
     candidates.sort_unstable_by_key(|candidate| (candidate.worker_id, candidate.dp_rank));
+    let (policy, selection_reason, parameters) = match explanation {
+        Some(explanation) => (
+            explanation.policy,
+            explanation.reason,
+            explanation.parameters,
+        ),
+        None => (
+            "custom".to_string(),
+            "custom_picker".to_string(),
+            Vec::new(),
+        ),
+    };
+    let parameter = |names: &[&str]| {
+        parameters
+            .iter()
+            .find(|(name, _)| names.contains(&name.as_str()))
+            .map(|(_, value)| *value)
+    };
+    let weight = |names: &[&str]| parameter(names).unwrap_or(0.0);
+    // A policy that reports the temperature it applied wins over the request override,
+    // which composed policies may ignore.
+    let router_temperature = parameter(&["router_temperature"])
+        .or(input.context.router_temperature_override)
+        .unwrap_or(0.0);
     Some(RoutingDecisionTrace {
         schema: "dynamo.router.decision.v1".to_string(),
         worker_type: worker_type.to_owned(),
-        policy: "custom".to_string(),
-        selection_reason: "custom_picker".to_string(),
+        policy,
+        selection_reason,
         candidate_scope: "eligible_workers_only".to_string(),
         block_size: input.context.block_size,
         request_blocks: input.context.request_blocks,
@@ -112,14 +159,18 @@ pub(super) fn decision_trace_for_selection<C: WorkerConfigLike>(
         max_overlap_dp_rank: max_overlap_worker.dp_rank,
         avoidable_prefill_token_equivalents: (max_overlap_blocks - selected_overlap)
             * input.context.block_size as f64,
-        overlap_score_credit: 0.0,
-        overlap_score_credit_decay: 0.0,
-        prefill_load_scale: 0.0,
-        host_cache_hit_weight: 0.0,
-        disk_cache_hit_weight: 0.0,
-        shared_cache_multiplier: 0.0,
-        decode_active_request_weight: 0.0,
-        router_temperature: input.context.router_temperature_override.unwrap_or(0.0),
+        overlap_score_credit: weight(&["overlap_score_credit"]),
+        overlap_score_credit_decay: weight(&["overlap_score_credit_decay"]),
+        prefill_load_scale: weight(&["prefill_load_scale"]),
+        host_cache_hit_weight: weight(&["host_cache_hit_weight", "host_cache_weight"]),
+        disk_cache_hit_weight: weight(&["disk_cache_hit_weight"]),
+        shared_cache_multiplier: weight(&["shared_cache_multiplier"]),
+        decode_active_request_weight: weight(&["decode_active_request_weight"]),
+        router_temperature,
+        policy_parameters: parameters
+            .into_iter()
+            .map(|(name, value)| RoutingDecisionParameter { name, value })
+            .collect(),
         candidates,
     })
 }
@@ -174,11 +225,19 @@ mod tests {
     use super::super::test_support::base_request;
     use super::*;
     use crate::KvRouterConfig;
-    use crate::plugins::worker_selection::{
-        WorkerInputView, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicyError,
+    use crate::plugins::worker_selection::{WorkerSelectionContext, WorkerSelectionPolicyError};
+    use crate::scheduling::selector::{
+        WorkerSelectionInput, WorkerSelectionPolicy, WorkerSelector,
     };
-    use crate::scheduling::selector::{WorkerSelectionInput, WorkerSelectionPolicy, WorkerSelector};
     use crate::test_utils::SimpleWorkerConfig;
+
+    fn view(rows: &[ScoredWorkerCandidate]) -> WorkerInputView<'_> {
+        WorkerInputView {
+            candidates: rows,
+            cache: None,
+            load: None,
+        }
+    }
 
     fn scored(worker_id: u64, cost: f64) -> ScoredWorkerCandidate {
         ScoredWorkerCandidate {
@@ -242,9 +301,17 @@ mod tests {
         let input = MaterializedSelectionInput::new(&request, 16);
         // Rows deliberately out of worker order: the trace sorts by worker id.
         let rows = [scored(2, 1.5), scored(1, 7.0)];
-        let trace =
-            decision_trace_for_selection("aggregated", &input, &workers, &request, &rows, 0, 1.0)
-                .expect("full sampling with a request id keeps the trace");
+        let trace = decision_trace_for_selection(
+            "aggregated",
+            &input,
+            &workers,
+            &request,
+            &FirstRow,
+            view(&rows),
+            0,
+            1.0,
+        )
+        .expect("full sampling with a request id keeps the trace");
 
         assert_eq!(trace.selected_worker_id, 2);
         assert_eq!(trace.max_overlap_worker_id, 1);
@@ -281,15 +348,33 @@ mod tests {
         {
             let input = MaterializedSelectionInput::new(&request, 16);
             assert!(
-                decision_trace_for_selection("aggregated", &input, &workers, &request, &rows, 0, 0.0)
-                    .is_none()
+                decision_trace_for_selection(
+                    "aggregated",
+                    &input,
+                    &workers,
+                    &request,
+                    &FirstRow,
+                    view(&rows),
+                    0,
+                    0.0,
+                )
+                .is_none()
             );
         }
         request.mode = crate::scheduling::ScheduleMode::QueryOnly { request_id: None };
         let input = MaterializedSelectionInput::new(&request, 16);
         assert!(
-            decision_trace_for_selection("aggregated", &input, &workers, &request, &rows, 0, 1.0)
-                .is_none()
+            decision_trace_for_selection(
+                "aggregated",
+                &input,
+                &workers,
+                &request,
+                &FirstRow,
+                view(&rows),
+                0,
+                1.0,
+            )
+            .is_none()
         );
     }
 
@@ -303,6 +388,92 @@ mod tests {
         ) -> Result<usize, WorkerSelectionPolicyError> {
             Ok(0)
         }
+    }
+
+    struct Explaining;
+
+    impl WorkerPicker for Explaining {
+        fn pick(
+            &mut self,
+            _context: &WorkerSelectionContext<'_>,
+            _input: WorkerInputView<'_>,
+        ) -> Result<usize, WorkerSelectionPolicyError> {
+            Ok(0)
+        }
+
+        fn explain_pick(
+            &self,
+            _context: &WorkerSelectionContext<'_>,
+            _input: WorkerInputView<'_>,
+            row: usize,
+        ) -> Option<crate::plugins::worker_selection::PickExplanation> {
+            Some(crate::plugins::worker_selection::PickExplanation {
+                policy: "test-policy".to_string(),
+                reason: format!("picked_row_{row}"),
+                // The policy ranks worker 2 (row 0) above worker 1 (row 1).
+                max_overlap_row: Some(0),
+                row_overlap: vec![6.5, 4.0],
+                parameters: vec![
+                    ("host_cache_weight".to_string(), 0.75),
+                    ("cache_ratio".to_string(), 0.8125),
+                ],
+            })
+        }
+    }
+
+    #[test]
+    fn picker_explanation_sets_policy_ranking_and_parameters() {
+        let request = request_with_overlap();
+        let workers = workers();
+        let input = MaterializedSelectionInput::new(&request, 16);
+        let rows = [scored(2, 0.0), scored(1, 0.0)];
+        let trace = decision_trace_for_selection(
+            "aggregated",
+            &input,
+            &workers,
+            &request,
+            &Explaining,
+            view(&rows),
+            0,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(trace.policy, "test-policy");
+        assert_eq!(trace.selection_reason, "picked_row_0");
+        assert_eq!(trace.max_overlap_worker_id, 2);
+        assert_eq!(trace.avoidable_prefill_token_equivalents, 0.0);
+        assert_eq!(trace.host_cache_hit_weight, 0.75);
+        assert_eq!(trace.policy_parameters.len(), 2);
+        let selected = trace.candidates.iter().find(|c| c.worker_id == 2).unwrap();
+        assert!(selected.selected && selected.max_overlap);
+        assert_eq!(selected.effective_overlap_blocks, 6.5);
+        // Raw tier inputs are still the request snapshot's.
+        assert_eq!(selected.device_overlap_blocks, 1.0);
+    }
+
+    #[test]
+    fn unexplained_pick_omits_policy_parameters_from_json() {
+        let request = request_with_overlap();
+        let workers = workers();
+        let input = MaterializedSelectionInput::new(&request, 16);
+        let rows = [scored(1, 0.0), scored(2, 0.0)];
+        let trace = decision_trace_for_selection(
+            "aggregated",
+            &input,
+            &workers,
+            &request,
+            &FirstRow,
+            view(&rows),
+            0,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(
+            (trace.policy.as_str(), trace.selection_reason.as_str()),
+            ("custom", "custom_picker")
+        );
+        let value = serde_json::to_value(&trace).unwrap();
+        assert!(value.get("policy_parameters").is_none());
     }
 
     /// The flag is a process-wide `LazyLock` and this crate's unit tests never set it, so a

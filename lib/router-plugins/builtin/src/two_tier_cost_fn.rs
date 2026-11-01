@@ -47,9 +47,9 @@ use std::sync::Arc;
 
 use dynamo_kv_router::KvRouterConfig;
 use dynamo_kv_router::plugins::worker_selection::{
-    WorkerCacheInput, WorkerCacheInputs, WorkerInputView, WorkerInputs, WorkerLoadInput,
-    WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError,
-    WorkerSelectionPolicyFactory,
+    PickExplanation, WorkerCacheInput, WorkerCacheInputs, WorkerInputView, WorkerInputs,
+    WorkerLoadInput, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicy,
+    WorkerSelectionPolicyError, WorkerSelectionPolicyFactory,
 };
 use dynamo_kv_router::plugins::{
     RouterPluginRegistry, WorkerSelectionPolicyParameters, WorkerSelectionPolicyProviderError,
@@ -217,44 +217,100 @@ fn effective_overlap(cache: WorkerCacheInput<'_>, host_cache_weight: f64) -> f64
     cache.device_overlap_blocks() + host_cache_weight * cache.host_overlap_blocks()
 }
 
+/// Branch names reported in the routing-decision trace. Stable strings; dashboards key on them.
+const REASON_LOAD_IMBALANCE: &str = "load_imbalance_least_loaded";
+const REASON_CACHE_TIER: &str = "cache_tier_least_loaded_among_max_overlap";
+const REASON_NO_CACHE_WINNER: &str = "least_loaded_no_cache_winner";
+
+/// One two-tier decision, with the quantities that determined it.
+struct Decision {
+    row: usize,
+    reason: &'static str,
+    /// Row holding the largest two-tier effective overlap (device + host_cache_weight * host).
+    max_overlap_row: usize,
+    max_overlap: f64,
+    cache_ratio: f64,
+    min_load: usize,
+    max_load: usize,
+}
+
+/// The two-tier rule. `row_overlap` receives each row's two-tier effective overlap, so the
+/// pick and its explanation rank workers from the same numbers.
+fn decide(
+    parameters: &Parameters,
+    cache: WorkerCacheInputs<'_>,
+    load: &[WorkerLoadInput],
+    request_blocks: u64,
+    host_cache_weight: f64,
+    row_overlap: &mut Vec<f64>,
+) -> Option<Decision> {
+    if cache.is_empty() || cache.len() != load.len() {
+        return None;
+    }
+
+    row_overlap.clear();
+    row_overlap.extend(
+        cache
+            .iter()
+            .map(|item| effective_overlap(item, host_cache_weight)),
+    );
+    let max_overlap_row =
+        (0..row_overlap.len()).max_by(|a, b| row_overlap[*a].total_cmp(&row_overlap[*b]))?;
+    let max_overlap = row_overlap[max_overlap_row];
+    let cache_ratio = if request_blocks == 0 {
+        0.0
+    } else {
+        max_overlap / request_blocks as f64
+    };
+    let min_load = load.iter().map(|item| item.active_requests()).min()?;
+    let max_load = load.iter().map(|item| item.active_requests()).max()?;
+    let decision = |row, reason| Decision {
+        row,
+        reason,
+        max_overlap_row,
+        max_overlap,
+        cache_ratio,
+        min_load,
+        max_load,
+    };
+
+    if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
+        && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
+    {
+        return least_loaded(load, 0..load.len()).map(|row| decision(row, REASON_LOAD_IMBALANCE));
+    }
+    if parameters.cache_tier_fires(cache_ratio) {
+        // Recomputed identically to `max_overlap`, so the equality is exact, not a tolerance
+        // comparison on independently derived floats.
+        return least_loaded(
+            load,
+            row_overlap
+                .iter()
+                .enumerate()
+                .filter_map(|(row, overlap)| (*overlap == max_overlap).then_some(row)),
+        )
+        .map(|row| decision(row, REASON_CACHE_TIER));
+    }
+    least_loaded(load, 0..load.len()).map(|row| decision(row, REASON_NO_CACHE_WINNER))
+}
+
 fn select_row(
     parameters: &Parameters,
     cache: WorkerCacheInputs<'_>,
     load: &[WorkerLoadInput],
     request_blocks: u64,
     host_cache_weight: f64,
+    row_overlap: &mut Vec<f64>,
 ) -> Option<usize> {
-    if cache.is_empty() || cache.len() != load.len() {
-        return None;
-    }
-
-    let min_load = load.iter().map(|item| item.active_requests()).min()?;
-    let max_load = load.iter().map(|item| item.active_requests()).max()?;
-    if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
-        && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
-    {
-        return least_loaded(load, 0..load.len());
-    }
-
-    let max_overlap = cache
-        .iter()
-        .map(|item| effective_overlap(item, host_cache_weight))
-        .max_by(f64::total_cmp)?;
-    let cache_ratio = if request_blocks == 0 {
-        0.0
-    } else {
-        max_overlap / request_blocks as f64
-    };
-    if parameters.cache_tier_fires(cache_ratio) {
-        return least_loaded(
-            load,
-            cache.iter().enumerate().filter_map(|(row, item)| {
-                (effective_overlap(item, host_cache_weight) == max_overlap).then_some(row)
-            }),
-        );
-    }
-
-    least_loaded(load, 0..load.len())
+    decide(
+        parameters,
+        cache,
+        load,
+        request_blocks,
+        host_cache_weight,
+        row_overlap,
+    )
+    .map(|decision| decision.row)
 }
 
 struct TwoTierCostFnPicker {
@@ -262,6 +318,8 @@ struct TwoTierCostFnPicker {
     /// Resolved once at construction: the instance override when given, else the router config's
     /// `host_cache_hit_weight`.
     host_cache_weight: f64,
+    /// Per-row two-tier overlap, reused across selections so a pick does not allocate.
+    row_overlap: Vec<f64>,
 }
 
 impl WorkerPicker for TwoTierCostFnPicker {
@@ -286,8 +344,68 @@ impl WorkerPicker for TwoTierCostFnPicker {
             load,
             context.request_blocks(),
             self.host_cache_weight,
+            &mut self.row_overlap,
         )
         .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+    }
+
+    /// The routing-decision trace for this policy: which branch fired, the thresholds in force,
+    /// the two-tier overlap ranking per candidate and the row it treats as the cache oracle.
+    fn explain_pick(
+        &self,
+        context: &WorkerSelectionContext<'_>,
+        input: WorkerInputView<'_>,
+        row: usize,
+    ) -> Option<PickExplanation> {
+        let mut row_overlap = Vec::new();
+        let decision = decide(
+            &self.parameters,
+            input.cache()?,
+            input.load()?,
+            context.request_blocks(),
+            self.host_cache_weight,
+            &mut row_overlap,
+        )?;
+        // `pick` and `explain_pick` see the same input, so the branch must agree with the row
+        // that was actually chosen. If it does not, say so rather than report a fiction.
+        let reason = if decision.row == row {
+            decision.reason.to_string()
+        } else {
+            format!("{}_row_mismatch", decision.reason)
+        };
+        // On a tie for the most overlap, name the chosen row as the oracle so the trace does
+        // not report a passed-over worker that held no more cache than the one picked.
+        let max_overlap_row = if row_overlap.get(row) == Some(&decision.max_overlap) {
+            row
+        } else {
+            decision.max_overlap_row
+        };
+        Some(PickExplanation {
+            policy: POLICY_TYPE.to_string(),
+            reason,
+            max_overlap_row: Some(max_overlap_row),
+            row_overlap,
+            parameters: vec![
+                ("cache_threshold".into(), self.parameters.cache_threshold),
+                (
+                    "cache_threshold_inclusive".into(),
+                    f64::from(u8::from(self.parameters.cache_threshold_inclusive)),
+                ),
+                (
+                    "balance_abs_threshold".into(),
+                    self.parameters.balance_abs_threshold as f64,
+                ),
+                (
+                    "balance_rel_threshold".into(),
+                    self.parameters.balance_rel_threshold,
+                ),
+                ("host_cache_weight".into(), self.host_cache_weight),
+                ("cache_ratio".into(), decision.cache_ratio),
+                ("max_effective_overlap_blocks".into(), decision.max_overlap),
+                ("min_active_requests".into(), decision.min_load as f64),
+                ("max_active_requests".into(), decision.max_load as f64),
+            ],
+        })
     }
 }
 
@@ -344,6 +462,7 @@ fn provider(
                 Box::new(TwoTierCostFnPicker {
                     parameters,
                     host_cache_weight,
+                    row_overlap: Vec::new(),
                 }),
             )
         },
@@ -475,6 +594,7 @@ mod tests {
             Box::new(TwoTierCostFnPicker {
                 parameters,
                 host_cache_weight,
+                row_overlap: Vec::new(),
             }),
         )
         .select_worker(WorkerSelectionInput::configured(
