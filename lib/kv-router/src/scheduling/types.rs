@@ -166,6 +166,9 @@ pub struct SchedulingResponse {
     /// Per-candidate costs, present only when the scheduler has a selection
     /// trace spec installed and this selection was admitted.
     pub selection_trace: Option<SelectionTrace>,
+    /// Populated only by opt-in routing-decision tracing
+    /// (`DYN_ROUTER_DECISION_TRACE_ENABLED`).
+    pub decision_trace: Option<Box<crate::protocols::RoutingDecisionTrace>>,
 }
 
 /// Internal result that pairs a public scheduling response with its attempt identity.

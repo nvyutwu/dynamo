@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
 };
 
+mod decision_trace;
 mod policy;
 #[cfg(any(test, feature = "bench"))]
 mod reference;
@@ -30,6 +31,9 @@ use crate::plugins::worker_selection::{
 };
 use crate::plugins::worker_selection::{
     RuntimePolicyConfig, RuntimePolicyError, RuntimePolicyUpdate,
+};
+use decision_trace::{
+    decision_trace_for_selection, router_decision_trace_enabled, router_decision_trace_sample_rate,
 };
 pub use policy::WorkerSelectionPolicy;
 use policy::{ComposedPolicyState, WorkerSelectionPolicyStateRef, collect_policy_candidates};
@@ -389,6 +393,7 @@ fn selection_result(
         potential_decode_blocks: request
             .potential_decode_blocks_after_admission(worker, block_size),
         kv_transfer_source,
+        decision_trace: None,
     }
 }
 
@@ -562,6 +567,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
 
     let mut input = MaterializedSelectionInput::new(request, block_size);
     input.context.pinned_worker = eligibility.pinned_worker();
+    let mut decision = None;
     let selected = match state {
         #[cfg(any(test, feature = "bench"))]
         WorkerSelectionPolicyStateRef::Reference(kv_router_config, picker) => {
@@ -619,6 +625,17 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                     .into());
                 };
                 log_scored_candidates(request, worker_type, candidates, row);
+                if router_decision_trace_enabled() && eligibility.pinned_worker().is_none() {
+                    decision = decision_trace_for_selection(
+                        worker_type,
+                        &input,
+                        workers,
+                        request,
+                        candidates,
+                        row,
+                        router_decision_trace_sample_rate(),
+                    );
+                }
                 let trace = trace.map(|spec| {
                     build_selection_trace(
                         candidates,
@@ -642,13 +659,14 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         return Err(KvSchedulerError::NoEndpoints);
     };
     let kv_transfer_source = input.selected_kv_transfer_source(workers, worker);
-    let result = selection_result(
+    let mut result = selection_result(
         request,
         worker,
         block_size,
         input.max_raw_cached_tokens(),
         kv_transfer_source,
     );
+    result.decision_trace = decision.map(Box::new);
     log_selection(
         workers,
         request,

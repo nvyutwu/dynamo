@@ -1118,6 +1118,77 @@ pub struct WorkerSelectionResult {
     /// The source the selected worker fetches its KV prefix from, chosen with
     /// the same rule that credited the fetch during selection.
     pub kv_transfer_source: Option<KvTransferSourceChoice>,
+
+    /// Opt-in, request-scoped explanation of the router choice. This is absent
+    /// unless `DYN_ROUTER_DECISION_TRACE_ENABLED=true`; an unset sampling rate
+    /// then defaults to 1.0, while an explicit 0.0 disables sampling.
+    pub decision_trace: Option<Box<RoutingDecisionTrace>>,
+}
+
+/// A bounded explanation of one KV-router worker selection.
+///
+/// This intentionally contains only numerical routing state — no prompt text,
+/// token IDs, cache keys, or user headers. It can therefore be attached to a
+/// request-end trace when explicitly enabled for a diagnostic deployment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingDecisionTrace {
+    pub schema: String,
+    pub worker_type: String,
+    pub policy: String,
+    pub selection_reason: String,
+    pub candidate_scope: String,
+    pub block_size: u32,
+    pub request_blocks: u64,
+    pub track_prefill_tokens: bool,
+    pub selected_worker_id: WorkerId,
+    pub selected_dp_rank: DpRank,
+    pub max_overlap_worker_id: WorkerId,
+    pub max_overlap_dp_rank: DpRank,
+    pub avoidable_prefill_token_equivalents: f64,
+    pub overlap_score_credit: f64,
+    pub overlap_score_credit_decay: f64,
+    pub prefill_load_scale: f64,
+    pub host_cache_hit_weight: f64,
+    pub disk_cache_hit_weight: f64,
+    pub shared_cache_multiplier: f64,
+    pub decode_active_request_weight: f64,
+    pub router_temperature: f64,
+    pub candidates: Vec<RoutingDecisionCandidate>,
+}
+
+/// The router inputs and policy cost for one eligible worker.
+///
+/// Policies are composed from plugin scorers, so the host sees each scorer's
+/// total cost but not its internal terms. The default-formula breakdown fields
+/// (`prefill_cost_blocks`, `active_request_cost_blocks`, `overlap_credit_blocks`,
+/// `effective_overlap_score_credit`, `adjusted_prefill_blocks`, `raw_prefill_blocks`)
+/// are therefore zero, and `overlap_credit_decay` is 1.0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingDecisionCandidate {
+    pub worker_id: WorkerId,
+    pub dp_rank: DpRank,
+    pub eligible: bool,
+    pub selected: bool,
+    pub max_overlap: bool,
+    pub total_cost_blocks: f64,
+    pub effective_overlap_blocks: f64,
+    pub device_overlap_blocks: f64,
+    pub host_overlap_blocks: f64,
+    pub disk_overlap_blocks: f64,
+    pub shared_beyond_device_blocks: u32,
+    pub raw_prefill_blocks: f64,
+    pub active_prefill_tokens: usize,
+    pub prefill_cost_blocks: f64,
+    pub decode_cost_blocks: f64,
+    pub active_requests: usize,
+    pub active_request_cost_blocks: f64,
+    pub overlap_credit_blocks: f64,
+    pub overlap_credit_decay: f64,
+    pub effective_overlap_score_credit: f64,
+    pub adjusted_prefill_blocks: f64,
+    pub base_score_blocks: f64,
+    pub preferred_taint_multiplier: Option<f64>,
+    pub decode_overlap_formula: bool,
 }
 
 /// How many candidates a selection trace retains: the `top_k` lowest-cost rows

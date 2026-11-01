@@ -469,6 +469,8 @@ pub enum FindBestMatchOutcome {
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
+        /// Opt-in candidate table (`DYN_ROUTER_DECISION_TRACE_ENABLED`).
+        decision_trace: Option<Box<dynamo_kv_router::protocols::RoutingDecisionTrace>>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -1529,6 +1531,7 @@ impl KvRouter {
                 potential_decode_blocks: response.potential_decode_blocks as u64,
                 routing_hashes,
                 kv_hint,
+                decision_trace: response.decision_trace.take(),
             },
             booking,
             advisory_load,
