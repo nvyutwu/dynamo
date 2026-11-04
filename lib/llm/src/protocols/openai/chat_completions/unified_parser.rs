@@ -1926,10 +1926,13 @@ impl ChoiceState {
                 choice.delta.tool_calls = Some(vec![ChatCompletionMessageToolCallChunk {
                     index: tool_index as u32,
                     id: first.then(|| {
-                        self.parser
-                            .tool_call_id(call.tool_index)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()))
+                        conversation_unique_tool_call_id(
+                            self.parser.as_ref(),
+                            &self.family,
+                            call.tool_index,
+                        )
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()))
                     }),
                     r#type: first.then_some(FunctionType::Function),
                     function: Some(FunctionCallStream {
@@ -2180,6 +2183,25 @@ fn finish_reason_closes_tool_calls(finish_reason: Option<&FinishReason>) -> bool
     )
 }
 
+/// The native grammar's call ID, when it stays unique across a conversation.
+///
+/// Kimi K3's `index` attribute numbers calls within one assistant message, and the
+/// K3 renderer numbers history calls the same way, so the parser's `<name>:<index>`
+/// ID repeats on every turn (the first call is always `<name>:0`). Clients that
+/// dedupe tool calls by ID, such as Anthropic Messages behind a gateway, then drop
+/// every later call. The K3 renderer ignores request tool-call IDs, so the caller's
+/// generated ID is safe there. Kimi K2 keeps its model ID: its index is global.
+fn conversation_unique_tool_call_id<'a>(
+    parser: &'a dyn UnifiedParser,
+    family: &str,
+    tool_index: usize,
+) -> Option<&'a str> {
+    if family == KIMI_K3_UNIFIED_FAMILY {
+        return None;
+    }
+    parser.tool_call_id(tool_index)
+}
+
 fn stable_tool_index(
     source_index: usize,
     indices: &mut HashMap<usize, usize>,
@@ -2395,14 +2417,15 @@ fn parse_complete_in_mode(
                 }
             }
             UnifiedEvent::ToolCall { name, arguments } => {
-                let id = parser
-                    .tool_call_id(
-                        completed_indices
-                            .next()
-                            .expect("assembled call has completion evidence"),
-                    )
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()));
+                let id = conversation_unique_tool_call_id(
+                    parser.as_ref(),
+                    family,
+                    completed_indices
+                        .next()
+                        .expect("assembled call has completion evidence"),
+                )
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()));
                 if forced_tool_name.is_some_and(|forced| forced != name) {
                     tracing::warn!(
                         forced_tool_name = forced_tool_name,
@@ -9528,7 +9551,12 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].id, "good:1");
+        // K3's per-message index is not a conversation-unique ID: the frontend assigns one.
+        assert!(
+            parsed.tool_calls[0].id.starts_with("call-"),
+            "{}",
+            parsed.tool_calls[0].id
+        );
     }
     #[tokio::test]
     async fn kimi3_short_close_before_guided_json_survives_every_split() {
@@ -9961,6 +9989,69 @@ pub(crate) mod tests {
             );
         }
     }
+
+    fn kimi_k3_weather_turn(cities: &[&str]) -> String {
+        let calls: String = cities
+            .iter()
+            .enumerate()
+            .map(|(position, city)| {
+                format!(
+                    "<|open|>call tool=\"get_weather\" index=\"{}\"<|sep|>\
+                     <|open|>argument key=\"city\" type=\"string\"<|sep|>{city}\
+                     <|close|>argument<|sep|><|close|>call<|sep|>",
+                    position + 1
+                )
+            })
+            .collect();
+        format!("<|open|>tools<|sep|>{calls}<|close|>tools<|sep|>")
+    }
+
+    /// K3 numbers calls per assistant message, so every turn's first call is
+    /// `index="1"`. The OpenAI IDs must still be unique across turns: clients that
+    /// dedupe by ID (Anthropic Messages via a gateway) drop a repeated `get_weather:0`.
+    #[tokio::test]
+    async fn kimi_k3_tool_call_ids_are_unique_across_turns() {
+        let tools = weather_tools();
+        let mut ids = Vec::new();
+        for _turn in 0..2 {
+            let raw = kimi_k3_weather_turn(&["Paris", "Tokyo"]);
+            let batch = parse_complete(
+                KIMI_K3_UNIFIED_FAMILY,
+                &raw,
+                &GuidedToolConstraint::None,
+                &tools,
+            )
+            .unwrap();
+            assert_eq!(batch.tool_calls.len(), 2, "{raw}");
+            ids.extend(batch.tool_calls.iter().map(|call| call.id.clone()));
+
+            let output = apply_stream(
+                stream::iter([chunk(&raw, true)]),
+                Some(tools.clone()),
+                Some(ChatCompletionToolChoiceOption::Auto),
+                false,
+                UnifiedParserStartingState::None,
+                KIMI_K3_UNIFIED_FAMILY,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            let streamed: Vec<String> = collect_choices(&output)
+                .iter()
+                .filter_map(|choice| choice.delta.tool_calls.as_ref())
+                .flatten()
+                .filter_map(|call| call.id.clone())
+                .collect();
+            assert_eq!(streamed.len(), 2, "{streamed:?}");
+            ids.extend(streamed);
+        }
+        assert!(ids.iter().all(|id| id.starts_with("call-")), "{ids:?}");
+        assert_eq!(
+            ids.iter().collect::<HashSet<_>>().len(),
+            ids.len(),
+            "{ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_incomplete_evidence_prevents_tool_terminal_for_valid_json() {
         for (family, _) in eight_family_calls("unused") {

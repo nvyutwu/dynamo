@@ -6178,6 +6178,15 @@ fn kimi_native_calls(
     calls
 }
 
+/// Kimi K2 keeps its model ID (`functions.<name>:<idx>`, a global index). K3's call
+/// index is per message, so the frontend assigns `call-<uuid>`; `"call-"` means that prefix.
+fn tool_id_matches(actual: Option<&str>, expected: &str) -> bool {
+    match actual {
+        Some(actual) if expected == "call-" => actual.starts_with("call-"),
+        actual => actual == Some(expected),
+    }
+}
+
 // This asserts the serving adapter's pre-close progress and transport evidence;
 // parser-only conformance cannot express an open downstream stream or OpenAI IDs.
 #[tokio::test]
@@ -6206,7 +6215,8 @@ async fn kimi_native_adapter_releases_open_strings_and_keeps_completed_siblings(
             "<|close|>argument<|sep|>",
             "<|close|>call<|sep|>",
             "<|close|>tools<|sep|>",
-            "write_file:0",
+            // K3 IDs are frontend-assigned (`call-<uuid>`); see tool_id_matches.
+            "call-",
         ),
         (
             "kimi-k3",
@@ -6216,7 +6226,8 @@ async fn kimi_native_adapter_releases_open_strings_and_keeps_completed_siblings(
             "\"}<|close|>json<|sep|>",
             "<|close|>call<|sep|>",
             "<|close|>tools<|sep|>",
-            "write_file:0",
+            // K3 IDs are frontend-assigned (`call-<uuid>`); see tool_id_matches.
+            "call-",
         ),
     ];
     for (tool, reason, warmup, header, value_end, call_end, section_end, expected_id) in shapes {
@@ -6280,7 +6291,11 @@ async fn kimi_native_adapter_releases_open_strings_and_keeps_completed_siblings(
                         if flag {
                             assert_eq!(early.len(), 1, "{tool}/{size}/{thinking}");
                             let call = early.get(&0).unwrap();
-                            assert_eq!(call.id.as_deref(), Some(expected_id));
+                            assert!(
+                                tool_id_matches(call.id.as_deref(), expected_id),
+                                "{:?}",
+                                call.id
+                            );
                             assert_eq!(call.name.as_deref(), Some("write_file"));
                             assert_eq!(
                                 call.arguments.bytes().filter(|byte| *byte == b'q').count(),
@@ -6338,7 +6353,11 @@ async fn kimi_native_adapter_releases_open_strings_and_keeps_completed_siblings(
                             .collect();
                         let calls = kimi_native_calls(&chunks);
                         if flag && tail != "truncated" {
-                            assert_eq!(calls[&0].id.as_deref(), Some(expected_id));
+                            assert!(
+                                tool_id_matches(calls[&0].id.as_deref(), expected_id),
+                                "{:?}",
+                                calls[&0].id
+                            );
                             assert_eq!(
                                 serde_json::from_str::<Value>(&calls[&0].arguments).unwrap(),
                                 serde_json::json!({"count":7,"content":q})
@@ -6372,7 +6391,11 @@ async fn kimi_native_adapter_releases_open_strings_and_keeps_completed_siblings(
                                 serde_json::json!({"count":7,"content":q})
                             );
                             if flag {
-                                assert_eq!(final_calls[0].id, expected_id);
+                                assert!(
+                                    tool_id_matches(Some(final_calls[0].id.as_str()), expected_id),
+                                    "{}",
+                                    final_calls[0].id
+                                );
                             }
                         }
                         assert_eq!(
