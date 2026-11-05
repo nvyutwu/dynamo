@@ -41,6 +41,24 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 UUID_ONLY_VARIANT_KEY: Final = "UuidOnly"
 IMAGE_CACHE_SCOPE_KEY: Final = "image_cache_scope"
 IMAGE_CACHE_SESSION_SCOPED_ENV: Final = "DYN_MM_IMAGE_CACHE_SESSION_SCOPED"
+# PIL ``Image.info`` key holding the SHA-256 hex digest of the encoded bytes an
+# http(s) image was decoded from. The vLLM worker binds it into the image's
+# cache identity so changed bytes behind an unchanged URL never reuse stale KV
+# or multimodal-cache entries.
+IMAGE_CONTENT_DIGEST_INFO_KEY: Final = "dynamo_content_digest"
+
+
+def _sha256_hex(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def image_content_digest(image: Any) -> str | None:
+    """Return the fetched-bytes digest attached by :class:`ImageLoader`, if any."""
+    info = getattr(image, "info", None)
+    if not isinstance(info, dict):
+        return None
+    digest = info.get(IMAGE_CONTENT_DIGEST_INFO_KEY)
+    return digest if isinstance(digest, str) and digest else None
 
 
 def image_cache_scope_from_request(request: Mapping[str, Any]) -> str | None:
@@ -135,7 +153,12 @@ async def read_decoded_media_via_nixl(*args: Any, **kwargs: Any) -> Any:
 
 
 class ImageLoader:
-    CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "8"))
+    # The in-process LRU is keyed by URL, so a hit serves whatever bytes the URL
+    # held when it was first fetched. That is only correct for immutable URLs,
+    # so it is off by default: every http(s) load fetches the current bytes and
+    # the worker derives the image's cache identity from them. Set
+    # DYN_MM_IMAGE_CACHE_SIZE > 0 only when image URLs never change content.
+    CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "0"))
 
     def __init__(
         self,
@@ -151,8 +174,10 @@ class ImageLoader:
         receiving frontend decoding.
 
         Args:
-            cache_size: Maximum number of images to store in the in-memory LRU cache.
-                Zero or less disables caching. Defaults to CACHE_SIZE_MAXIMUM.
+            cache_size: Maximum number of images to store in the in-memory,
+                URL-keyed LRU cache. Zero or less disables caching. Defaults to
+                CACHE_SIZE_MAXIMUM (DYN_MM_IMAGE_CACHE_SIZE, default 0). A
+                nonzero size asserts that image URLs are immutable.
             http_timeout: Timeout in seconds for HTTP requests when fetching remote images.
                 Defaults to 30.0 seconds.
             enable_frontend_decoding: If True, enables NIXL RDMA for transferring
@@ -235,6 +260,18 @@ class ImageLoader:
         with _nvtx.annotate("mm:img:pil_open_convert", color="lime"):
             return await asyncio.to_thread(ImageLoader._open_image_sync, image_data)
 
+    async def _open_fetched_image(self, content: bytes) -> Image.Image:
+        """Open fetched http(s) bytes, tagging the image with their digest.
+
+        The digest is what the vLLM worker binds into the image's cache
+        identity, so it must describe exactly the bytes that were decoded.
+        """
+        image = await self._open_image(BytesIO(content))
+        with _nvtx.annotate("mm:img:content_digest", color="lime"):
+            digest = await asyncio.to_thread(_sha256_hex, content)
+        image.info[IMAGE_CONTENT_DIGEST_INFO_KEY] = digest
+        return image
+
     def _cache_put(self, key: str, image: Image.Image) -> None:
         """Insert into cache if not already present. Sync — no awaits."""
         # A capacity of zero or less means caching is off. Falling through would
@@ -260,7 +297,7 @@ class ImageLoader:
                 cached_content = await self._shared_image_cache.get(key)
                 if cached_content is not None:
                     try:
-                        return await self._open_image(BytesIO(cached_content))
+                        return await self._open_fetched_image(cached_content)
                     except (OSError, ValueError) as exc:
                         logger.warning(
                             "Discarding invalid shared image cache entry for '%s': %s",
@@ -278,9 +315,8 @@ class ImageLoader:
                 )
                 if not content:
                     raise ValueError("Empty response content from image URL")
-                image_data = BytesIO(content)
 
-            image = await self._open_image(image_data)
+            image = await self._open_fetched_image(content)
             if self._shared_image_cache is not None and key is not None:
                 # Cache fills are awaited deliberately so Redis acknowledges a
                 # successful write before this request returns. A cache outage

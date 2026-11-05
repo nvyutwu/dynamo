@@ -11,6 +11,7 @@ multimodal UUIDs, and the model-specific prefill/decode handoff.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from dynamo.common.multimodal.image_loader import (
     UUID_ONLY_VARIANT_KEY,
     ImageLoader,
     image_cache_scope_from_request,
+    image_content_digest,
 )
 from dynamo.common.multimodal.mm_kwargs_transfer import (
     MmKwargsNixlReceiver,
@@ -80,6 +82,79 @@ def mark_forwarded_mm_hashes_for_routing(
             )
         marked_hashes.append(prefix + "0" * 48)
     return marked_hashes
+
+
+def bind_forwarded_mm_hash_to_content(
+    marked_hash: str | None, content_digest: str | None
+) -> str | None:
+    """Replace a URL-derived routing marker with one derived from content.
+
+    URL-passthrough routing hashes are xxh3 of the URL string, so the same URL
+    serving new bytes would otherwise reuse the old image's KV blocks and vLLM
+    multimodal-cache entries. The replacement routing hash is derived from the
+    frontend hash and the fetched bytes, in the same marker form:
+
+    - same URL, same bytes: same marker, so repeated images still hit;
+    - same URL, new bytes: a new marker, so vLLM misses and the KV router
+      indexes the new blocks under a new identity.
+
+    The router predicted the request from the URL hash, so it does not match
+    these image blocks (an undercount, never a false hit). Keeping the URL hash
+    as the router-visible identity instead would alias two engine blocks to
+    one router block whenever a URL's bytes change, which the KV indexers do
+    not support.
+    """
+    if marked_hash is None or content_digest is None:
+        return marked_hash
+    digest = content_digest.lower()
+    if len(digest) < 32 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("image content digest must be at least 32 hex characters")
+    derived = hashlib.sha256(
+        f"dynamo-mm-content:{marked_hash[:16].lower()}:{digest}".encode()
+    ).hexdigest()[:16]
+    return derived + "0" * 48
+
+
+def _loaded_images_for_modality(
+    multi_modal_data: Optional[dict[str, Any]], modality: str
+) -> Optional[list[Any]]:
+    """Return the loaded image objects in slot order (None for UUID-only)."""
+    if not multi_modal_data or modality not in multi_modal_data:
+        return None
+    items = multi_modal_data[modality]
+    if not isinstance(items, list):
+        items = [items]
+    if modality == "vision_chunk":
+        return [item.get("image") if isinstance(item, dict) else None for item in items]
+    return list(items)
+
+
+def _bind_forwarded_mm_uuids_to_content(
+    mm_uuids: dict[str, list[str | None]],
+    multi_modal_data: Optional[dict[str, Any]],
+    use_unified_vision_chunk: bool,
+) -> dict[str, list[str | None]]:
+    """Bind forwarded image markers to the bytes this worker actually loaded.
+
+    Only http(s) images carry a fetched-bytes digest. data: URLs (whose
+    frontend hash covers the whole payload) and frontend-decoded images (hashed
+    over pixels) keep their forwarded marker.
+    """
+    modality = _normalize_forwarded_mm_modality("image", use_unified_vision_chunk)
+    markers = mm_uuids.get(modality)
+    images = _loaded_images_for_modality(multi_modal_data, modality)
+    if not markers or images is None:
+        return mm_uuids
+    if len(markers) != len(images):
+        # vLLM rejects a UUID/item count mismatch; leave the markers alone so
+        # that error, not a silent rebinding, reports it.
+        return mm_uuids
+    bound = dict(mm_uuids)
+    bound[modality] = [
+        bind_forwarded_mm_hash_to_content(marker, image_content_digest(image))
+        for marker, image in zip(markers, images)
+    ]
+    return bound
 
 
 def _normalize_forwarded_mm_modality(
@@ -894,6 +969,12 @@ class VllmMultimodalRequestProcessor:
                 extra_args,
                 self.use_unified_vision_chunk,
             )
+            if mm_uuids is not None:
+                mm_uuids = _bind_forwarded_mm_uuids_to_content(
+                    mm_uuids,
+                    multi_modal_data,
+                    self.use_unified_vision_chunk,
+                )
         if mm_uuids is None and self.embedding_loader is None:
             mm_uuids = compute_mm_uuids(multi_modal_data)
             if mm_uuids is not None:

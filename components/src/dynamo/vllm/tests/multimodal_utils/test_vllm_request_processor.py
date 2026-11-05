@@ -2412,3 +2412,134 @@ def test_video_derived_audio_respects_flag_and_limit(
     else:
         request.update(kwargs)
     processor.validate_multimodal_request(request)
+
+
+# --- Content-bound image identity (same URL, changed bytes) ---
+
+
+def _png_bytes(color: tuple[int, int, int]) -> bytes:
+    from io import BytesIO
+
+    buf = BytesIO()
+    Image.new("RGB", (4, 4), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("unified_vision_chunk", [False, True])
+@pytest.mark.asyncio
+async def test_same_url_changed_bytes_gets_new_engine_identity(unified_vision_chunk):
+    """A URL whose bytes change must not reuse the old image's vLLM identity.
+
+    The frontend's URL-passthrough routing hash is xxh3(URL), so all three
+    requests forward the same hash. The worker must bind the vLLM UUID to the
+    bytes it fetched: red -> blue changes the UUID (no stale KV or MM-cache
+    hit) and blue -> red restores the first UUID (repeated images still hit).
+    UUIDs keep the marker form the KV event parser accepts.
+    """
+    from dynamo.common.http.url_validator import UrlValidationPolicy
+    from dynamo.common.multimodal.image_loader import ImageLoader
+
+    loader = ImageLoader(
+        cache_size=0,
+        url_policy=UrlValidationPolicy(allow_http=True, allow_private_ips=True),
+    )
+    processor = mod.VllmMultimodalRequestProcessor(
+        model="Qwen/Qwen3-VL-2B-Instruct",
+        enable_multimodal=True,
+        image_loader=loader,
+        video_loader=SimpleNamespace(load_video_batch=AsyncMock(return_value=[])),
+        audio_loader=SimpleNamespace(
+            load_audio_batch=AsyncMock(return_value=[]),
+            load_audio=AsyncMock(return_value=None),
+        ),
+        use_unified_vision_chunk=unified_vision_chunk,
+    )
+    responses = iter(
+        [_png_bytes((255, 0, 0)), _png_bytes((0, 0, 255)), _png_bytes((255, 0, 0))]
+    )
+
+    async def _fetch(url, timeout, *, policy=None, max_bytes=None):
+        return next(responses)
+
+    routing_hash = "0123456789abcdef"
+    modality = "vision_chunk" if unified_vision_chunk else "image"
+    uuids = []
+    with patch(
+        "dynamo.common.multimodal.image_loader.fetch_bytes",
+        AsyncMock(side_effect=_fetch),
+    ):
+        for step in range(3):
+            prepared = await _prepare_prompt(
+                processor,
+                {
+                    "token_ids": [1, 2],
+                    "multi_modal_data": {
+                        "image_url": [{"Url": "https://example.com/stale.jpg"}]
+                    },
+                    "extra_args": {"mm_hashes": [routing_hash]},
+                },
+                f"request-{step}",
+                None,
+                DisaggregationMode.AGGREGATED,
+            )
+            uuids.append(prepared.prompt["multi_modal_uuids"][modality][0])
+
+    red, blue, red_again = uuids
+    assert red != blue
+    assert red_again == red
+    for uuid in uuids:
+        assert len(uuid) == 64
+        assert uuid[16:] == "0" * 48
+        assert all(char in "0123456789abcdef" for char in uuid[:16])
+        # Never the URL-only identity the stale entries were stored under.
+        assert uuid[:16] != routing_hash
+
+
+def test_bind_forwarded_mm_hash_to_content():
+    import hashlib
+
+    marker = "0123456789abcdef" + "0" * 48
+    digest = "ab" * 32
+    assert mod.bind_forwarded_mm_hash_to_content(marker, None) == marker
+    assert mod.bind_forwarded_mm_hash_to_content(None, digest) is None
+    bound = mod.bind_forwarded_mm_hash_to_content(marker, digest)
+    # Pinned so the derivation cannot drift silently between worker versions
+    # (prefix caches survive only while identities are stable).
+    expected = hashlib.sha256(
+        b"dynamo-mm-content:0123456789abcdef:" + b"ab" * 32
+    ).hexdigest()[:16]
+    assert bound == expected + "0" * 48
+    assert mod.bind_forwarded_mm_hash_to_content(marker, digest.upper()) == bound
+    # Distinct content or a distinct URL hash gives a distinct identity.
+    assert mod.bind_forwarded_mm_hash_to_content(marker, "cd" * 32) != bound
+    other_url = "fedcba9876543210" + "0" * 48
+    assert mod.bind_forwarded_mm_hash_to_content(other_url, digest) != bound
+    with pytest.raises(ValueError):
+        mod.bind_forwarded_mm_hash_to_content(marker, "xyz")
+
+
+def test_forwarded_markers_without_fetched_digest_are_unchanged():
+    """data: URLs and frontend-decoded images already hash content upstream."""
+    processor = _processor()
+    image = Image.new("RGB", (2, 2))
+    prompt = processor.build_tokens_prompt(
+        {"token_ids": [1, 2], "extra_args": {"mm_hashes": ["0123456789abcdef"]}},
+        {"image": image},
+        None,
+    )
+    assert prompt["multi_modal_uuids"] == {"image": ["0123456789abcdef" + "0" * 48]}
+
+
+def test_forwarded_marker_count_mismatch_is_left_for_vllm():
+    from dynamo.common.multimodal.image_loader import IMAGE_CONTENT_DIGEST_INFO_KEY
+
+    processor = _processor()
+    images = [Image.new("RGB", (2, 2)) for _ in range(2)]
+    for image in images:
+        image.info[IMAGE_CONTENT_DIGEST_INFO_KEY] = "cd" * 32
+    prompt = processor.build_tokens_prompt(
+        {"token_ids": [1, 2], "extra_args": {"mm_hashes": ["0123456789abcdef"]}},
+        {"image": images},
+        None,
+    )
+    assert prompt["multi_modal_uuids"] == {"image": ["0123456789abcdef" + "0" * 48]}

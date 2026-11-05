@@ -55,7 +55,7 @@ class TestImageLoaderCache:
 
     def test_cache_put_and_get(self):
         """ImageLoader caches images by URL key."""
-        loader = ImageLoader()
+        loader = ImageLoader(cache_size=2)
         img = _make_pil_image()
         url = "http://example.com/test.jpg"
 

@@ -4760,6 +4760,13 @@ impl OpenAIPreprocessor {
     /// Azure SAS) should use `--frontend-decoding`: that path hashes the
     /// decoded RGB bytes instead, so cross-URL cache reuse is restored
     /// without depending on URL conventions.
+    ///
+    /// This hash does not identify the image's content. The vLLM worker
+    /// replaces it with a hash of (this hash, fetched bytes) before handing
+    /// the image to vLLM, so changed bytes behind an unchanged URL get a new
+    /// engine cache identity. The router therefore does not match the image
+    /// blocks of http(s) images (undercount only); data: URLs keep exact
+    /// matching because this hash already covers their payload.
     #[cfg(feature = "mm-routing")]
     fn hash_image_url(url: &str) -> u64 {
         xxhash_rust::xxh3::xxh3_64(url.as_bytes())

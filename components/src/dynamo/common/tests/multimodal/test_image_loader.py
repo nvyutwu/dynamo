@@ -40,6 +40,7 @@ from dynamo.common.multimodal.image_loader import (
     URL_VARIANT_KEY,
     ImageLoader,
     image_cache_scope_from_request,
+    image_content_digest,
 )
 from dynamo.common.multimodal.shared_image_cache import (
     SharedImageCache,
@@ -1394,3 +1395,68 @@ async def test_load_image_failure_keeps_signed_url_out(
     assert _SIGNATURE not in str(exc_info.value)
     assert _SIGNATURE not in caplog.text
     assert "bucket.s3.amazonaws.com/img.png" in str(exc_info.value)
+
+
+# --- Content identity for mutable URLs ---
+
+
+def _png_of(color: tuple[int, int, int]) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (2, 2), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def test_same_url_changed_bytes_reloads_and_changes_digest() -> None:
+    """With the default (URL cache off), changed bytes behind one URL are seen."""
+    loader = ImageLoader(cache_size=0, url_policy=_permissive_policy())
+    red, blue = _png_of((255, 0, 0)), _png_of((0, 0, 255))
+    responses = iter([red, blue, red])
+
+    async def _fetch(url, timeout, *, policy=None, max_bytes=None):
+        return next(responses)
+
+    url = "https://example.com/stale.png"
+    with patch(_FETCH_BYTES_PATH, AsyncMock(side_effect=_fetch)) as fetch:
+        first = await loader.load_image(url)
+        second = await loader.load_image(url)
+        third = await loader.load_image(url)
+
+    assert fetch.await_count == 3
+    assert first.getpixel((0, 0)) == (255, 0, 0)
+    assert second.getpixel((0, 0)) == (0, 0, 255)
+    assert image_content_digest(first) != image_content_digest(second)
+    # Identical bytes keep an identical identity, so repeated images still hit.
+    assert image_content_digest(third) == image_content_digest(first)
+    assert len(image_content_digest(first) or "") == 64
+
+
+async def test_url_image_cache_is_off_by_default() -> None:
+    import os
+
+    if os.environ.get("DYN_MM_IMAGE_CACHE_SIZE") is None:
+        assert ImageLoader.CACHE_SIZE_MAXIMUM == 0
+
+
+async def test_opt_in_url_cache_serves_digest_of_cached_bytes(
+    loader: ImageLoader,
+) -> None:
+    """A nonzero URL cache asserts immutable URLs; its digest stays consistent."""
+    with patch(_FETCH_BYTES_PATH, _mock_fetch_bytes()) as fetch:
+        first = await loader.load_image("https://example.com/img.png")
+        second = await loader.load_image("https://example.com/img.png")
+
+    assert fetch.await_count == 1
+    assert second is first
+    assert image_content_digest(second) == image_content_digest(first) is not None
+
+
+async def test_data_url_has_no_fetched_bytes_digest(loader: ImageLoader) -> None:
+    data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode()
+    image = await loader.load_image(data_url)
+    assert image_content_digest(image) is None
+
+
+async def test_image_content_digest_ignores_foreign_objects() -> None:
+    assert image_content_digest(None) is None
+    assert image_content_digest({"image": 1}) is None
+    assert image_content_digest(Image.new("RGB", (1, 1))) is None
