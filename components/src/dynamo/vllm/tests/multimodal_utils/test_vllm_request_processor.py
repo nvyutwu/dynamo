@@ -2425,16 +2425,13 @@ def _png_bytes(color: tuple[int, int, int]) -> bytes:
     return buf.getvalue()
 
 
-@pytest.mark.parametrize("unified_vision_chunk", [False, True])
-@pytest.mark.asyncio
-async def test_same_url_changed_bytes_gets_new_engine_identity(unified_vision_chunk):
-    """A URL whose bytes change must not reuse the old image's vLLM identity.
+async def _uuids_for_same_url_red_blue_red(
+    content_identity: bool, unified_vision_chunk: bool
+) -> list[str]:
+    """Send one URL three times while its bytes go red -> blue -> red.
 
     The frontend's URL-passthrough routing hash is xxh3(URL), so all three
-    requests forward the same hash. The worker must bind the vLLM UUID to the
-    bytes it fetched: red -> blue changes the UUID (no stale KV or MM-cache
-    hit) and blue -> red restores the first UUID (repeated images still hit).
-    UUIDs keep the marker form the KV event parser accepts.
+    requests forward the same hash. Returns the vLLM UUID of each request.
     """
     from dynamo.common.http.url_validator import UrlValidationPolicy
     from dynamo.common.multimodal.image_loader import ImageLoader
@@ -2442,6 +2439,7 @@ async def test_same_url_changed_bytes_gets_new_engine_identity(unified_vision_ch
     loader = ImageLoader(
         cache_size=0,
         url_policy=UrlValidationPolicy(allow_http=True, allow_private_ips=True),
+        content_identity=content_identity,
     )
     processor = mod.VllmMultimodalRequestProcessor(
         model="Qwen/Qwen3-VL-2B-Instruct",
@@ -2461,7 +2459,6 @@ async def test_same_url_changed_bytes_gets_new_engine_identity(unified_vision_ch
     async def _fetch(url, timeout, *, policy=None, max_bytes=None):
         return next(responses)
 
-    routing_hash = "0123456789abcdef"
     modality = "vision_chunk" if unified_vision_chunk else "image"
     uuids = []
     with patch(
@@ -2476,13 +2473,40 @@ async def test_same_url_changed_bytes_gets_new_engine_identity(unified_vision_ch
                     "multi_modal_data": {
                         "image_url": [{"Url": "https://example.com/stale.jpg"}]
                     },
-                    "extra_args": {"mm_hashes": [routing_hash]},
+                    "extra_args": {"mm_hashes": ["0123456789abcdef"]},
                 },
                 f"request-{step}",
                 None,
                 DisaggregationMode.AGGREGATED,
             )
             uuids.append(prepared.prompt["multi_modal_uuids"][modality][0])
+    return uuids
+
+
+@pytest.mark.parametrize("unified_vision_chunk", [False, True])
+@pytest.mark.asyncio
+async def test_same_url_keeps_url_identity_by_default(unified_vision_chunk):
+    """Default: the same URL is assumed to serve the same bytes.
+
+    The forwarded URL marker is kept, so the router's prediction matches the
+    engine's KV events exactly.
+    """
+    uuids = await _uuids_for_same_url_red_blue_red(False, unified_vision_chunk)
+    assert uuids == ["0123456789abcdef" + "0" * 48] * 3
+
+
+@pytest.mark.parametrize("unified_vision_chunk", [False, True])
+@pytest.mark.asyncio
+async def test_same_url_changed_bytes_gets_new_engine_identity(unified_vision_chunk):
+    """With DYN_MM_IMAGE_CONTENT_IDENTITY, changed bytes get a new identity.
+
+    The worker binds the vLLM UUID to the bytes it fetched: red -> blue changes
+    the UUID (no stale KV or MM-cache hit) and blue -> red restores the first
+    UUID (repeated images still hit). UUIDs keep the marker form the KV event
+    parser accepts.
+    """
+    routing_hash = "0123456789abcdef"
+    uuids = await _uuids_for_same_url_red_blue_red(True, unified_vision_chunk)
 
     red, blue, red_again = uuids
     assert red != blue

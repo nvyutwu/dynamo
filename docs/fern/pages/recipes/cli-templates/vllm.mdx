@@ -272,7 +272,8 @@ In single-GPU mode (`--single-gpu` or `SINGLE_GPU=true`), set `CUDA_VISIBLE_DEVI
 | `ETCD_ENDPOINTS` | `http://127.0.0.1:2379` | etcd endpoint used for Dynamo discovery state. |
 | `VLLM_SYSTEM_PORT_BASE` | `18081` | Starting system and metrics port for vLLM workers. |
 | `KV_EVENTS_PORT_BASE` | `29080` | Starting port for per-worker KV event publishers. |
-| `DYN_MM_IMAGE_CACHE_SIZE` | `0` | URL-keyed multimodal image-cache capacity, applied by every component that loads images; `0` disables caching. A cached URL is not re-fetched, so set it above `0` only when image URLs never change content. The optional shared Redis image cache is URL-keyed too and serves its bytes until its TTL expires. |
+| `DYN_MM_IMAGE_CACHE_SIZE` | `8` (`0` with `DYN_MM_IMAGE_CONTENT_IDENTITY=1`) | URL-keyed multimodal image-cache capacity, applied by every component that loads images; `0` disables caching. A cached URL is not re-fetched, so a nonzero size assumes image URLs never change content. The optional shared Redis image cache is URL-keyed too and serves its bytes until its TTL expires. |
+| `DYN_MM_IMAGE_CONTENT_IDENTITY` | `0` | Set to `1` when the same http(s) image URL can serve different bytes. Aggregated vLLM workers then bind each URL image's engine cache identity to the fetched bytes, so changed content never reuses stale KV or multimodal-cache entries. Cost: the KV router predicts from the URL, so requests with http(s) images lose exact router matching from the first image on (data: URLs are unaffected). |
 | `DYNAMO_MM_TRANSFER` | `shm` | Transport used to transfer preprocessed multimodal data. |
 | `VLLM_EXTRA_ARGS` | `Empty` | Additional arguments appended to each `dynamo.vllm` worker command. |
 | `FRONTEND_EXTRA_ARGS` | `Empty` | Additional arguments appended to each frontend command. |
@@ -1343,7 +1344,8 @@ The default model is `Qwen/Qwen3-VL-2B-Instruct`.
 | `ETCD_ENDPOINTS` | `http://127.0.0.1:2379` | etcd endpoint used for Dynamo discovery state. |
 | `VLLM_SYSTEM_PORT_BASE` | `18081` | Starting system and metrics port for vLLM workers. |
 | `KV_EVENTS_PORT_BASE` | `29080` | Starting port for per-worker KV event publishers. |
-| `DYN_MM_IMAGE_CACHE_SIZE` | `0` | URL-keyed multimodal image-cache capacity, applied by every component that loads images; `0` disables caching. A cached URL is not re-fetched, so set it above `0` only when image URLs never change content. The optional shared Redis image cache is URL-keyed too and serves its bytes until its TTL expires. |
+| `DYN_MM_IMAGE_CACHE_SIZE` | `8` (`0` with `DYN_MM_IMAGE_CONTENT_IDENTITY=1`) | URL-keyed multimodal image-cache capacity, applied by every component that loads images; `0` disables caching. A cached URL is not re-fetched, so a nonzero size assumes image URLs never change content. The optional shared Redis image cache is URL-keyed too and serves its bytes until its TTL expires. |
+| `DYN_MM_IMAGE_CONTENT_IDENTITY` | `0` | Set to `1` when the same http(s) image URL can serve different bytes. Aggregated vLLM workers then bind each URL image's engine cache identity to the fetched bytes, so changed content never reuses stale KV or multimodal-cache entries. Cost: the KV router predicts from the URL, so requests with http(s) images lose exact router matching from the first image on (data: URLs are unaffected). |
 | `DYNAMO_MM_TRANSFER` | `shm` | Transport used to transfer preprocessed multimodal data. |
 | `VLLM_EXTRA_ARGS` | `Empty` | Additional arguments appended to each `dynamo.vllm` worker command. |
 | `FRONTEND_EXTRA_ARGS` | `Empty` | Additional arguments appended to each frontend command. |

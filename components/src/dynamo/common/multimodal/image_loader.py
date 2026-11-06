@@ -41,10 +41,17 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 UUID_ONLY_VARIANT_KEY: Final = "UuidOnly"
 IMAGE_CACHE_SCOPE_KEY: Final = "image_cache_scope"
 IMAGE_CACHE_SESSION_SCOPED_ENV: Final = "DYN_MM_IMAGE_CACHE_SESSION_SCOPED"
+# Opt-in ("1"; default "0"): treat an http(s) image URL's bytes, not the URL
+# alone, as the image's identity. ImageLoader then tags each fetched image with
+# a digest of its bytes, the vLLM worker binds that digest into the image's
+# engine cache identity, and the URL-keyed LRU defaults to off. Leave it off
+# when image URLs are immutable: the KV router predicts from the URL, so
+# enabling it loses exact router matching for requests with http(s) images.
+IMAGE_CONTENT_IDENTITY_ENV: Final = "DYN_MM_IMAGE_CONTENT_IDENTITY"
 # PIL ``Image.info`` key holding the SHA-256 hex digest of the encoded bytes an
-# http(s) image was decoded from. The vLLM worker binds it into the image's
-# cache identity so changed bytes behind an unchanged URL never reuse stale KV
-# or multimodal-cache entries.
+# http(s) image was decoded from (set only with content identity enabled). The
+# vLLM worker binds it into the image's cache identity so changed bytes behind
+# an unchanged URL never reuse stale KV or multimodal-cache entries.
 IMAGE_CONTENT_DIGEST_INFO_KEY: Final = "dynamo_content_digest"
 
 
@@ -78,6 +85,24 @@ def image_cache_session_scoped_from_env() -> bool:
             f"{IMAGE_CACHE_SESSION_SCOPED_ENV} must be '0' or '1', got {value!r}"
         )
     return value == "1"
+
+
+def image_content_identity_from_env() -> bool:
+    """Return whether http(s) image identity is bound to the fetched bytes."""
+    value = os.environ.get(IMAGE_CONTENT_IDENTITY_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"{IMAGE_CONTENT_IDENTITY_ENV} must be '0' or '1', got {value!r}"
+        )
+    return value == "1"
+
+
+def _default_image_cache_size() -> int:
+    # The LRU is keyed by URL and a hit never re-fetches, so it is only correct
+    # for immutable URLs. With content identity enabled it defaults to off so
+    # every load sees the current bytes; an explicit size always wins.
+    default = "0" if image_content_identity_from_env() else "8"
+    return int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", default))
 
 
 def scope_image_cache_key(
@@ -153,12 +178,8 @@ async def read_decoded_media_via_nixl(*args: Any, **kwargs: Any) -> Any:
 
 
 class ImageLoader:
-    # The in-process LRU is keyed by URL, so a hit serves whatever bytes the URL
-    # held when it was first fetched. That is only correct for immutable URLs,
-    # so it is off by default: every http(s) load fetches the current bytes and
-    # the worker derives the image's cache identity from them. Set
-    # DYN_MM_IMAGE_CACHE_SIZE > 0 only when image URLs never change content.
-    CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "0"))
+    # DYN_MM_IMAGE_CACHE_SIZE; default 8, or 0 with DYN_MM_IMAGE_CONTENT_IDENTITY=1.
+    CACHE_SIZE_MAXIMUM = _default_image_cache_size()
 
     def __init__(
         self,
@@ -168,6 +189,7 @@ class ImageLoader:
         url_policy: UrlValidationPolicy | None = None,
         max_bytes: int | None = None,
         session_scoped_cache: bool | None = None,
+        content_identity: bool | None = None,
     ):
         """
         Initialize the ImageLoader with caching, HTTP settings, and optional NIXL config for
@@ -176,7 +198,8 @@ class ImageLoader:
         Args:
             cache_size: Maximum number of images to store in the in-memory,
                 URL-keyed LRU cache. Zero or less disables caching. Defaults to
-                CACHE_SIZE_MAXIMUM (DYN_MM_IMAGE_CACHE_SIZE, default 0). A
+                CACHE_SIZE_MAXIMUM (DYN_MM_IMAGE_CACHE_SIZE; default 8, or 0
+                with content identity enabled). A hit never re-fetches, so a
                 nonzero size asserts that image URLs are immutable.
             http_timeout: Timeout in seconds for HTTP requests when fetching remote images.
                 Defaults to 30.0 seconds.
@@ -190,6 +213,10 @@ class ImageLoader:
                 in-flight, and shared-cache keys. ``None`` (default) reads
                 DYN_MM_IMAGE_CACHE_SESSION_SCOPED (default off). When enabled,
                 HTTP loads without a scope bypass all image caches.
+            content_identity: Tag each fetched http(s) image with a SHA-256
+                digest of its bytes, which the vLLM worker binds into the
+                image's engine cache identity. ``None`` (default) reads
+                DYN_MM_IMAGE_CONTENT_IDENTITY (default off).
         """
         self._http_timeout = http_timeout
         self._cache_size = cache_size
@@ -197,6 +224,9 @@ class ImageLoader:
         if session_scoped_cache is None:
             session_scoped_cache = image_cache_session_scoped_from_env()
         self._session_scoped_cache = session_scoped_cache
+        if content_identity is None:
+            content_identity = image_content_identity_from_env()
+        self._content_identity = content_identity
         self._image_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self._inflight: dict[str, asyncio.Task[Image.Image]] = {}
         self._shared_image_cache = SharedImageCache.from_env()
@@ -216,6 +246,11 @@ class ImageLoader:
     def cache_entries(self) -> int:
         """Current number of cached images (read by metrics export)."""
         return len(self._image_cache)
+
+    @property
+    def content_identity(self) -> bool:
+        """Whether fetched http(s) images carry a content digest."""
+        return self._content_identity
 
     @property
     def session_scoped_cache(self) -> bool:
@@ -263,10 +298,14 @@ class ImageLoader:
     async def _open_fetched_image(self, content: bytes) -> Image.Image:
         """Open fetched http(s) bytes, tagging the image with their digest.
 
-        The digest is what the vLLM worker binds into the image's cache
-        identity, so it must describe exactly the bytes that were decoded.
+        With content identity enabled, the digest is what the vLLM worker binds
+        into the image's cache identity, so it must describe exactly the bytes
+        that were decoded. Disabled, the image carries no digest and the worker
+        keeps the URL-derived identity.
         """
         image = await self._open_image(BytesIO(content))
+        if not self._content_identity:
+            return image
         with _nvtx.annotate("mm:img:content_digest", color="lime"):
             digest = await asyncio.to_thread(_sha256_hex, content)
         image.info[IMAGE_CONTENT_DIGEST_INFO_KEY] = digest

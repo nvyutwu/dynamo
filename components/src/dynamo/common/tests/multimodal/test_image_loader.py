@@ -39,8 +39,10 @@ from dynamo.common.http.url_validator import UrlValidationError, UrlValidationPo
 from dynamo.common.multimodal.image_loader import (
     URL_VARIANT_KEY,
     ImageLoader,
+    _default_image_cache_size,
     image_cache_scope_from_request,
     image_content_digest,
+    image_content_identity_from_env,
 )
 from dynamo.common.multimodal.shared_image_cache import (
     SharedImageCache,
@@ -1407,8 +1409,10 @@ def _png_of(color: tuple[int, int, int]) -> bytes:
 
 
 async def test_same_url_changed_bytes_reloads_and_changes_digest() -> None:
-    """With the default (URL cache off), changed bytes behind one URL are seen."""
-    loader = ImageLoader(cache_size=0, url_policy=_permissive_policy())
+    """With content identity on (URL cache off), changed bytes are seen."""
+    loader = ImageLoader(
+        cache_size=0, url_policy=_permissive_policy(), content_identity=True
+    )
     red, blue = _png_of((255, 0, 0)), _png_of((0, 0, 255))
     responses = iter([red, blue, red])
 
@@ -1430,17 +1434,57 @@ async def test_same_url_changed_bytes_reloads_and_changes_digest() -> None:
     assert len(image_content_digest(first) or "") == 64
 
 
-async def test_url_image_cache_is_off_by_default() -> None:
-    import os
+async def test_content_identity_is_off_by_default() -> None:
+    """Default: the URL is the identity, so fetched images carry no digest."""
+    loader = ImageLoader(cache_size=0, url_policy=_permissive_policy())
+    if not image_content_identity_from_env():
+        assert loader.content_identity is False
+    loader = ImageLoader(
+        cache_size=0, url_policy=_permissive_policy(), content_identity=False
+    )
+    with patch(_FETCH_BYTES_PATH, _mock_fetch_bytes()):
+        image = await loader.load_image("https://example.com/img.png")
+    assert image_content_digest(image) is None
 
-    if os.environ.get("DYN_MM_IMAGE_CACHE_SIZE") is None:
-        assert ImageLoader.CACHE_SIZE_MAXIMUM == 0
 
-
-async def test_opt_in_url_cache_serves_digest_of_cached_bytes(
-    loader: ImageLoader,
+@pytest.mark.parametrize(
+    ("identity_env", "size_env", "expected"),
+    [
+        (None, None, 8),
+        ("0", None, 8),
+        ("1", None, 0),
+        ("1", "16", 16),
+        (None, "0", 0),
+    ],
+)
+async def test_default_url_cache_size_follows_content_identity(
+    monkeypatch, identity_env, size_env, expected
 ) -> None:
+    for name, value in (
+        ("DYN_MM_IMAGE_CONTENT_IDENTITY", identity_env),
+        ("DYN_MM_IMAGE_CACHE_SIZE", size_env),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert _default_image_cache_size() == expected
+
+
+async def test_content_identity_env_must_be_zero_or_one(monkeypatch) -> None:
+    monkeypatch.setenv("DYN_MM_IMAGE_CONTENT_IDENTITY", "1")
+    assert image_content_identity_from_env() is True
+    assert ImageLoader(cache_size=0).content_identity is True
+    monkeypatch.setenv("DYN_MM_IMAGE_CONTENT_IDENTITY", "true")
+    with pytest.raises(ValueError, match="DYN_MM_IMAGE_CONTENT_IDENTITY"):
+        image_content_identity_from_env()
+
+
+async def test_opt_in_url_cache_serves_digest_of_cached_bytes() -> None:
     """A nonzero URL cache asserts immutable URLs; its digest stays consistent."""
+    loader = ImageLoader(
+        cache_size=4, url_policy=_permissive_policy(), content_identity=True
+    )
     with patch(_FETCH_BYTES_PATH, _mock_fetch_bytes()) as fetch:
         first = await loader.load_image("https://example.com/img.png")
         second = await loader.load_image("https://example.com/img.png")

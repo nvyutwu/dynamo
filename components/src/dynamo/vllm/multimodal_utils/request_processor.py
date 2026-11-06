@@ -89,6 +89,10 @@ def bind_forwarded_mm_hash_to_content(
 ) -> str | None:
     """Replace a URL-derived routing marker with one derived from content.
 
+    Applies only with DYN_MM_IMAGE_CONTENT_IDENTITY=1: otherwise ImageLoader
+    attaches no digest and the URL-derived marker is kept (exact routing; the
+    same URL is assumed to always serve the same bytes).
+
     URL-passthrough routing hashes are xxh3 of the URL string, so the same URL
     serving new bytes would otherwise reuse the old image's KV blocks and vLLM
     multimodal-cache entries. The replacement routing hash is derived from the
@@ -136,7 +140,8 @@ def _bind_forwarded_mm_uuids_to_content(
 ) -> dict[str, list[str | None]]:
     """Bind forwarded image markers to the bytes this worker actually loaded.
 
-    Only http(s) images carry a fetched-bytes digest. data: URLs (whose
+    Only http(s) images loaded with content identity enabled carry a
+    fetched-bytes digest. data: URLs (whose
     frontend hash covers the whole payload) and frontend-decoded images (hashed
     over pixels) keep their forwarded marker.
     """
