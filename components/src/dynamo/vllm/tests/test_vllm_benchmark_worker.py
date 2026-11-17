@@ -21,6 +21,16 @@ pytestmark = [
 ]
 
 
+def _align_mamba_spec():
+    # vLLM #61452 moved mamba_cache_mode from MambaSpec to MambaManager.Params.
+    kwargs = (
+        {"mamba_cache_mode": "align"}
+        if "mamba_cache_mode" in MambaSpec.__dataclass_fields__
+        else {}
+    )
+    return MambaSpec(block_size=16, shapes=(), dtypes=(), **kwargs)
+
+
 def test_random_state_is_finite_reproducible_and_preserves_rng_and_other_blocks():
     states = (
         torch.full((4, 3, 8), 7, dtype=torch.bfloat16),
@@ -85,7 +95,7 @@ def test_worker_initializes_only_private_kda_after_zeroing_and_disables_before_s
             static_forward_context={"kda": SimpleNamespace(kv_cache=states)}
         )
     )
-    spec = MambaSpec(block_size=16, shapes=(), dtypes=(), mamba_cache_mode="align")
+    spec = _align_mamba_spec()
     cache_config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(kv_cache_spec=object(), layer_names=["mla"]),
@@ -149,7 +159,7 @@ def test_worker_binds_only_recurrent_layers_from_runtime_cache_groups(
     worker.model_runner = SimpleNamespace(
         _zero_block_ids=(lambda _ids: None) if has_zeroing_api else None
     )
-    spec = MambaSpec(block_size=16, shapes=(), dtypes=(), mamba_cache_mode="align")
+    spec = _align_mamba_spec()
     cache_config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(kv_cache_spec=object(), layer_names=["mla"]),
@@ -165,3 +175,40 @@ def test_worker_binds_only_recurrent_layers_from_runtime_cache_groups(
     worker.initialize_from_config(cache_config)
     assert worker._benchmark_kda_layers == [(1, "kda", state)]
     assert worker._benchmark_kda_active
+
+
+def test_worker_binds_recurrent_layers_from_manager_policy_groups(monkeypatch):
+    """vLLM #61452 groups carry kv_cache_specs + manager_config, no kv_cache_spec."""
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+
+    worker = BenchmarkWorker.__new__(BenchmarkWorker)
+    state = (torch.zeros(4, 2, 4),)
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "kda": SimpleNamespace(kv_cache=state),
+                "mla": object(),
+            }
+        )
+    )
+    worker.model_runner = SimpleNamespace(_zero_block_ids=lambda _ids: None)
+    cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_specs={"mla": object()},
+                manager_config=SimpleNamespace(manager_cls=FullAttentionManager),
+                layer_names=["mla"],
+            ),
+            SimpleNamespace(
+                kv_cache_specs={"kda": _align_mamba_spec()},
+                manager_config=SimpleNamespace(manager_cls=MambaManager),
+                layer_names=["kda"],
+            ),
+        ]
+    )
+    monkeypatch.setattr(Worker, "initialize_from_config", lambda *_args: None)
+    worker.initialize_from_config(cache_config)
+    assert worker._benchmark_kda_layers == [(1, "kda", state)]

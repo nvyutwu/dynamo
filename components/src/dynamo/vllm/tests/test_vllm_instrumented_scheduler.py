@@ -35,13 +35,71 @@ from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core import kv_cache_manager
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    SlidingWindowSpec,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus  # noqa: E402
+
+try:  # vLLM before #61452: the spec class names the allocation policy.
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+except ImportError:  # vLLM with #61452: KVCacheGroup + ManagerConfig.
+    FullAttentionSpec = KVCacheGroupSpec = SlidingWindowSpec = None
+
+LEGACY_KV_CACHE_SPECS = FullAttentionSpec is not None
+requires_legacy_kv_cache_specs = pytest.mark.skipif(
+    not LEGACY_KV_CACHE_SPECS,
+    reason="vLLM #61452 removed FullAttentionSpec/SlidingWindowSpec",
+)
+
+
+def _attention_group(
+    layer_names, *, block_size=16, num_kv_heads=1, head_size=8, sliding_window=None
+):
+    """A real vLLM KV-cache group of full or sliding-window attention layers,
+    in whichever API shape the installed vLLM has."""
+    if LEGACY_KV_CACHE_SPECS:
+        kwargs = dict(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+        )
+        spec = (
+            FullAttentionSpec(**kwargs)
+            if sliding_window is None
+            else SlidingWindowSpec(**kwargs, sliding_window=sliding_window)
+        )
+        return KVCacheGroupSpec(layer_names=list(layer_names), kv_cache_spec=spec)
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.bfloat16,
+    )
+    layer = (
+        FullAttentionManager.layer_config(spec)
+        if sliding_window is None
+        else SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
+    )
+    return KVCacheGroup.from_layers({name: layer for name in layer_names})
+
+
+def _renamed_group(group, layer_name):
+    """``group`` holding one layer called ``layer_name`` (either API shape)."""
+    if LEGACY_KV_CACHE_SPECS:
+        return KVCacheGroupSpec(
+            layer_names=[layer_name], kv_cache_spec=group.kv_cache_spec
+        )
+    (spec,) = set(group.kv_cache_specs.values())
+    return dataclasses.replace(group, kv_cache_specs={layer_name: spec})
 
 
 @pytest.fixture(autouse=True)
@@ -5351,28 +5409,15 @@ def _kvwarm_gate_stub(*, state_groups=(), experts=8, ep=True, prefix=True):
 
 def _kvwarm_native_gate_stub(*, experts=8, ep=False, prefix=False):
     stub = _kvwarm_gate_stub(experts=experts, ep=ep, prefix=prefix)
-    specs = [
-        FullAttentionSpec(
-            block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
-        ),
-        SlidingWindowSpec(
-            block_size=16,
-            num_kv_heads=1,
-            head_size=8,
-            dtype=torch.bfloat16,
-            sliding_window=512,
-        ),
-        SlidingWindowSpec(
-            block_size=4,
-            num_kv_heads=1,
-            head_size=8,
-            dtype=torch.bfloat16,
-            sliding_window=4,
-        ),
+    groups = [
+        _attention_group(["full"]),
+        _attention_group(["swa512"], sliding_window=512),
+        _attention_group(["swa4"], block_size=4, sliding_window=4),
     ]
-    stub.kv_cache_manager.kv_cache_config.kv_cache_groups = [
-        SimpleNamespace(kv_cache_spec=spec) for spec in specs
-    ]
+    if LEGACY_KV_CACHE_SPECS:
+        # Pre-#61452 groups exactly as the gate always saw them.
+        groups = [SimpleNamespace(kv_cache_spec=g.kv_cache_spec) for g in groups]
+    stub.kv_cache_manager.kv_cache_config.kv_cache_groups = groups
     return stub
 
 
@@ -5434,12 +5479,11 @@ def test_kvwarm_native_admits_recurrent_state_layouts(experts):
 def test_kvwarm_native_admits_full_attention_plus_state_without_windows():
     # GLM-5.3-Flash / Qwen3-Next shape: full (or MLA) attention + KDA/Mamba state.
     stub = _kvwarm_gate_stub(experts=8, ep=False, prefix=False)
+    full = _attention_group(["full"])
+    if LEGACY_KV_CACHE_SPECS:
+        full = SimpleNamespace(kv_cache_spec=full.kv_cache_spec)
     stub.kv_cache_manager.kv_cache_config.kv_cache_groups = [
-        SimpleNamespace(
-            kv_cache_spec=FullAttentionSpec(
-                block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
-            )
-        ),
+        full,
         SimpleNamespace(kv_cache_spec=type("MambaSpec", (), {})()),
     ]
 
@@ -5589,9 +5633,7 @@ def test_kvwarm_native_grid_numbering_preserves_each_execution(
             num_blocks=num_blocks,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    layer_names=[str(index)], kv_cache_spec=group.kv_cache_spec
-                )
+                _renamed_group(group, str(index))
                 for index, group in enumerate(
                     gate.kv_cache_manager.kv_cache_config.kv_cache_groups
                 )
@@ -6340,24 +6382,12 @@ def test_kvwarm_native_capacity_fallback_saves_available_steady_samples(monkeypa
         point_type="decode", benchmark_id=1, batch_size=1, total_kv_read_tokens=14
     )
     stub = _benchmark_save_stub(point, [])
-    specs = [
-        FullAttentionSpec(
-            block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
-        ),
-        SlidingWindowSpec(
-            block_size=16,
-            num_kv_heads=1,
-            head_size=8,
-            dtype=torch.bfloat16,
-            sliding_window=512,
-        ),
-    ]
     config = KVCacheConfig(
         num_blocks=3,  # The null block leaves two usable blocks.
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=[str(index)], kv_cache_spec=spec)
-            for index, spec in enumerate(specs)
+            _attention_group(["0"]),
+            _attention_group(["1"], sliding_window=512),
         ],
     )
     stub.kv_cache_manager = kv_cache_manager.KVCacheManager(
@@ -8797,6 +8827,7 @@ def test_bench_capture_engine_fans_out_uniform_type_kv_cache_specs_wrapper():
     "window,chunk,non_causal",
     [(None, None, False), (512, None, False), (None, 128, False), (None, None, True)],
 )
+@requires_legacy_kv_cache_specs
 def test_bench_capture_engine_records_full_attention_retention(
     window, chunk, non_causal
 ):
@@ -8827,6 +8858,7 @@ def test_bench_capture_engine_records_full_attention_retention(
     json.dumps(engine)
 
 
+@requires_legacy_kv_cache_specs
 def test_bench_capture_engine_preserves_absent_and_wrapped_retention():
     vllm_config, kv_cache_config = _provenance_vllm_config()
     full = FullAttentionSpec(
@@ -9276,15 +9308,7 @@ def realseed_prefix_cache(monkeypatch):
                 num_blocks=2048,
                 kv_cache_tensors=[],
                 kv_cache_groups=[
-                    KVCacheGroupSpec(
-                        ["layer"],
-                        FullAttentionSpec(
-                            block_size=block_size,
-                            num_kv_heads=1,
-                            head_size=1,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
+                    _attention_group(["layer"], block_size=block_size, head_size=1)
                 ],
             ),
             max_model_len=4096,

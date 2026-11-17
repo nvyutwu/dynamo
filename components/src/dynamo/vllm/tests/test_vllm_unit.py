@@ -447,6 +447,8 @@ def test_headless_namespace_has_required_fields(mock_vllm_cli):
     # Required by run_headless()
     assert hasattr(ns, "api_server_count")
     assert ns.api_server_count == 0
+    # Newer vLLM's run_headless() reads this serve-CLI-only flag.
+    assert ns.headless_client_handshake_address is None
     # Core engine fields must survive the round-trip
     assert hasattr(ns, "model")
     assert hasattr(ns, "tensor_parallel_size")

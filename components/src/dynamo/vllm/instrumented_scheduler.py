@@ -114,7 +114,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
 from vllm.v1.engine.core import EngineCore
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import Request, RequestStatus
 
 from dynamo.common.forward_pass_metrics import (
@@ -125,6 +125,7 @@ from dynamo.common.forward_pass_metrics import (
     encode,
 )
 from dynamo.runtime.logging import configure_dynamo_logging
+from dynamo.vllm import kv_cache_compat
 from dynamo.vllm.benchmark_points import (
     BENCHMARK_MODES,
     RANDOM_KDA_BOUND,
@@ -275,6 +276,16 @@ def _bench_engine_attention(attention_config: Any, hf_config: Any) -> dict[str, 
     return block
 
 
+# Fields vLLM removed from scheduler outputs (absent on newer vLLM): the
+# per-group common-prefix block counts and the V1 runner's resume fields.
+_SCHEDULER_OUTPUT_HAS_COMMON_PREFIX_BLOCKS = "num_common_prefix_blocks" in {
+    f.name for f in fields(SchedulerOutput)
+}
+_CACHED_REQUEST_DATA_HAS_RESUME_FIELDS = {"resumed_req_ids", "all_token_ids"} <= {
+    f.name for f in fields(CachedRequestData)
+}
+
+
 def _bench_engine_kv_cache_spec(spec: Any) -> dict[str, Any]:
     """One kv_cache_spec's identity, geometry and observed attention retention."""
     entry: dict[str, Any] = {
@@ -307,10 +318,18 @@ def _bench_engine_kv_cache(cache_config: Any, kv_cache_config: Any) -> dict[str,
     """
     groups: list[dict[str, Any]] = []
     for group in getattr(kv_cache_config, "kv_cache_groups", None) or []:
-        spec = getattr(group, "kv_cache_spec", None)
+        spec = kv_cache_compat.group_spec(group)
         if spec is None:
             continue
         entry = _bench_engine_kv_cache_spec(spec)
+        # vLLM with #61452: the group (not the spec) holds the allocation policy
+        # and may hold several distinct layer specs. Empty on older vLLM.
+        policy = kv_cache_compat.group_policy_fields(group)
+        if policy:
+            entry["policy"] = _json_safe(policy)
+            distinct = kv_cache_compat.group_distinct_specs(group)
+            if len(distinct) > 1:
+                entry["specs"] = [_bench_engine_kv_cache_spec(s) for s in distinct]
         # vLLM's UniformTypeKVCacheSpecs wraps several same-kind specs that
         # differ in per-layer attributes; its own dtype/head_size/
         # num_kv_heads are always None, so fan out the wrapped specs too.
@@ -2346,9 +2365,7 @@ class InstrumentedScheduler(AsyncScheduler):
                     total_num_scheduled_tokens=0,
                     scheduled_spec_decode_tokens={},
                     scheduled_encoder_inputs={},
-                    num_common_prefix_blocks=(
-                        [0] * self.kv_cache_manager.num_kv_cache_groups
-                    ),
+                    **self._legacy_common_prefix_blocks_kwarg(),
                     finished_req_ids=self.finished_req_ids,
                     free_encoder_mm_hashes=[],
                 )
@@ -2701,6 +2718,14 @@ class InstrumentedScheduler(AsyncScheduler):
     _bench_active_warmup: _BenchmarkWarmupEvidence | None = None
     _bench_eager_warmup: _BenchmarkWarmupEvidence | None = None
 
+    def _legacy_common_prefix_blocks_kwarg(self) -> dict[str, list[int]]:
+        """``num_common_prefix_blocks`` for vLLM versions whose SchedulerOutput has it."""
+        if not _SCHEDULER_OUTPUT_HAS_COMMON_PREFIX_BLOCKS:
+            return {}
+        return {
+            "num_common_prefix_blocks": [0] * self.kv_cache_manager.num_kv_cache_groups
+        }
+
     def _bench_init(self, vllm_config: "VllmConfig") -> None:
         """Parse benchmark config and initialise state machine."""
         bench_cfg = vllm_config.additional_config.get("benchmark")
@@ -3041,10 +3066,8 @@ class InstrumentedScheduler(AsyncScheduler):
                     "block_size": getattr(manager, "block_size", None),
                     "admission_cap": self._kvwarm_admission_cap(manager),
                     "mamba_cache_mode": getattr(manager, "mamba_cache_mode", None),
-                    "num_prefill_checkpoint_blocks": getattr(
-                        getattr(manager, "kv_cache_spec", None),
-                        "num_prefill_checkpoint_blocks",
-                        0,
+                    "num_prefill_checkpoint_blocks": (
+                        kv_cache_compat.manager_num_prefill_checkpoint_blocks(manager)
                     ),
                     "num_speculative_blocks": getattr(
                         manager, "num_speculative_blocks", 0
@@ -3846,10 +3869,8 @@ class InstrumentedScheduler(AsyncScheduler):
                 # Bound the full state transition, not just the steady state:
                 # old/new states can coexist, and FlashKDA reserves an extra
                 # prefill checkpoint even without speculative decoding.
-                checkpoint_blocks = getattr(
-                    getattr(manager, "kv_cache_spec", None),
-                    "num_prefill_checkpoint_blocks",
-                    0,
+                checkpoint_blocks = (
+                    kv_cache_compat.manager_num_prefill_checkpoint_blocks(manager)
                 )
                 blocks = 2 + speculative_blocks + checkpoint_blocks
                 if resident_chain and num_tokens < block_size:
@@ -4698,7 +4719,7 @@ class InstrumentedScheduler(AsyncScheduler):
             total_num_scheduled_tokens=len(new_reqs_data),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=([0] * self.kv_cache_manager.num_kv_cache_groups),
+            **self._legacy_common_prefix_blocks_kwarg(),
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=[],
             new_block_ids_to_zero=new_block_ids_to_zero,
@@ -5603,7 +5624,7 @@ class InstrumentedScheduler(AsyncScheduler):
         groups = getattr(config, "kv_cache_groups", None) or []
         names = []
         for group in groups:
-            spec_name = type(getattr(group, "kv_cache_spec", None)).__name__
+            spec_name = type(kv_cache_compat.group_spec(group)).__name__
             if "Mamba" in spec_name:
                 names.append(spec_name)
         return names
@@ -5622,25 +5643,16 @@ class InstrumentedScheduler(AsyncScheduler):
         Native allocation and forward execution build both exactly. Necessary,
         not sufficient: the gate also requires experts or state layers.
         """
-        specs = [
-            group.kv_cache_spec
+        kinds = [
+            kv_cache_compat.group_layout_kind(group)
             for group in self.kv_cache_manager.kv_cache_config.kv_cache_groups
         ]
-
-        def finite_window(spec) -> bool:
-            return isinstance(spec, SlidingWindowSpec) and spec.sliding_window > 0
-
+        exact = (kv_cache_compat.LAYOUT_WINDOW, kv_cache_compat.LAYOUT_STATE)
         return (
             not self._bench_random_kda
-            and any(
-                finite_window(spec) or self._kvwarm_is_state_spec(spec)
-                for spec in specs
-            )
+            and any(kind in exact for kind in kinds)
             and all(
-                isinstance(spec, FullAttentionSpec)
-                or finite_window(spec)
-                or self._kvwarm_is_state_spec(spec)
-                for spec in specs
+                kind == kv_cache_compat.LAYOUT_FULL or kind in exact for kind in kinds
             )
         )
 
@@ -6279,8 +6291,7 @@ class InstrumentedScheduler(AsyncScheduler):
         """
         if self._kvwarm_admission_cap(manager) is None:
             return False
-        spec = getattr(manager, "kv_cache_spec", None)
-        return getattr(spec, "participates_in_prefix_caching", True) is False
+        return kv_cache_compat.manager_is_circular_table(manager)
 
     def _kvwarm_live_state_manager(self, manager) -> bool:
         """Recurrent-state groups served by live-state borrowing (hybrid live-state mode,
@@ -6291,16 +6302,15 @@ class InstrumentedScheduler(AsyncScheduler):
         # manager class names, so a vLLM rename or subclass cannot silently route a
         # recurrent group to the positional path. The k-pool tail is not a recurrent
         # state table; it is served by the circular-table predicate.
-        spec = getattr(manager, "kv_cache_spec", None)
         return (
             self._bench_hybrid_live_state
             and not self._bench_random_kda
-            and (isinstance(spec, MambaSpec) or "Mamba" in type(spec).__name__)
+            and kv_cache_compat.manager_is_state(manager)
         )
 
     def _kvwarm_random_state_manager(self, manager) -> bool:
-        return self._bench_random_kda and isinstance(
-            getattr(manager, "kv_cache_spec", None), MambaSpec
+        return self._bench_random_kda and kv_cache_compat.manager_is_state(
+            manager, strict=True
         )
 
     def _kvwarm_shadow_tail_blocks_for(self, ctx_len: int, headroom: int) -> int:
@@ -7095,7 +7105,7 @@ class InstrumentedScheduler(AsyncScheduler):
             total_num_scheduled_tokens=len(new_reqs_data),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=([0] * self.kv_cache_manager.num_kv_cache_groups),
+            **self._legacy_common_prefix_blocks_kwarg(),
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=[],
             new_block_ids_to_zero=zero_ids or None,
@@ -7189,17 +7199,30 @@ class InstrumentedScheduler(AsyncScheduler):
         # full native tables and sampled token history. V2 retains the table
         # until finish and only accepts appended block deltas.
         resumed = (
-            native_resumes if native_resumes and not self.use_v2_model_runner else set()
+            native_resumes
+            if native_resumes
+            # vLLM after the V1 model runner's removal has no such attribute:
+            # only the V2 runner exists there.
+            and not getattr(self, "use_v2_model_runner", True)
+            else set()
+        )
+        # vLLM without the V1 runner dropped the resume fields together with it.
+        resume_fields = (
+            {
+                "resumed_req_ids": resumed,
+                "all_token_ids": {
+                    request.request_id: request.all_token_ids.copy()
+                    for request in reqs
+                    if request.request_id in native_resumes
+                },
+            }
+            if _CACHED_REQUEST_DATA_HAS_RESUME_FIELDS
+            else {}
         )
         cached = CachedRequestData(
             req_ids=[request.request_id for request in reqs],
-            resumed_req_ids=resumed,
             new_token_ids=[],
-            all_token_ids={
-                request.request_id: request.all_token_ids.copy()
-                for request in reqs
-                if request.request_id in native_resumes
-            },
+            **resume_fields,
             new_block_ids=[
                 (
                     self.kv_cache_manager.get_block_ids(request.request_id)
@@ -7223,7 +7246,7 @@ class InstrumentedScheduler(AsyncScheduler):
             total_num_scheduled_tokens=len(reqs),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=([0] * self.kv_cache_manager.num_kv_cache_groups),
+            **self._legacy_common_prefix_blocks_kwarg(),
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=[],
             new_block_ids_to_zero=(

@@ -37,6 +37,10 @@ def build_headless_namespace(config: Config) -> argparse.Namespace:
     # run_headless() reads api_server_count; default to 0 (no API server)
     if not hasattr(ns, "api_server_count"):
         ns.api_server_count = 0
+    # Newer vLLM's run_headless() also reads this serve-CLI-only flag (the
+    # handshake address of a colocated frontend); Dynamo has none.
+    if not hasattr(ns, "headless_client_handshake_address"):
+        ns.headless_client_handshake_address = None
     return ns
 
 

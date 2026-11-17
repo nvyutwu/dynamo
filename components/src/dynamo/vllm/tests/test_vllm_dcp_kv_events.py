@@ -63,12 +63,34 @@ async def test_dcp_events_match_configured_block_size(monkeypatch, runtime):
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.engine.core import EngineCore
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        KVCacheConfig,
-        KVCacheGroupSpec,
-    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+
+    try:  # vLLM before #61452
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+        group = KVCacheGroupSpec(
+            layer_names=["full"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+            ),
+        )
+    except ImportError:  # vLLM with #61452: policy in ManagerConfig
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
+        group = KVCacheGroup.from_layers(
+            {
+                "full": FullAttentionManager.layer_config(
+                    AttentionSpec(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=64,
+                        dtype=torch.float16,
+                    )
+                )
+            }
+        )
 
     monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1")
     monkeypatch.setattr(
@@ -81,14 +103,7 @@ async def test_dcp_events_match_configured_block_size(monkeypatch, runtime):
     cache_config = KVCacheConfig(
         num_blocks=16,
         kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=["full"],
-                kv_cache_spec=FullAttentionSpec(
-                    block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
-                ),
-            )
-        ],
+        kv_cache_groups=[group],
     )
     manager = KVCacheManager(
         cache_config,
