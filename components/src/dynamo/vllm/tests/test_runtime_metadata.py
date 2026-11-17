@@ -203,3 +203,19 @@ def test_spec_decode_runtime_data_ignores_invalid_nextn(speculative_config):
     vllm_config = SimpleNamespace(speculative_config=None)
 
     assert get_spec_decode_runtime_data(config, vllm_config) is None
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("0.32.1rc1.dev602+g5d35ce393.d20261027", False),  # tagged: release gate
+        ("0.1.dev0+ge149d88ba.rainhollow", True),  # untagged source build
+        ("dev", True),  # vLLM's own fallback
+        ("0.31.2", False),
+        ("0.1.2", False),
+    ],
+)
+def test_untagged_vllm_builds_pass_release_gates(version, expected):
+    from dynamo.vllm.vllm_version import is_untagged_source_build
+
+    assert is_untagged_source_build(version) is expected

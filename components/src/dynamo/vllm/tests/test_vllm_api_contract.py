@@ -32,7 +32,8 @@ import pytest
 # Module-level vLLM import so the real site-packages ``vllm`` loads (matches the
 # pattern in test_vllm_instrumented_scheduler.py / test_vllm_unit.py).
 import vllm  # noqa: F401,E402
-from packaging.version import Version
+
+from dynamo.vllm.vllm_version import vllm_release_at_least
 
 pytestmark = [
     pytest.mark.unit,
@@ -101,10 +102,14 @@ def test_scheduler_output_new_connector_fields_remain_optional():
     fields = {field.name: field for field in dataclasses.fields(SchedulerOutput)}
     connector_field = (
         "kv_connector_block_state"
-        if Version(vllm.__version__).release >= (0, 29)
+        if vllm_release_at_least(0, 29)
         else "partial_tail_offloads"
     )
-    for field_name in ("ec_manager_metadata", connector_field):
+    # vLLM without the V1 model runner removed ec_manager_metadata; Dynamo never
+    # passes it (re-audited), so it only has to stay optional where it exists.
+    required = (connector_field,)
+    optional = ("ec_manager_metadata",)
+    for field_name in required + tuple(f for f in optional if f in fields):
         assert field_name in fields, (
             f"vLLM SchedulerOutput.{field_name} is gone — re-audit Dynamo's "
             "direct SchedulerOutput construction."

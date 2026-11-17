@@ -17,9 +17,9 @@ def has_vllm_output_clamping() -> bool:
 
     Remove when the CPU and XPU images reach vLLM 0.32.
     """
-    from vllm.version import __version_tuple__
+    from .vllm_version import vllm_release_at_least
 
-    return __version_tuple__[:2] >= (0, 32)
+    return vllm_release_at_least(0, 32)
 
 
 def publish_vllm_token_budget(runtime_config: Any, max_model_len: int | None) -> None:
