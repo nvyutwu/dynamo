@@ -21,6 +21,7 @@ onto the manager policy otherwise. Only metadata is read; nothing is mutated.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -40,6 +41,7 @@ LAYOUT_STATE = "state"
 LAYOUT_OTHER = "other"
 
 
+@lru_cache(maxsize=None)
 def _manager_classes() -> dict[str, Any]:
     """vLLM manager classes by name (missing ones are absent)."""
     from vllm.v1.core import single_type_kv_cache_manager as stm
@@ -144,11 +146,6 @@ def group_layout_kind(group: Any) -> str:
     return LAYOUT_OTHER
 
 
-def manager_spec(manager: Any) -> Any:
-    """``manager.kv_cache_spec`` where it exists (pre-#61452), else ``None``."""
-    return getattr(manager, "kv_cache_spec", None)
-
-
 def manager_is_state(manager: Any, *, strict: bool = False) -> bool:
     """Whether a single-type manager serves recurrent state.
 
@@ -178,8 +175,10 @@ def manager_num_prefill_checkpoint_blocks(manager: Any) -> int:
 def manager_is_circular_table(manager: Any) -> bool:
     """A fixed-length ring table excluded from prefix caching.
 
-    Legacy: the spec's ``participates_in_prefix_caching`` is ``False``, as
-    before. #61452: ``CircularBufferManager`` (the ring-buffer policy).
+    Legacy: the spec's ``participates_in_prefix_caching`` is ``False``, the
+    predicate InstrumentedScheduler always used (kept verbatim; vLLM 40b2b65c
+    specs have no such attribute, so it is False there). #61452:
+    ``CircularBufferManager`` (the ring-buffer policy).
     """
     if hasattr(manager, "kv_cache_spec"):
         spec = manager.kv_cache_spec

@@ -137,6 +137,18 @@ from dynamo.vllm.instrumented_scheduler import (  # noqa: E402
     _BenchPhase,
 )
 
+# vLLM #61452 moved mamba_cache_mode from MambaSpec to MambaManager.Params.
+_ALIGN_MAMBA_SPEC_KWARGS = (
+    {"mamba_cache_mode": "align"}
+    if "mamba_cache_mode"
+    in instrumented_scheduler_module.MambaSpec.__dataclass_fields__
+    else {}
+)
+# vLLM without the V1 model runner dropped CachedRequestData's resume fields.
+_CACHED_REQUEST_DATA_HAS_RESUME_FIELDS = (
+    instrumented_scheduler_module._CACHED_REQUEST_DATA_HAS_RESUME_FIELDS
+)
+
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.vllm,
@@ -4741,7 +4753,8 @@ def test_make_steady_step_builds_production_shaped_output():
     assert output.scheduled_new_reqs == []
     cached = output.scheduled_cached_reqs
     assert cached.req_ids == ["__bench_0", "__bench_1"]
-    assert cached.resumed_req_ids == set()
+    # vLLM without the V1 runner dropped resumed_req_ids from CachedRequestData.
+    assert getattr(cached, "resumed_req_ids", set()) == set()
     assert cached.new_token_ids == []
     assert cached.num_computed_tokens == [63, 64]
     assert cached.num_output_tokens == [1, 1]
@@ -5854,6 +5867,8 @@ def _kvwarm_native_resume_stub(use_v2):
 def test_kvwarm_native_resume_continues_private_requests_and_preserves_runner_state(
     use_v2, with_state
 ):
+    if not use_v2 and not _CACHED_REQUEST_DATA_HAS_RESUME_FIELDS:
+        pytest.skip("vLLM without the V1 model runner has no V1 resume path")
     stub, requests = _kvwarm_native_resume_stub(use_v2)
     tables = {"chain-a": ([1, 11], [2, 21]), "chain-b": ([3, 12], [4, 22])}
     delta = ([11], [21])
@@ -5878,14 +5893,22 @@ def test_kvwarm_native_resume_continues_private_requests_and_preserves_runner_st
     assert stub._kvwarm_borrowed_ids == set()
     cached = output.scheduled_cached_reqs
     assert cached.num_computed_tokens == [3, 4]
-    assert cached.all_token_ids == {
-        request.request_id: request.all_token_ids for request in requests
-    }
-    if use_v2:
+    if not _CACHED_REQUEST_DATA_HAS_RESUME_FIELDS:
+        # vLLM without the V1 runner: no resume fields, V2 delta semantics.
+        assert not hasattr(cached, "all_token_ids")
+        assert not hasattr(cached, "resumed_req_ids")
+        assert cached.new_block_ids == [delta, delta]
+    elif use_v2:
+        assert cached.all_token_ids == {
+            request.request_id: request.all_token_ids for request in requests
+        }
         # V2 keeps the parked tables and accepts only the appended delta.
         assert cached.resumed_req_ids == set()
         assert cached.new_block_ids == [delta, delta]
     else:
+        assert cached.all_token_ids == {
+            request.request_id: request.all_token_ids for request in requests
+        }
         # V1 re-adds the parked requests: every group's full table, unchanged.
         assert cached.resumed_req_ids == {"chain-a", "chain-b"}
         assert cached.new_block_ids == [tables["chain-a"], tables["chain-b"]]
@@ -8422,7 +8445,7 @@ def test_random_kda_shadow_keeps_attention_prefix_but_owns_sparse_state(context)
     state_chain = [_FakeBlock(900)]  # a deep chain retains one current state
     kda = _FakeManager(state_chain)
     kda.kv_cache_spec = instrumented_scheduler_module.MambaSpec(
-        block_size=16, shapes=(), dtypes=(), mamba_cache_mode="align"
+        block_size=16, shapes=(), dtypes=(), **_ALIGN_MAMBA_SPEC_KWARGS
     )
     pool.null_block = _FakeBlock(0)
     pool.null_block.is_null = True
